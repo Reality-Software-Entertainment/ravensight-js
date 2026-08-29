@@ -1,0 +1,52 @@
+{
+  "name": "ravensight",
+  "version": "0.1.0",
+  "description": "Official JavaScript SDK for Ravensight player analytics. Browser and Node, zero dependencies: sessions, batched events, offline queue.",
+  "license": "MIT",
+  "author": "Reality Software Entertainment",
+  "homepage": "https://ravensight.io/docs/",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Reality-Software-Entertainment/ravensight-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Reality-Software-Entertainment/ravensight-js/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ravensight",
+    "analytics",
+    "game-analytics",
+    "telemetry",
+    "gamedev",
+    "events"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node scripts/build-cjs.mjs",
+    "pretest": "node scripts/build-cjs.mjs",
+    "test": "node --test \"test/**/*.test.js\"",
+    "prepack": "node scripts/build-cjs.mjs"
+  }
+}

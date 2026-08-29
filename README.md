@@ -1,0 +1,215 @@
+# ravensight
+
+Official JavaScript SDK for [Ravensight](https://ravensight.io) player analytics.
+
+Zero dependencies. Works in the browser and in Node 18 or newer. Ships both ESM
+and CommonJS. Handles sessions, batching, the offline queue, rate limits and the
+server side kill switch for you.
+
+* API base: `https://api.ravensight.io/api/v1`
+* Docs: https://ravensight.io/docs/
+
+## Install
+
+Publishing to npm is pending. Until then install straight from git:
+
+```bash
+npm install github:Reality-Software-Entertainment/ravensight-js
+```
+
+Once the package is on npm:
+
+```bash
+npm install ravensight
+```
+
+There is no build step for consumers. The ESM entry is plain source and the
+CommonJS build is committed, so a git install works as is.
+
+## Quickstart: browser game
+
+```js
+import Ravensight from 'ravensight';
+
+const rs = new Ravensight({
+  ingestKey: 'gt_live_your_publishable_key',
+  gameVersion: '1.4.0',
+});
+
+// Reads the server kill switch and opens a session.
+await rs.init();
+
+rs.track('game_started');
+rs.track('level_completed', { level: 3, deaths: 2, seconds: 91 });
+
+// Optional: player feedback from an in game form.
+await rs.submitFeedback('The boss fight is too long', 'balance', 4);
+```
+
+Events are queued and sent in batches of up to 50, on a timer and when the page
+is hidden. You do not need to call `flush()` yourself, but you can.
+
+Without a bundler, load it as a module directly:
+
+```html
+<script type="module">
+  import Ravensight from './node_modules/ravensight/src/index.js';
+  const rs = new Ravensight({ ingestKey: 'gt_live_...' });
+  await rs.init();
+  rs.track('page_loaded');
+</script>
+```
+
+## Quickstart: Node
+
+```js
+// ESM
+import Ravensight from 'ravensight';
+
+// CommonJS
+// const Ravensight = require('ravensight');
+
+const rs = new Ravensight({
+  ingestKey: process.env.RAVENSIGHT_KEY,
+  gameVersion: '1.4.0',
+  platform: 'dedicated-server',
+});
+
+await rs.init();
+rs.track('match_finished', { mode: 'ranked', durationSec: 620 });
+
+// Node has no localStorage, so the device id lives in memory by default.
+// Give it a stable id or your own storage if you want it to persist.
+```
+
+Persisting the device id in Node:
+
+```js
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const fileStorage = {
+  getItem: (k) => {
+    try { return readFileSync(`./.${k}`, 'utf8'); } catch { return null; }
+  },
+  setItem: (k, v) => writeFileSync(`./.${k}`, v, 'utf8'),
+};
+
+const rs = new Ravensight({ ingestKey: 'gt_live_...', storage: fileStorage });
+```
+
+## itch.io and HTML5 exports
+
+Ravensight works from an itch.io HTML5 page with no extra setup, with two things
+worth knowing:
+
+* itch.io serves games from a sandboxed subdomain of `hwcdn.net` or
+  `itch.zone`. All calls are cross origin, and the API sends the CORS headers
+  needed for that. If you self host Ravensight, allow your itch domain.
+* Some browsers block `localStorage` inside the itch iframe. The SDK catches
+  that and falls back to an in memory device id, so tracking still works, but
+  returning players look new. Ticking "Click to launch in fullscreen" or serving
+  the game from your own domain avoids it.
+
+For Godot HTML5 exports, use the Godot SDK instead. This package is for
+JavaScript and TypeScript engines such as Phaser, PixiJS, three.js, Excalibur
+and hand written canvas games.
+
+## API
+
+### `new Ravensight(options)`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `ingestKey` | required | Your publishable `gt_live_...` key. Safe to ship in a client build. |
+| `apiUrl` | `https://api.ravensight.io/api/v1` | Base URL. `/api/v1` is appended if you leave it off. |
+| `gameVersion` | `'1.0.0'` | Reported with the session. |
+| `platform` | auto | `'web'` in a browser, `node-<platform>` in Node. |
+| `autoFlushMs` | `15000` | Flush interval. Set `0` to flush only on demand. |
+| `maxQueueSize` | `500` | Offline queue cap. Oldest events are dropped first. |
+| `storage` | auto | Anything with `getItem` and `setItem`. Used for the device id. |
+| `deviceId` | auto | Override the generated device id entirely. |
+| `enabled` | `true` | Start opted out by passing `false`. |
+| `fetch` | global | Inject a custom fetch. |
+| `debug` | `false` | Log SDK activity to the console. |
+
+### `await rs.init()`
+
+Reads `GET /settings` for the kill switch, then opens a session with
+`POST /session`. Returns `{ trackingEnabled, sessionReady }`. It never throws on
+a network failure: if the settings call fails the SDK assumes tracking is on, and
+if the session call fails events keep queueing until a retry succeeds.
+
+If the server has tracking switched off for your game, the queue is cleared,
+`track()` becomes a no op and nothing further is sent.
+
+### `rs.track(event, data?)`
+
+Queues an event. Safe to call before `init()`. Returns `false` when tracking is
+off. Timestamps are recorded as unix seconds at the moment of the call, so a
+delayed flush still reports when the thing actually happened.
+
+### `await rs.flush()`
+
+Sends queued events now. Returns `{ sent, queued }`. Concurrent calls are safe.
+
+### `await rs.submitFeedback(message, category?, rating?)`
+
+Posts to `POST /feedback`. Throws a `RavensightError` on failure, with a `code`
+such as `empty_message`, `tracking_disabled` or the server's own error string.
+
+### `await rs.fetchSuggestions()`
+
+EXPERIMENTAL. Returns the AI generated design suggestions for your game as an
+array. Empty until your game has enough data for a weekly digest. The shape of
+each suggestion may change, so do not build game logic on it.
+
+### `rs.setEnabled(bool)`
+
+Local opt in and opt out, for a privacy toggle in your settings menu. Disabling
+clears anything still queued, so an opt out does not leave player data sitting
+in memory.
+
+### `rs.dispose()`
+
+Stops timers and listeners. The client cannot be reused afterwards.
+
+## How delivery works
+
+* **Batching.** Up to 50 events per request, the server hard limit. A flush
+  keeps sending batches until the queue drains.
+* **Offline queue.** Events accumulate up to `maxQueueSize` (default 500). Past
+  that the oldest are dropped so the newest are always kept.
+* **Never dropped on failure.** Events are only removed from the queue after the
+  server answers `202`.
+* **Session expiry.** A `401` clears the session, opens a new one and re sends
+  the same batch.
+* **Rate limits.** A `429` honors `Retry-After` in seconds. With no such header
+  the SDK backs off exponentially from 10 seconds up to a 5 minute ceiling. The
+  queue is held, never discarded.
+* **Oversize batches.** A `400` halves the batch and retries, down to a single
+  event. An event that is still rejected on its own is dropped so it cannot
+  block everything behind it.
+
+## Flush on page hide
+
+In a browser the SDK listens for `visibilitychange` and sends one last batch when
+the page goes hidden. It prefers `fetch` with `keepalive: true` rather than
+`navigator.sendBeacon`, because `sendBeacon` cannot set request headers and the
+batch endpoint authenticates with `X-Session-Token`. `sendBeacon` is used only
+where keepalive is unavailable, and then the token has to travel in the query
+string, which is a best effort fallback rather than the primary path.
+
+## Development
+
+```bash
+npm run build   # regenerate dist/index.cjs from src/index.js
+npm test        # node --test, no dependencies
+```
+
+There is no bundler. `src/index.js` is the source of truth and
+`scripts/build-cjs.mjs` strips its `export` keywords and appends a CommonJS
+footer to produce `dist/index.cjs`.
+
+## License
+
+MIT. Copyright 2026 Reality Software Entertainment.
