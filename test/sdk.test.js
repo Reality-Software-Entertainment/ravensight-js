@@ -317,7 +317,9 @@ test('the unload request prefers fetch keepalive so the session header survives'
   const beacon = rs._buildUnloadRequest(events, 'tok/1', { hasFetchKeepalive: false, hasBeacon: true });
   assert.equal(beacon.transport, 'beacon');
   assert.equal(beacon.headers, null, 'sendBeacon cannot carry headers');
-  assert.ok(beacon.url.endsWith('/track/batch?sessionToken=tok%2F1'), 'the token moves to the query string');
+  assert.ok(beacon.url.endsWith('/track/batch'), 'the URL stays clean, no token in it');
+  const beaconBody = JSON.parse(beacon.body);
+  assert.equal(beaconBody.sessionToken, 'tok/1', 'the token rides inside the JSON body');
 
   const none = rs._buildUnloadRequest(events, 'tok_1', { hasFetchKeepalive: false, hasBeacon: false });
   assert.equal(none.transport, 'none');

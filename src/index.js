@@ -75,7 +75,7 @@ export function parseRetryAfterMs(value) {
  *
  * fetch with keepalive is preferred over sendBeacon because sendBeacon cannot
  * set request headers, and the batch endpoint authenticates with the
- * X-Session-Token header. The beacon path therefore has to move the token into
+ * X-Session-Token header. The beacon path therefore moves the token into
  * the query string, which is only a best effort fallback for browsers where
  * keepalive is unavailable.
  */
@@ -561,12 +561,15 @@ export class Ravensight {
       };
     }
     if (transport === 'beacon') {
-      // sendBeacon cannot set headers, so the token has to ride in the query
-      // string. Best effort only.
+      // sendBeacon cannot set headers, so the token rides INSIDE the JSON
+      // body (never the URL, where proxies and logs could capture it). The
+      // API accepts body.sessionToken on ingest POSTs for exactly this path.
+      const parsed = JSON.parse(body);
+      parsed.sessionToken = token;
       return {
         transport,
-        url: url + '?sessionToken=' + encodeURIComponent(token),
-        body,
+        url,
+        body: JSON.stringify(parsed),
         headers: null,
       };
     }
