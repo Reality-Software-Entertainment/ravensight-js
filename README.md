@@ -8,6 +8,7 @@ server side kill switch for you.
 
 * API base: `https://api.ravensight.io/api/v1`
 * Docs: https://ravensight.io/docs/
+* Privacy: a random per-install device id, no advertising identifier, a local opt-out (`rs.setEnabled(false)`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 
 ## Install
 
@@ -172,6 +173,27 @@ in memory.
 ### `rs.dispose()`
 
 Stops timers and listeners. The client cannot be reused afterwards.
+
+## Device id and privacy
+
+The SDK generates a random device id on first run (`crypto.randomUUID`
+where available) and stores it in `localStorage` under
+`ravensight_device_id`. No hardware identifier, advertising id, IP based
+fingerprint or personal data is collected by the SDK itself. Only the
+events you choose to send leave the browser.
+
+`rs.setEnabled(false)` stops all sending and discards anything still
+queued, so an opt out does not leave player data sitting in memory.
+
+The opt-out is not stored by the SDK: keep the player's choice in your own
+settings and call `rs.setEnabled(false)` before the first event on every
+launch. To forget this install's analytics identity, remove `ravensight_device_id` from `localStorage`;
+the next run starts under a fresh id and nothing links the old one back.
+
+A game that sends gameplay events and nothing else can declare Device ID and
+Product Interaction as not linked to the player and not used for tracking,
+and needs no tracking permission prompt. The row by row answers for the App
+Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
 
 ## How delivery works
 
