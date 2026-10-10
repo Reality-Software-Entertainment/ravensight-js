@@ -130,6 +130,8 @@ export declare class Ravensight {
   readonly isActive: boolean;
   readonly retryInMs: number;
   readonly maxSessions: number;
+  /** True when a Ravensight Playtest token was found at construction (window.__RAVENSIGHT_PLAYTEST__, ?rs_playtest=, or localStorage ravensight.playtest). */
+  readonly isPlaytest: boolean;
   /** The current device id's session token, or null. */
   readonly sessionToken: string | null;
   /** When the current device id's session expires, epoch ms, or 0. */
@@ -151,7 +153,13 @@ export declare class Ravensight {
   isSessionValid(deviceId?: string): boolean;
   /** Switches at once and stores the id; nothing is flushed. Queued events keep their id and its session. Rejects with code disposed after dispose(). */
   setDeviceId(id: string): Promise<SetDeviceIdResult>;
-  /** Switches to a fresh random device id. Resolves with the new id. */
+  /**
+   * Joins a session opened elsewhere (the browser's rs.sessionToken), so this device id's next
+   * session shares its analytics session. Used once; a refused token falls back to a plain session.
+   * Throws TypeError on a bad token or deviceId, RavensightError code disposed after dispose().
+   */
+  joinSession(token: string, options?: TrackOptions): void;
+  /** Switches to a fresh random device id. Same semantics as setDeviceId. Resolves with the new id. */
   resetDeviceId(): Promise<string>;
   dispose(options?: DisposeOptions): Promise<DisposeResult>;
 }

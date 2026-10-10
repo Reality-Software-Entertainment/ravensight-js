@@ -24,6 +24,10 @@ const DEFAULT_AUTO_FLUSH_MS = 15000;
 const DEFAULT_DISPOSE_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_SESSIONS = 64;
 const DEVICE_ID_KEY = 'ravensight_device_id';
+/** Where the playtest runner leaves its token for the page. */
+const PLAYTEST_STORAGE_KEY = 'ravensight.playtest';
+const PLAYTEST_GLOBAL = '__RAVENSIGHT_PLAYTEST__';
+const PLAYTEST_QUERY_PARAM = 'rs_playtest';
 /** Clock skew allowance so we refresh slightly before the server expires us. */
 const EXPIRY_SKEW_MS = 5000;
 
@@ -144,6 +148,58 @@ function wireEvents(items) {
   return items.map((item) => ({ event: item.event, data: item.data, timestamp: item.timestamp }));
 }
 
+/** A token from a string, a JSON string or an object with `token`. */
+function playtestTokenFrom(value) {
+  if (value == null) return null;
+  if (typeof value === 'object') return isNonEmptyString(value.token) ? value.token.trim() : null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (text[0] === '{') {
+    try {
+      return playtestTokenFrom(JSON.parse(text));
+    } catch (_err) {
+      return null;
+    }
+  }
+  return text;
+}
+
+/**
+ * The Ravensight Playtest runner hands the game a token, read in this order:
+ * `window.__RAVENSIGHT_PLAYTEST__`, the `?rs_playtest=` query parameter, then
+ * `localStorage['ravensight.playtest']`. Null outside a playtest.
+ */
+function readPlaytestToken(storage) {
+  try {
+    if (typeof window !== 'undefined' && window) {
+      const fromGlobal = playtestTokenFrom(window[PLAYTEST_GLOBAL]);
+      if (fromGlobal) return fromGlobal;
+      const search = window.location && window.location.search;
+      if (search && typeof URLSearchParams === 'function') {
+        const fromQuery = playtestTokenFrom(new URLSearchParams(search).get(PLAYTEST_QUERY_PARAM));
+        if (fromQuery) return fromQuery;
+      }
+    }
+  } catch (_err) {
+    // A hostile or partial window object. Fall through to storage.
+  }
+  const stores = [storage];
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage && localStorage !== storage) stores.push(localStorage);
+  } catch (_err) {
+    // Blocked storage.
+  }
+  for (const store of stores) {
+    try {
+      const fromStorage = playtestTokenFrom(store.getItem(PLAYTEST_STORAGE_KEY));
+      if (fromStorage) return fromStorage;
+    } catch (_err) {
+      // Blocked storage.
+    }
+  }
+  return null;
+}
+
 function isBrowser() {
   return typeof window !== 'undefined' && typeof document !== 'undefined';
 }
@@ -183,7 +239,11 @@ class Ravensight {
     this._storage = detectStorage(opts.storage);
     this._env = opts.env || null;
 
-    this.deviceId = opts.deviceId ? String(opts.deviceId) : this._loadOrCreateDeviceId();
+    // Under a playtest the server decides the device id from the token, so
+    // nothing is read from or written to the player's own storage.
+    this._playtestToken = readPlaytestToken(this._storage);
+    if (opts.deviceId) this.deviceId = String(opts.deviceId);
+    else this.deviceId = this._playtestToken ? 'dev_' + randomId() : this._loadOrCreateDeviceId();
 
     /** Local opt out. Combined with the server kill switch by `isActive`. */
     this.enabled = opts.enabled === undefined ? true : Boolean(opts.enabled);
@@ -224,6 +284,8 @@ class Ravensight {
     /** Set when POST /session refuses the key. Stops the timer until a session opens. */
     this._invalidKey = false;
     this._invalidKeyWarned = false;
+    /** Set by a 403 playtest_job_closed. Permanent for this client. */
+    this._playtestClosed = false;
   }
 
   /** True when events may actually be sent. */
@@ -233,7 +295,12 @@ class Ravensight {
 
   /** Like isActive, but still true while dispose() delivers the last events. */
   get _canSend() {
-    return this.enabled && this.trackingEnabled && !this._disposed;
+    return this.enabled && this.trackingEnabled && !this._playtestClosed && !this._disposed;
+  }
+
+  /** True when a Ravensight Playtest token was found at construction. */
+  get isPlaytest() {
+    return Boolean(this._playtestToken);
   }
 
   /** The current id's session token, or null. Read only. */
@@ -267,6 +334,7 @@ class Ravensight {
 
     await this._checkSettings();
     this.initialized = true;
+    if (this._playtestClosed) this.trackingEnabled = false;
 
     if (!this.trackingEnabled) {
       this._log('tracking disabled by server kill switch');
@@ -493,6 +561,35 @@ class Ravensight {
   }
 
   /**
+   * Joins a session opened elsewhere, typically the browser's, so server side
+   * events for that player share its analytics session. `token` is the
+   * browser's `rs.sessionToken`. The next session opened for `deviceId`
+   * (default: the current id) carries it once; any session already cached
+   * for that id is dropped. A refused join token falls back to a plain
+   * session and is recorded as stats.lastError `invalid_join_token`.
+   *
+   * @throws {TypeError} when `token` or `options.deviceId` is not a non-empty string.
+   * @throws {RavensightError} code `disposed` after dispose().
+   */
+  joinSession(token, options) {
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+    if (!isNonEmptyString(token)) {
+      throw new TypeError('Ravensight: `token` must be a non-empty string');
+    }
+    let deviceId = this.deviceId;
+    if (options && options.deviceId !== undefined) {
+      if (!isNonEmptyString(options.deviceId)) {
+        throw new TypeError('Ravensight: `deviceId` must be a non-empty string');
+      }
+      deviceId = options.deviceId;
+    }
+    const entry = this._sessionEntry(deviceId);
+    entry.joinToken = token;
+    entry.token = null;
+    entry.expiresAt = 0;
+  }
+
+  /**
    * Shuts the client down. The timer and page listeners stop at once and
    * track() returns false from the first call. By default the queue is then
    * flushed, bounded by `timeoutMs`, and in a browser one last best effort
@@ -605,14 +702,13 @@ class Ravensight {
   }
 
   async _createSession(deviceId, entry) {
-    const res = await this._request('POST', '/session', {
-      headers: { 'X-API-Key': this.ingestKey },
-      body: {
-        deviceId,
-        gameVersion: this.gameVersion,
-        platform: this.platform,
-      },
-    });
+    const joinToken = entry.joinToken;
+    const headers = { 'X-API-Key': this.ingestKey };
+    if (this._playtestToken) headers['X-Ravensight-Playtest'] = 'Bearer ' + this._playtestToken;
+    const body = { deviceId, gameVersion: this.gameVersion, platform: this.platform };
+    if (joinToken) body.joinToken = joinToken;
+
+    const res = await this._request('POST', '/session', { headers, body });
 
     if (res.status === 201 && res.body && res.body.token) {
       const token = String(res.body.token);
@@ -620,6 +716,10 @@ class Ravensight {
         // dispose() finished while this was in flight. Do not store it.
         return token;
       }
+      // joinSession() was called again while this was in flight: the next
+      // session for this id must carry the newer join token, so keep none.
+      if (entry.joinToken !== joinToken) return token;
+      entry.joinToken = null;
       entry.token = token;
       entry.expiresAt = this._resolveExpiry(res.body);
       // The entry may have been evicted meanwhile; put it back.
@@ -635,7 +735,28 @@ class Ravensight {
       return token;
     }
 
-    const reason = this._sessionFailure(res);
+    const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
+
+    // A stale or foreign join token. Forget it and open a plain session.
+    if (res.status === 401 && joinToken && code === 'invalid_join_token') {
+      if (entry.joinToken === joinToken) entry.joinToken = null;
+      this._recordError('invalid_join_token', 401);
+      this._log('join token refused, opening a plain session');
+      return this._createSession(deviceId, entry);
+    }
+
+    // The playtest job this token belongs to has finished: nothing more may
+    // be sent, ever, by this client.
+    if (res.status === 403 && code === 'playtest_job_closed') {
+      this._playtestClosed = true;
+      this._disableTracking();
+      this._recordError('playtest_job_closed', 403);
+      const closed = new RavensightError('playtest job closed', 'playtest_job_closed', 403);
+      closed.reason = 'tracking_disabled';
+      throw closed;
+    }
+
+    const reason = this._sessionFailure(res, code);
     this._recordError(reason, res.status);
     const err = new RavensightError('session creation failed (HTTP ' + res.status + ')', reason, res.status);
     err.reason = reason;
@@ -647,9 +768,8 @@ class Ravensight {
    * Mapped on status, because the body text is not a contract, except for
    * the one 403 body that means the kill switch.
    */
-  _sessionFailure(res) {
+  _sessionFailure(res, code) {
     const status = res.status;
-    const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
 
     if (status === 0) {
       this._scheduleBackoff();
@@ -1034,6 +1154,7 @@ class Ravensight {
   }
 
   _persistDeviceId(id) {
+    if (this._playtestToken) return;
     try {
       this._storage.setItem(DEVICE_ID_KEY, id);
     } catch (_err) {

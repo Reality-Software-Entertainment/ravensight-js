@@ -1127,3 +1127,180 @@ test('sessionToken and sessionExpiresAt are read only views of the current id', 
   }, TypeError);
   await rs.dispose();
 });
+
+// --- Joining a browser session -------------------------------------------
+
+test('joinSession sends the join token on that device id\'s next session, once', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_abc'] });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host' });
+  await rs.init();
+  rs.joinSession('join_abc', { deviceId: 'p7' });
+  rs.track('server_side', { gold: 5 }, { deviceId: 'p7' });
+  await rs.flush();
+
+  const sessions = server.requestsTo('/api/v1/session');
+  assert.deepEqual(sessions[1].body, {
+    deviceId: 'p7',
+    gameVersion: '1.2.3',
+    platform: 'test',
+    joinToken: 'join_abc',
+  });
+  assert.equal(sessions[0].body.joinToken, undefined, 'the host session never carried it');
+  assert.deepEqual(server.state.batches.at(-1).device, 'p7');
+
+  server.expireSession();
+  rs.track('later', {}, { deviceId: 'p7' });
+  await rs.flush();
+  const reopened = server.requestsTo('/api/v1/session').at(-1);
+  assert.equal(reopened.body.deviceId, 'p7');
+  assert.equal(reopened.body.joinToken, undefined, 'a join token is used once');
+  await rs.dispose();
+});
+
+test('joinSession on the current id drops the session already cached for it', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_abc'] });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host' });
+  await rs.init();
+  assert.ok(rs.sessionToken);
+  rs.joinSession('join_abc');
+  assert.equal(rs.sessionToken, null);
+
+  rs.track('a');
+  await rs.flush();
+  const last = server.requestsTo('/api/v1/session').at(-1);
+  assert.equal(last.body.joinToken, 'join_abc');
+  assert.equal(last.body.deviceId, 'host');
+  assert.equal(server.requestsTo('/api/v1/track/batch').at(-1).headers['x-session-token'], rs.sessionToken);
+  await rs.dispose();
+});
+
+test('a refused join token falls back to a plain session and is recorded', async (t) => {
+  const server = await startMockServer({ joinTokens: ['good'] });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  rs.joinSession('stale', { deviceId: 'p7' });
+  rs.track('e', {}, { deviceId: 'p7' });
+  const result = await rs.flush();
+
+  assert.equal(result.sent, 1);
+  const sessions = server.requestsTo('/api/v1/session').map((r) => r.body.joinToken);
+  assert.deepEqual(sessions, ['stale', undefined]);
+  assert.equal(rs.stats.lastError.code, 'invalid_join_token');
+  assert.equal(rs.stats.lastError.status, 401);
+  assert.equal(rs._invalidKey, false, 'a refused join token is not a refused key');
+  await rs.dispose();
+});
+
+test('joinSession validates its arguments and refuses after dispose', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server);
+  for (const bad of ['', '  ', null, 42]) {
+    assert.throws(() => rs.joinSession(bad), TypeError);
+  }
+  assert.throws(() => rs.joinSession('tok', { deviceId: '' }), TypeError);
+  await rs.dispose();
+  assert.throws(() => rs.joinSession('tok'), (err) => err instanceof RavensightError && err.code === 'disposed');
+});
+
+// --- Playtest token -------------------------------------------------------
+
+function withWindow(t, value) {
+  const had = Object.prototype.hasOwnProperty.call(globalThis, 'window');
+  const previous = globalThis.window;
+  globalThis.window = value;
+  t.after(() => {
+    if (had) globalThis.window = previous;
+    else delete globalThis.window;
+  });
+}
+
+async function assertPlaytestSession(t, server, storage, expectedToken) {
+  const rs = makeClient(server, { storage });
+  assert.equal(rs.isPlaytest, true);
+  await rs.init();
+  rs.track('a');
+  await rs.flush();
+  await rs.setDeviceId('someone');
+
+  const req = server.requestsTo('/api/v1/session')[0];
+  assert.equal(req.headers['x-ravensight-playtest'], 'Bearer ' + expectedToken);
+  assert.equal(
+    server.requestsTo('/api/v1/track/batch')[0].headers['x-ravensight-playtest'],
+    undefined,
+    'only POST /session carries the playtest token',
+  );
+  assert.equal(storage.getItem('ravensight_device_id'), null, 'a playtest client persists no device id');
+  await rs.dispose();
+}
+
+test('the playtest token is read from window.__RAVENSIGHT_PLAYTEST__ first', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  withWindow(t, {
+    __RAVENSIGHT_PLAYTEST__: { token: 'pt_tok_1', runId: 'r1', jobId: 'j1', persona: 'speedrunner' },
+    location: { search: '?rs_playtest=pt_tok_query' },
+  });
+  const storage = new MemoryStorage();
+  storage.setItem('ravensight.playtest', JSON.stringify({ token: 'pt_tok_stored' }));
+  await assertPlaytestSession(t, server, storage, 'pt_tok_1');
+});
+
+test('the playtest token is read from ?rs_playtest= second', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  withWindow(t, { location: { search: '?level=2&rs_playtest=pt_tok_2' } });
+  const storage = new MemoryStorage();
+  storage.setItem('ravensight.playtest', JSON.stringify({ token: 'pt_tok_stored' }));
+  await assertPlaytestSession(t, server, storage, 'pt_tok_2');
+});
+
+test('the playtest token is read from localStorage ravensight.playtest last', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const storage = new MemoryStorage();
+  storage.setItem('ravensight.playtest', JSON.stringify({ token: 'pt_tok_3', runId: 'r3' }));
+  await assertPlaytestSession(t, server, storage, 'pt_tok_3');
+});
+
+test('without a playtest token there is no header and the device id persists', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const storage = new MemoryStorage();
+  const rs = makeClient(server, { storage });
+  assert.equal(rs.isPlaytest, false);
+  await rs.init();
+  assert.equal(server.requestsTo('/api/v1/session')[0].headers['x-ravensight-playtest'], undefined);
+  assert.equal(storage.getItem('ravensight_device_id'), rs.deviceId);
+  await rs.dispose();
+});
+
+test('a 403 playtest_job_closed is fatal: tracking stops and the timer with it', async (t) => {
+  const server = await startMockServer({
+    sessionOverrides: [{ status: 403, body: { error: 'playtest_job_closed' } }],
+  });
+  t.after(() => server.close());
+  const storage = new MemoryStorage();
+  storage.setItem('ravensight.playtest', JSON.stringify({ token: 'pt_closed' }));
+
+  const rs = makeClient(server, { storage, autoFlushMs: 60000 });
+  rs.track('queued');
+  const result = await rs.init();
+  assert.deepEqual(result, { trackingEnabled: false, sessionReady: false, reason: 'tracking_disabled' });
+  assert.equal(rs.stats.lastError.code, 'playtest_job_closed');
+  assert.equal(rs._timer, null);
+  assert.equal(rs.queue.length, 0);
+  assert.equal(rs.track('after'), false);
+  assert.deepEqual(await rs.flush(), { sent: 0, queued: 0, skipped: 'inactive' });
+  assert.equal(server.requestsTo('/api/v1/session').length, 1, 'never retried');
+  const again = await rs.init();
+  assert.equal(again.trackingEnabled, false, 'a later init() does not revive a closed playtest');
+  assert.equal(server.requestsTo('/api/v1/session').length, 1);
+  await rs.dispose();
+});
