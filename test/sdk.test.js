@@ -488,7 +488,7 @@ test('submitFeedback rejects an unknown category or a bad rating before any requ
   await rs.init();
   const before = server.state.requests.length;
 
-  for (const category of ['balance', 'BUG', '', 7]) {
+  for (const category of ['balance', 'BUG', 7]) {
     await assert.rejects(
       () => rs.submitFeedback('note', category),
       (err) => err instanceof RavensightError && err.code === 'invalid_category',
@@ -509,8 +509,15 @@ test('submitFeedback rejects an unknown category or a bad rating before any requ
   }
   await rs.submitFeedback('no category or rating');
   await rs.submitFeedback('rating only', undefined, 1);
-  assert.equal(server.state.feedback.length, FEEDBACK_CATEGORIES.length + 2);
   assert.deepEqual(server.state.feedback.at(-1), { message: 'rating only', rating: 1 });
+  // An empty string means "not given" for both, and is left out of the payload.
+  await rs.submitFeedback('empty category', '', 2);
+  assert.deepEqual(server.state.feedback.at(-1), { message: 'empty category', rating: 2 });
+  await rs.submitFeedback('empty rating', 'bug', '');
+  assert.deepEqual(server.state.feedback.at(-1), { message: 'empty rating', category: 'bug' });
+  await rs.submitFeedback('null both', null, null);
+  assert.deepEqual(server.state.feedback.at(-1), { message: 'null both' });
+  assert.equal(server.state.feedback.length, FEEDBACK_CATEGORIES.length + 5);
   await rs.dispose();
 });
 
@@ -613,7 +620,33 @@ test('dispose waits for a flush already in flight before giving up', async (t) =
   );
 });
 
-test('dispose in a browser sends what a timed out flush left with one keepalive request', async (t) => {
+test('dispose in a browser never re sends the batch a timed out flush still has in flight', async (t) => {
+  const server = await startMockServer({ batchDelayMs: 300 });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { env: { hasFetchKeepalive: true, hasBeacon: false } });
+  await rs.init();
+  // The 50th track starts a flush of the first 50, which hangs for 300ms.
+  for (let i = 0; i < 70; i++) rs.track('e', { i });
+
+  const result = await rs.dispose({ timeoutMs: 50 });
+  assert.deepEqual(
+    result,
+    { sent: 20, dropped: 50 },
+    'the unload request carried only the 20 beyond the in flight batch, whose outcome is unknown',
+  );
+  assert.equal(rs.stats.dropped, 50);
+
+  // Both requests land late. Every event arrives exactly once.
+  await waitFor(() => server.state.events.length >= 70);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const seen = server.state.events.map((e) => e.data.i).sort((x, y) => x - y);
+  assert.deepEqual(seen, Array.from({ length: 70 }, (_, i) => i), 'no duplicates');
+  const sizes = server.requestsTo('/api/v1/track/batch').map((r) => r.body.events.length).sort((x, y) => x - y);
+  assert.deepEqual(sizes, [20, 50]);
+});
+
+test('dispose in a browser skips the unload request when the hung batch covers the queue', async (t) => {
   const server = await startMockServer({ batchDelayMs: 300 });
   t.after(() => server.close());
 
@@ -623,9 +656,29 @@ test('dispose in a browser sends what a timed out flush left with one keepalive 
   rs.track('b');
 
   const result = await rs.dispose({ timeoutMs: 50 });
-  assert.deepEqual(result, { sent: 2, dropped: 0 }, 'the best effort request carried the remainder');
-  // The keepalive request is fire and forget, so wait for it to land.
-  await waitFor(() => server.requestsTo('/api/v1/track/batch').length === 2);
+  assert.deepEqual(result, { sent: 0, dropped: 2 }, 'a request that timed out counts as dropped');
+
+  await waitFor(() => server.state.events.length === 2);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(server.state.events.map((e) => e.event), ['a', 'b'], 'sent once, never twice');
+  assert.equal(server.requestsTo('/api/v1/track/batch').length, 1);
+});
+
+test('a session that opens after dispose timed out is never used', async (t) => {
+  const server = await startMockServer({ sessionDelayMs: 200 });
+  t.after(() => server.close());
+
+  const rs = makeClient(server);
+  rs.track('a');
+
+  const result = await rs.dispose({ timeoutMs: 50 });
+  assert.deepEqual(result, { sent: 0, dropped: 1 });
+
+  await waitFor(() => server.state.tokens.length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(rs.sessionToken, null, 'the late session is not stored');
+  assert.equal(rs.stats.sessions, 0);
+  assert.equal(server.requestsTo('/api/v1/track/batch').length, 0, 'no stray batch request');
 });
 
 // --- Device id ------------------------------------------------------------
@@ -693,6 +746,39 @@ test('setDeviceId validates, and an unchanged id is a no op', async (t) => {
   assert.equal(rs.queue.length, 1, 'nothing was flushed');
   assert.equal(server.requestsTo('/api/v1/track/batch').length, 0);
   await rs.dispose({ flush: false });
+});
+
+test('setDeviceId waits for a session already opening under the old id', async (t) => {
+  const server = await startMockServer({ sessionDelayMs: 50 });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'old' });
+  const opening = rs._ensureSession();
+  await rs.setDeviceId('new');
+  await opening;
+
+  rs.track('x');
+  await rs.flush();
+
+  const sessions = server.requestsTo('/api/v1/session').map((r) => r.body.deviceId);
+  assert.deepEqual(sessions, ['old', 'new'], 'the event opened a session for the new id');
+  const batch = server.requestsTo('/api/v1/track/batch').at(-1);
+  assert.equal(batch.headers['x-session-token'], server.state.tokens[1]);
+  assert.equal(rs.deviceId, 'new');
+  await rs.dispose();
+});
+
+test('setDeviceId on a disposed client throws and stores nothing', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const storage = new MemoryStorage();
+  const rs = makeClient(server, { storage });
+  const before = rs.deviceId;
+  await rs.dispose();
+  await assert.rejects(() => rs.setDeviceId('late'), (err) => err instanceof RavensightError && err.code === 'disposed');
+  assert.equal(rs.deviceId, before);
+  assert.equal(storage.getItem('ravensight_device_id'), before);
 });
 
 test('resetDeviceId switches to a fresh random id', async (t) => {

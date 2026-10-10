@@ -191,7 +191,8 @@ Sends queued events now. Returns `{ sent, queued }`. Concurrent calls are safe.
 
 Posts to `POST /feedback`. `category` is optional and must be one of the values
 below, also exported as `FEEDBACK_CATEGORIES`. `rating` is optional and must be
-an integer from 1 to 5. Bad input is rejected before any request is made.
+an integer from 1 to 5. Leave either out with `undefined`, `null` or `''`. Bad
+input is rejected before any request is made.
 
 | Category | Use it for |
 | --- | --- |
@@ -221,7 +222,7 @@ in memory.
 
 Changes the device id after construction, for example once a player signs in
 on a shared machine. `id` must be a non-empty string, and setting the current
-id again does nothing.
+id again does nothing. It rejects with code `disposed` after `dispose()`.
 
 The server stamps the device id from the session, so the switch happens in
 order: events already queued are flushed first under the old session, then the
@@ -241,7 +242,10 @@ Shuts the client down. The timer and page listeners stop at once and `track()`
 returns `false` from that moment. By default the queue is then flushed, bounded
 by `timeoutMs`. In a browser, whatever is still queued after that goes out in
 one last best effort keepalive or beacon request. Anything left is dropped and
-counted in `rs.stats.dropped`. Resolves with `{ sent, dropped }`.
+counted in `rs.stats.dropped`. Resolves with `{ sent, dropped }`. Events in a
+request that timed out are counted as dropped even if it later lands, and are
+never sent a second time. Like `flush()`, it sends even if `init()` was never
+called.
 
 Pass `{ flush: false }` to discard the queue without sending. The client cannot
 be reused afterwards.

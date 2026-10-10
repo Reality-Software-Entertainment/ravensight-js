@@ -190,6 +190,8 @@ export class Ravensight {
     this._disposePromise = null;
     this._flushing = false;
     this._flushPromise = null;
+    /** Events in the batch request currently awaiting an answer. */
+    this._inflightSize = 0;
     this._sessionPromise = null;
     this._timer = null;
     this._nextAttemptAt = 0;
@@ -313,13 +315,16 @@ export class Ravensight {
     if (typeof message !== 'string' || message.trim() === '') {
       throw new RavensightError('feedback message is empty', 'empty_message');
     }
-    if (category != null && !FEEDBACK_CATEGORIES.includes(category)) {
+    // null, undefined and '' all mean "not given".
+    const hasCategory = category != null && category !== '';
+    const hasRating = rating != null && rating !== '';
+    if (hasCategory && !FEEDBACK_CATEGORIES.includes(category)) {
       throw new RavensightError(
         'feedback category must be one of: ' + FEEDBACK_CATEGORIES.join(', '),
         'invalid_category',
       );
     }
-    if (rating != null && !(Number.isInteger(rating) && rating >= 1 && rating <= 5)) {
+    if (hasRating && !(Number.isInteger(rating) && rating >= 1 && rating <= 5)) {
       throw new RavensightError('feedback rating must be an integer from 1 to 5', 'invalid_rating');
     }
     if (!this.isActive) {
@@ -327,8 +332,8 @@ export class Ravensight {
     }
 
     const payload = { message };
-    if (category != null) payload.category = category;
-    if (rating != null) payload.rating = rating;
+    if (hasCategory) payload.category = category;
+    if (hasRating) payload.rating = rating;
 
     const send = async () => {
       const token = await this._ensureSession();
@@ -402,15 +407,24 @@ export class Ravensight {
    * stay queued and go out under the new id rather than being dropped.
    *
    * @throws {TypeError} when `id` is not a non-empty string.
+   * @throws {RavensightError} code `disposed` after dispose().
    */
   async setDeviceId(id) {
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
     if (typeof id !== 'string' || id.trim() === '') {
       throw new TypeError('Ravensight: `id` must be a non-empty string');
     }
     if (id === this.deviceId) return;
 
+    // A session already opening was requested for the old id. Let it and any
+    // flush in flight finish first, or it would land after the switch and
+    // carry later events under the old identity.
+    if (this._sessionPromise) await this._sessionPromise.catch(noop);
+    if (this._flushPromise) await this._flushPromise.catch(noop);
     if (this.queue.length > 0) await this._flushAfterInflight();
+    if (this._sessionPromise) await this._sessionPromise.catch(noop);
 
+    // No await from here on, so nothing can open a session in between.
     this._invalidateSession();
     this.deviceId = id;
     try {
@@ -471,9 +485,13 @@ export class Ravensight {
       }
       sent += this.stats.sent - sentBefore;
 
-      if (this.queue.length > 0 && (this._env || isBrowser())) {
+      // Events in a batch that is still awaiting an answer stay at the head
+      // of the queue. Their outcome is unknown, so they are never re sent
+      // (that could deliver them twice) and are counted as dropped below.
+      const inflight = this._inflightSize;
+      if (this.queue.length > inflight && (this._env || isBrowser())) {
         const before = this.queue.length;
-        if (this._flushOnHidden()) sent += before - this.queue.length;
+        if (this._flushOnHidden(inflight)) sent += before - this.queue.length;
       }
     }
 
@@ -518,6 +536,10 @@ export class Ravensight {
     });
 
     if (res.status === 201 && res.body && res.body.token) {
+      if (this._disposed) {
+        // dispose() finished while this was in flight. Do not store it.
+        return String(res.body.token);
+      }
       this.sessionToken = String(res.body.token);
       this.sessionExpiresAt = this._resolveExpiry(res.body);
       this.stats.sessions += 1;
@@ -568,12 +590,19 @@ export class Ravensight {
       } catch (_err) {
         break;
       }
+      if (this._disposed) break;
 
       const size = Math.min(batchLimit, this.queue.length);
-      const res = await this._request('POST', '/track/batch', {
-        headers: { 'X-Session-Token': token },
-        body: { events: this.queue.slice(0, size) },
-      });
+      this._inflightSize = size;
+      let res;
+      try {
+        res = await this._request('POST', '/track/batch', {
+          headers: { 'X-Session-Token': token },
+          body: { events: this.queue.slice(0, size) },
+        });
+      } finally {
+        this._inflightSize = 0;
+      }
 
       // dispose() timed out while this batch was in flight and has already
       // counted the queue as dropped. Leave the cleared queue alone.
@@ -695,11 +724,14 @@ export class Ravensight {
     return { transport: 'none', url, body, headers: null };
   }
 
-  /** Best effort flush of one batch while the page is being hidden. */
-  _flushOnHidden() {
-    if (!this._canSend || this.queue.length === 0 || !this.isSessionValid()) return false;
+  /**
+   * Best effort flush of one batch while the page is being hidden. `offset`
+   * skips events already in a batch request awaiting an answer.
+   */
+  _flushOnHidden(offset = 0) {
+    if (!this._canSend || this.queue.length <= offset || !this.isSessionValid()) return false;
 
-    const events = this.queue.slice(0, MAX_BATCH_SIZE);
+    const events = this.queue.slice(offset, offset + MAX_BATCH_SIZE);
     const req = this._buildUnloadRequest(events, this.sessionToken);
     if (req.transport === 'none') return false;
 
@@ -717,7 +749,7 @@ export class Ravensight {
         navigator.sendBeacon(req.url, blob);
       }
       // Optimistic: the page may never come back to confirm delivery.
-      this.queue.splice(0, events.length);
+      this.queue.splice(offset, events.length);
       return true;
     } catch (_err) {
       return false;
@@ -730,7 +762,7 @@ export class Ravensight {
       return;
     }
     this._onVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') this._flushOnHidden();
+      if (document.visibilityState === 'hidden') this._flushOnHidden(this._inflightSize);
     };
     document.addEventListener('visibilitychange', this._onVisibilityChange);
     this._listenersBound = true;

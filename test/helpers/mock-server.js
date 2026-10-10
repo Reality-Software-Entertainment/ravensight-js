@@ -48,6 +48,8 @@ export async function startMockServer(config = {}) {
     batchStatus: config.batchStatus == null ? null : config.batchStatus,
     /** Delay before answering POST /track/batch, to simulate a hung server. */
     batchDelayMs: config.batchDelayMs == null ? 0 : config.batchDelayMs,
+    /** Delay before answering POST /session, to hold a session open in flight. */
+    sessionDelayMs: config.sessionDelayMs == null ? 0 : config.sessionDelayMs,
     seq: 0,
   };
 
@@ -72,6 +74,9 @@ export async function startMockServer(config = {}) {
     }
 
     if (req.method === 'POST' && path === '/api/v1/session') {
+      if (state.sessionDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, state.sessionDelayMs).unref());
+      }
       if (!String(req.headers['x-api-key'] || '').startsWith('gt_live_')) {
         return send(res, 401, { error: 'invalid_key' });
       }

@@ -106,12 +106,12 @@ export declare class Ravensight {
   init(): Promise<InitResult>;
   track(event: string, data?: Record<string, unknown>): boolean;
   flush(options?: { force?: boolean }): Promise<FlushResult>;
-  /** Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
-  submitFeedback(message: string, category?: FeedbackCategory, rating?: number): Promise<{ ok: true }>;
+  /** null, undefined and '' mean not given. Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
+  submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null): Promise<{ ok: true }>;
   fetchSuggestions(): Promise<unknown[]>;
   setEnabled(value: boolean): void;
   isSessionValid(): boolean;
-  /** Flushes, drops the session, stores the id. The next flush opens a new session. */
+  /** Flushes, drops the session, stores the id. The next flush opens a new session. Rejects with code disposed after dispose(). */
   setDeviceId(id: string): Promise<void>;
   /** Switches to a fresh random device id. Resolves with the new id. */
   resetDeviceId(): Promise<string>;
