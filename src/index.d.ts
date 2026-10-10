@@ -52,9 +52,23 @@ export interface SetDeviceIdResult {
   queuedUnderPreviousId: number;
 }
 
+/** Why init() could not open a session. */
+export type InitReason = 'invalid_key' | 'tracking_disabled' | 'offline' | 'rate_limited' | 'session_failed';
+
 export interface InitResult {
   trackingEnabled: boolean;
   sessionReady: boolean;
+  /** null when the session is ready. */
+  reason: InitReason | null;
+}
+
+export interface RavensightLastError {
+  /** An InitReason for POST /session, invalid_join_token, offline, rate_limited, or the server's error code. */
+  code: string;
+  /** HTTP status, 0 for a network failure. */
+  status: number;
+  /** Epoch ms. */
+  at: number;
 }
 
 export interface FlushResult {
@@ -83,6 +97,8 @@ export interface RavensightStats {
   sessions: number;
   /** Cached sessions dropped to stay within maxSessions. */
   sessionsEvicted: number;
+  /** The last failed request, from POST /session, GET /settings or a batch. */
+  lastError: RavensightLastError | null;
 }
 
 export declare class RavensightError extends Error {

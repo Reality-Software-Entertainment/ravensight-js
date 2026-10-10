@@ -198,7 +198,16 @@ class Ravensight {
     this._sessions = new Map();
 
     this.queue = [];
-    this.stats = { queued: 0, sent: 0, dropped: 0, flushes: 0, sessions: 0, sessionsEvicted: 0 };
+    this.stats = {
+      queued: 0,
+      sent: 0,
+      dropped: 0,
+      flushes: 0,
+      sessions: 0,
+      sessionsEvicted: 0,
+      /** The last failed request: { code, status, at } with `at` in epoch ms, or null. */
+      lastError: null,
+    };
 
     this._disposed = false;
     this._disposing = false;
@@ -212,6 +221,9 @@ class Ravensight {
     this._backoffMs = DEFAULT_RETRY_MS;
     this._listenersBound = false;
     this._onVisibilityChange = null;
+    /** Set when POST /session refuses the key. Stops the timer until a session opens. */
+    this._invalidKey = false;
+    this._invalidKeyWarned = false;
   }
 
   /** True when events may actually be sent. */
@@ -245,7 +257,10 @@ class Ravensight {
    * Reads the server kill switch, opens a session, and starts the flush timer.
    * Never throws on network failure: the SDK degrades to queue and retry.
    *
-   * @returns {Promise<{trackingEnabled: boolean, sessionReady: boolean}>}
+   * `reason` says why the session is not ready: `invalid_key`,
+   * `tracking_disabled`, `offline`, `rate_limited`, `session_failed`, or null.
+   *
+   * @returns {Promise<{trackingEnabled: boolean, sessionReady: boolean, reason: string|null}>}
    */
   async init() {
     if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
@@ -256,15 +271,21 @@ class Ravensight {
     if (!this.trackingEnabled) {
       this._log('tracking disabled by server kill switch');
       this.queue.length = 0;
-      return { trackingEnabled: false, sessionReady: false };
+      return { trackingEnabled: false, sessionReady: false, reason: 'tracking_disabled' };
     }
 
     let sessionReady = false;
+    let reason = null;
     try {
       await this._ensureSession();
       sessionReady = true;
     } catch (err) {
-      this._log('session not ready yet: ' + err.message);
+      reason = (err && err.reason) || 'session_failed';
+      this._log('session not ready yet: ' + (err && err.message));
+    }
+
+    if (!this.trackingEnabled) {
+      return { trackingEnabled: false, sessionReady: false, reason: 'tracking_disabled' };
     }
 
     this._startTimer();
@@ -274,7 +295,7 @@ class Ravensight {
       this.flush().catch(noop);
     }
 
-    return { trackingEnabled: true, sessionReady };
+    return { trackingEnabled: true, sessionReady, reason };
   }
 
   /**
@@ -310,7 +331,8 @@ class Ravensight {
     });
     this.stats.queued += 1;
 
-    if (this.queue.length >= MAX_BATCH_SIZE) this.flush().catch(noop);
+    // While the key is refused only an explicit flush() or init() retries.
+    if (this.queue.length >= MAX_BATCH_SIZE && !this._invalidKey) this.flush().catch(noop);
     return true;
   }
 
@@ -605,21 +627,83 @@ class Ravensight {
       this.stats.sessions += 1;
       this._resetBackoff();
       this._evictSessions();
+      if (this._invalidKey) {
+        this._invalidKey = false;
+        if (this.initialized && this.isActive) this._startTimer();
+      }
       this._log('session ready');
       return token;
     }
 
-    if (res.status === 429) {
-      this._applyRetryAfter(res);
-      throw new RavensightError('session creation rate limited', 'rate_limited', 429);
-    }
+    const reason = this._sessionFailure(res);
+    this._recordError(reason, res.status);
+    const err = new RavensightError('session creation failed (HTTP ' + res.status + ')', reason, res.status);
+    err.reason = reason;
+    throw err;
+  }
 
+  /**
+   * Applies the side effects of a refused POST /session and names the reason.
+   * Mapped on status, because the body text is not a contract, except for
+   * the one 403 body that means the kill switch.
+   */
+  _sessionFailure(res) {
+    const status = res.status;
+    const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
+
+    if (status === 0) {
+      this._scheduleBackoff();
+      return 'offline';
+    }
+    if (status === 403 && code === 'tracking_disabled') {
+      this._disableTracking();
+      return 'tracking_disabled';
+    }
+    if (status === 401 || status === 403) {
+      this._refuseKey();
+      return 'invalid_key';
+    }
+    if (status === 429) {
+      this._applyRetryAfter(res);
+      return 'rate_limited';
+    }
     this._scheduleBackoff();
-    throw new RavensightError(
-      'session creation failed (HTTP ' + res.status + ')',
-      this._errorCode(res, 'session_failed'),
-      res.status,
-    );
+    return 'session_failed';
+  }
+
+  /** The server switched tracking off for this game. Same as the kill switch on init(). */
+  _disableTracking() {
+    this.trackingEnabled = false;
+    this.queue.length = 0;
+    this._stopTimer();
+    this._log('tracking disabled by server kill switch');
+  }
+
+  /**
+   * The key was refused. Retrying on a timer cannot fix that, so the timer
+   * stops; track() still queues, and flush() or init() try again.
+   */
+  _refuseKey() {
+    this._invalidKey = true;
+    this._stopTimer();
+    if (this.debug && !this._invalidKeyWarned && typeof console !== 'undefined') {
+      this._invalidKeyWarned = true;
+      console.warn(
+        '[ravensight] the ingest key was refused (invalid_key). Automatic flushing is stopped ' +
+          'until a session opens; check your gt_live_ key. Events keep queueing.',
+      );
+    }
+  }
+
+  _recordError(code, status) {
+    this.stats.lastError = { code, status, at: this._clock() };
+  }
+
+  /** The error code for a failed request: offline, rate_limited, else the server's code or `fallback`. */
+  _failureCode(res, fallback) {
+    if (res.status === 0) return 'offline';
+    if (res.status === 429) return 'rate_limited';
+    return this._errorCode(res, fallback);
   }
 
   _resolveExpiry(body) {
@@ -671,6 +755,8 @@ class Ravensight {
       // dispose() timed out while this batch was in flight and has already
       // counted the queue as dropped. Leave the cleared queue alone.
       if (this._disposed) break;
+
+      if (res.status !== 202) this._recordError(this._failureCode(res, 'batch_failed'), res.status);
 
       if (res.status === 202) {
         this.queue.splice(0, size);
@@ -865,7 +951,7 @@ class Ravensight {
   // --- Timer --------------------------------------------------------------
 
   _startTimer() {
-    if (this._timer || !(this.autoFlushMs > 0)) return;
+    if (this._timer || !(this.autoFlushMs > 0) || this._invalidKey) return;
     this._timer = setInterval(() => {
       this.flush().catch(noop);
     }, this.autoFlushMs);
@@ -924,6 +1010,7 @@ class Ravensight {
     }
     // Unreachable or malformed: assume tracking is on, same as the Godot SDK.
     this.trackingEnabled = true;
+    this._recordError(this._failureCode(res, 'settings_failed'), res.status);
     if (res.status !== 200) this._log('settings check failed (HTTP ' + res.status + '), assuming enabled');
   }
 

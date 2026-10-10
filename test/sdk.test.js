@@ -81,6 +81,7 @@ test('init honors the server kill switch and stops tracking', async (t) => {
   const result = await rs.init();
 
   assert.equal(result.trackingEnabled, false);
+  assert.equal(result.reason, 'tracking_disabled');
   assert.equal(rs.isActive, false);
   assert.equal(rs.queue.length, 0, 'pending events are discarded when tracking is off');
   assert.equal(rs.track('after_init'), false);
@@ -97,8 +98,7 @@ test('init assumes tracking is enabled when settings are unreachable', async (t)
   const rs = makeClient(server);
   const result = await rs.init();
 
-  assert.equal(result.trackingEnabled, true);
-  assert.equal(result.sessionReady, true);
+  assert.deepEqual(result, { trackingEnabled: true, sessionReady: true, reason: null });
   assert.equal(server.requestsTo('/api/v1/session').length, 1);
 
   const sessionReq = server.requestsTo('/api/v1/session')[0];
@@ -107,6 +107,142 @@ test('init assumes tracking is enabled when settings are unreachable', async (t)
   assert.equal(sessionReq.body.platform, 'test');
   assert.ok(sessionReq.body.deviceId, 'a device id is sent');
   rs.dispose();
+});
+
+// --- Init reasons and lastError ----------------------------------------
+
+function captureConsole(t, method) {
+  const calls = [];
+  const original = console[method];
+  console[method] = (...args) => calls.push(args.join(' '));
+  t.after(() => {
+    console[method] = original;
+  });
+  return calls;
+}
+
+test('an invalid key stops the timer, warns once, and a later success restarts it', async (t) => {
+  const refused = { status: 401, body: { error: 'invalid_api_key' } };
+  const server = await startMockServer({ sessionOverrides: [refused, refused] });
+  t.after(() => server.close());
+  const warnings = captureConsole(t, 'warn');
+  captureConsole(t, 'log');
+
+  const rs = makeClient(server, { autoFlushMs: 60000, debug: true });
+  const result = await rs.init();
+  assert.deepEqual(result, { trackingEnabled: true, sessionReady: false, reason: 'invalid_key' });
+  assert.equal(rs._timer, null, 'the flush timer is stopped');
+  assert.equal(rs.retryInMs, 0, 'no backoff: an explicit flush retries at once');
+  assert.equal(rs.stats.lastError.code, 'invalid_key');
+  assert.equal(rs.stats.lastError.status, 401);
+  assert.equal(typeof rs.stats.lastError.at, 'number');
+  assert.equal(warnings.filter((w) => w.includes('invalid')).length, 1);
+
+  for (let i = 0; i < 60; i++) rs.track('e', { i });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(rs.queue.length, 60, 'track keeps queueing');
+  assert.equal(server.requestsTo('/api/v1/session').length, 1, 'the 50 event auto flush is suppressed');
+
+  const second = await rs.flush();
+  assert.equal(second.sent, 0);
+  assert.equal(server.requestsTo('/api/v1/session').length, 2, 'flush() retries');
+  assert.equal(warnings.filter((w) => w.includes('invalid')).length, 1, 'the warning fires once');
+
+  const third = await rs.flush();
+  assert.equal(third.sent, 60, 'the key works again and everything goes out');
+  assert.notEqual(rs._timer, null, 'the timer is running again');
+  await rs.dispose();
+});
+
+test('init reports rate_limited and honors Retry-After on POST /session', async (t) => {
+  const server = await startMockServer({
+    sessionOverrides: [{ status: 429, body: { error: 'rate_limited' }, headers: { 'Retry-After': '3' } }],
+  });
+  t.after(() => server.close());
+
+  const clock = fakeClock();
+  const rs = makeClient(server, { now: clock });
+  const result = await rs.init();
+  assert.deepEqual(result, { trackingEnabled: true, sessionReady: false, reason: 'rate_limited' });
+  assert.equal(rs.retryInMs, 3000);
+  assert.deepEqual(rs.stats.lastError, { code: 'rate_limited', status: 429, at: clock() });
+  await rs.dispose({ flush: false });
+});
+
+test('init reports offline when the network is down', async (t) => {
+  const rs = new Ravensight({
+    ingestKey: INGEST_KEY,
+    apiUrl: 'http://127.0.0.1:9',
+    autoFlushMs: 0,
+    storage: new MemoryStorage(),
+    fetch: async () => {
+      throw new Error('getaddrinfo ENOTFOUND');
+    },
+  });
+  const result = await rs.init();
+  assert.deepEqual(result, { trackingEnabled: true, sessionReady: false, reason: 'offline' });
+  assert.equal(rs.stats.lastError.code, 'offline');
+  assert.equal(rs.stats.lastError.status, 0);
+  await rs.dispose({ flush: false });
+});
+
+test('init reports session_failed for a server error, and invalid_key for another 403', async (t) => {
+  const server = await startMockServer({
+    sessionOverrides: [
+      { status: 500, body: { error: 'internal' } },
+      { status: 403, body: { error: 'forbidden' } },
+    ],
+  });
+  t.after(() => server.close());
+
+  const clock = fakeClock();
+  const rs = makeClient(server, { now: clock });
+  const first = await rs.init();
+  assert.equal(first.reason, 'session_failed');
+  assert.equal(rs.stats.lastError.status, 500);
+  assert.ok(rs.retryInMs > 0, 'a server error backs off');
+
+  clock.advance(60000);
+  const other = makeClient(server);
+  const second = await other.init();
+  assert.equal(second.reason, 'invalid_key');
+  await rs.dispose({ flush: false });
+  await other.dispose({ flush: false });
+});
+
+test('a 403 tracking_disabled on POST /session flips the kill switch locally', async (t) => {
+  const server = await startMockServer({
+    sessionOverrides: [{ status: 403, body: { error: 'tracking_disabled' } }],
+  });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  rs.track('queued');
+  const result = await rs.init();
+  assert.deepEqual(result, { trackingEnabled: false, sessionReady: false, reason: 'tracking_disabled' });
+  assert.equal(rs.trackingEnabled, false);
+  assert.equal(rs.isActive, false);
+  assert.equal(rs.queue.length, 0);
+  assert.equal(rs.track('after'), false);
+  assert.equal(rs._timer, null);
+  await rs.dispose();
+});
+
+test('stats.lastError records batch and settings failures', async (t) => {
+  const server = await startMockServer({ settingsStatus: 500, batchStatus: 503 });
+  t.after(() => server.close());
+
+  const rs = makeClient(server);
+  assert.equal(rs.stats.lastError, null);
+  await rs.init();
+  assert.equal(rs.stats.lastError.code, 'boom', 'the settings failure, with the server code');
+  assert.equal(rs.stats.lastError.status, 500);
+
+  rs.track('a');
+  await rs.flush();
+  assert.equal(rs.stats.lastError.code, 'unavailable');
+  assert.equal(rs.stats.lastError.status, 503);
+  await rs.dispose({ flush: false });
 });
 
 // --- Batching -------------------------------------------------------------
