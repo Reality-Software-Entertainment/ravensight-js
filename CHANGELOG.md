@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.3.0
+
+One client can now speak for many players, `init()` says why a session is
+not ready, and a refused key no longer retries forever.
+
+### Breaking
+
+* `setDeviceId(id)` no longer flushes or waits. It switches at once, stores
+  the id and resolves with `{ previousId, queuedUnderPreviousId }`. Events
+  queued before the switch keep the id they were tracked under and drain
+  later under that id's own session, which stays cached. In 0.2.0 they were
+  flushed first, and any that could not be sent moved to the new id.
+  `resetDeviceId()` follows the same rules and still resolves with the new id.
+* `dispose()` accounting: the last keepalive or beacon request in a browser
+  carries only the run of events at the head of the queue that share one
+  device id, because one request is one session. Events queued under other
+  ids that the bounded flush could not send are counted as dropped.
+* `sessionToken` and `sessionExpiresAt` are read only views of the current
+  device id's session. Assigning to them throws a `TypeError`.
+* `rs.queue` items carry a `deviceId` field. It is stripped before sending:
+  the server stamps the device id from the session.
+
+### Added
+
+* `track(event, data, { deviceId })` sends one event as another device, with
+  its own session, so one Node client serves many players.
+* `maxSessions` option (default 64): sessions are cached per device id and
+  the least recently used is dropped past the cap, never the current id or
+  one still opening. `stats.sessionsEvicted` counts them.
+* `rs.joinSession(token, { deviceId })` joins a session opened elsewhere,
+  normally the browser's `rs.sessionToken`, so server side events share the
+  player's analytics session. A refused join token falls back to a plain
+  session.
+* `init()` resolves with `reason`: `invalid_key`, `tracking_disabled`,
+  `offline`, `rate_limited`, `session_failed`, or `null` when the session is
+  ready.
+* `stats.lastError` is `{ code, status, at }` for the last failed session,
+  settings or batch request.
+* `RS_KINDS`, the four values the reserved `rs_kind` property accepts. With
+  `debug: true`, `track()` warns once per event and key about an `rs_kind`
+  outside it or an `rs_` key Ravensight does not read.
+* Ravensight Playtest support: a token left by the playtest runner in
+  `window.__RAVENSIGHT_PLAYTEST__`, `?rs_playtest=` or `localStorage`
+  `ravensight.playtest` is sent on `POST /session` as
+  `X-Ravensight-Playtest`. `rs.isPlaytest` reports it.
+
+### Changed
+
+* A flush sends one device per request: the leading run of events sharing
+  the head's device id, up to 50. A `401` re opens only that device's
+  session.
+* A refused ingest key (`401`, or a `403` other than `tracking_disabled`)
+  stops the flush timer and the 50 event auto flush. `track()` keeps
+  queueing up to `maxQueueSize`; `flush()` and `init()` try again, and the
+  first session that opens restarts the timer. With `debug: true` it warns
+  once.
+* A `403 tracking_disabled` from `POST /session` switches tracking off
+  locally, the same as the kill switch read from `GET /settings`.
+* Under a playtest no device id is read from or written to storage, and a
+  `403 playtest_job_closed` stops the client for good.
+
 ## 0.2.0
 
 First release on npm: `npm install ravensight`.

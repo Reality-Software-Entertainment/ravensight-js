@@ -75,7 +75,8 @@ rs.track('match_finished', { mode: 'ranked', durationSec: 620 });
 // Give it a stable id or your own storage if you want it to persist.
 ```
 
-A Node process that serves many players needs one client per player. See
+A Node process that serves many players needs only one client: pass each
+player's id with the event. See
 [Node servers with many players](#node-servers-with-many-players).
 
 Persisting the device id in Node:
@@ -95,42 +96,70 @@ const rs = new Ravensight({ ingestKey: 'gt_live_...', storage: fileStorage });
 
 ## Node servers with many players
 
-The device id belongs to the session, and the server fixes it when the session
-opens. One client therefore speaks for one player. On a game server, create a
-client per connected player, keyed on your own player id, and dispose of it
-when they leave:
+The server stamps the device id from the session, so every device needs its
+own session. The SDK keeps one per device id for you. On a game server, create
+one client and pass the player's id as the third argument to `track()`:
 
 ```js
 import Ravensight, { MemoryStorage } from 'ravensight';
 
-const clients = new Map();
+const rs = new Ravensight({
+  ingestKey: process.env.RAVENSIGHT_KEY,
+  gameVersion: '1.4.0',
+  platform: 'dedicated-server',
+  // Explicit, so the server's own device id never lands in a shared
+  // localStorage polyfill or a file another process reads.
+  storage: new MemoryStorage(),
+});
+await rs.init();
 
-async function onConnect(player) {
-  const rs = new Ravensight({
-    ingestKey: process.env.RAVENSIGHT_KEY,
-    gameVersion: '1.4.0',
-    platform: 'dedicated-server',
-    deviceId: player.id,
-    // Explicit, so no client ever reads or writes another player's id
-    // through a shared localStorage polyfill.
-    storage: new MemoryStorage(),
-  });
-  clients.set(player.id, rs);
-  await rs.init();
+function onMatchFinished(player, match) {
+  rs.track('match_finished', { mode: match.mode, durationSec: match.seconds }, { deviceId: player.id });
 }
 
-async function onDisconnect(player) {
-  const rs = clients.get(player.id);
-  clients.delete(player.id);
-  // Flushes what is queued (bounded by timeoutMs) before shutting down.
-  if (rs) await rs.dispose();
-}
+// On shutdown, the last flush for every player at once.
+process.on('SIGTERM', async () => {
+  await rs.dispose({ timeoutMs: 5000 });
+  process.exit(0);
+});
 ```
 
-Every client opens its own session, and the limits are per game, not per
-client: 60 session creations and 600 tracked events a minute. A burst of
-joins past that gets `429` with `Retry-After`, and the SDK holds the events
-and retries. See the [limits](https://ravensight.io/docs/#limits).
+* **One request is one device.** A flush sends the run of queued events that
+  share the device id at the head of the queue, up to 50, under that id's
+  session, then the next run. Interleaved players cost more requests than one
+  player, but nothing is ever sent under the wrong id.
+* **Sessions are cached per id**, up to `maxSessions` (default 64). Past that
+  the least recently used is dropped and reopens on that player's next
+  event. Raise it if more players than that are active at once.
+* **Limits are per game, shared by every player** on the client: 60 session
+  creations and 600 tracked events a minute. A burst past that gets `429`
+  with `Retry-After`, and the SDK holds the events and retries for all of
+  them. See the [limits](https://ravensight.io/docs/#limits).
+* **`dispose()` is the last flush.** Call it on shutdown. Anything it cannot
+  send inside `timeoutMs` is counted in `stats.dropped`.
+
+### Joining the browser's session
+
+When the same player also runs the browser SDK, the browser can hand its
+session to your server, so server side events land in the same analytics
+session as the player's own:
+
+```js
+// Browser: send the token to your server with your own request.
+await fetch('/api/link-analytics', {
+  method: 'POST',
+  body: JSON.stringify({ rsToken: rs.sessionToken }),
+});
+
+// Server: one call per player, before that player's next event.
+rs.joinSession(body.rsToken, { deviceId: player.id });
+rs.track('purchase_verified', { sku: 'gold_pack' }, { deviceId: player.id });
+```
+
+The next session opened for that id carries the token once, and the server
+copies the browser's device id. The local id is only the key the SDK caches
+the session under. If the server refuses the token, the SDK opens a plain
+session instead and records `invalid_join_token` in `stats.lastError`.
 
 ## itch.io and HTML5 exports
 
@@ -161,27 +190,60 @@ and hand written canvas games.
 | `platform` | auto | `'web'` in a browser, `node-<platform>` in Node. |
 | `autoFlushMs` | `15000` | Flush interval. Set `0` to flush only on demand. |
 | `maxQueueSize` | `500` | Offline queue cap. Oldest events are dropped first. |
+| `maxSessions` | `64` | Sessions cached at once, one per device id. The least recently used is dropped first, never the current id. |
 | `storage` | auto | Anything with `getItem` and `setItem`. Used for the device id. |
 | `deviceId` | auto | Override the generated device id entirely. |
 | `enabled` | `true` | Start opted out by passing `false`. |
 | `fetch` | global | Inject a custom fetch. |
-| `debug` | `false` | Log SDK activity to the console. |
+| `debug` | `false` | Log SDK activity to the console, and warn about reserved `rs_` keys. |
 
 ### `await rs.init()`
 
 Reads `GET /settings` for the kill switch, then opens a session with
-`POST /session`. Returns `{ trackingEnabled, sessionReady }`. It never throws on
-a network failure: if the settings call fails the SDK assumes tracking is on, and
-if the session call fails events keep queueing until a retry succeeds.
+`POST /session`. Returns `{ trackingEnabled, sessionReady, reason }`. It never
+throws on a network failure: if the settings call fails the SDK assumes
+tracking is on, and if the session call fails events keep queueing until a
+retry succeeds.
+
+`reason` is `null` when the session is ready, otherwise one of:
+
+| Reason | Meaning |
+| --- | --- |
+| `invalid_key` | The key was refused (`401`, or a `403` other than the kill switch). The flush timer stops; see below. |
+| `tracking_disabled` | Tracking is switched off for this game. Nothing is sent. |
+| `offline` | No answer from the network. Retried with backoff. |
+| `rate_limited` | `429`. Retried after `Retry-After`. |
+| `session_failed` | Any other answer. Retried with backoff. |
+
+With `invalid_key` the SDK stops its flush timer and the automatic flush at
+50 queued events, because retrying on a timer cannot fix a wrong key.
+`track()` keeps queueing up to `maxQueueSize`. `flush()` and `init()` still
+try again, and the first session that opens restarts the timer. With
+`debug: true` it warns once.
 
 If the server has tracking switched off for your game, the queue is cleared,
 `track()` becomes a no op and nothing further is sent.
 
-### `rs.track(event, data?)`
+`rs.stats.lastError` holds the last failed request as `{ code, status, at }`
+(`at` in epoch ms, `status` 0 for a network failure), from the session,
+settings or batch requests, or `null`. Read it when events are not arriving.
+
+### `rs.track(event, data?, { deviceId }?)`
 
 Queues an event. Safe to call before `init()`. Returns `false` when tracking is
 off. Timestamps are recorded as unix seconds at the moment of the call, so a
 delayed flush still reports when the thing actually happened.
+
+`deviceId` sends this one event as another device, under that id's own
+session. It must be a non-empty string or `track()` throws a `TypeError`.
+Leave it out to use the client's own id. See
+[Node servers with many players](#node-servers-with-many-players).
+
+Property keys starting with `rs_` are reserved for Ravensight. `rs_kind` says
+what an event means for the level funnel and must be one of `RS_KINDS`:
+`level_start`, `level_complete`, `death` or `none`. With `debug: true`, the SDK
+warns once per event and key about an `rs_kind` outside that list or an `rs_`
+key Ravensight does not read. It never throws and still queues the event.
 
 ### `await rs.flush()`
 
@@ -221,20 +283,27 @@ in memory.
 ### `await rs.setDeviceId(id)` and `await rs.resetDeviceId()`
 
 Changes the device id after construction, for example once a player signs in
-on a shared machine. `id` must be a non-empty string, and setting the current
-id again does nothing. It rejects with code `disposed` after `dispose()`.
+on a shared machine. `id` must be a non-empty string. It rejects with code
+`disposed` after `dispose()`.
 
-The server stamps the device id from the session, so the switch happens in
-order: events already queued are flushed first under the old session, then the
-session is dropped and the new id is stored under `ravensight_device_id`. The
-next flush opens a new session for the new id.
-
-One edge: if that first flush cannot reach the server (offline, rate limited),
-the queued events are kept and go out later under the new id rather than being
-dropped.
+The switch is immediate: nothing is flushed or waited for. The new id is
+stored under `ravensight_device_id`, and its session opens on the next flush.
+Events already queued keep the id they were tracked under and go out under
+that id's own session, which stays cached, so nothing is ever sent under the
+wrong id. Resolves with `{ previousId, queuedUnderPreviousId }`, the old id
+and how many of its events are still queued. Setting the current id again
+changes nothing.
 
 `resetDeviceId()` does the same with a fresh random id and resolves with it.
 Use it for a "reset analytics id" button.
+
+### `rs.joinSession(token, { deviceId }?)`
+
+Joins a session opened elsewhere, normally the browser's `rs.sessionToken`,
+so the next session for `deviceId` (default: the client's own id) shares its
+analytics session. Any session already cached for that id is dropped. The
+token is used once. See
+[Joining the browser's session](#joining-the-browsers-session).
 
 ### `await rs.dispose({ flush = true, timeoutMs = 2000 })`
 
@@ -281,8 +350,12 @@ Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
   that the oldest are dropped so the newest are always kept.
 * **Never dropped on failure.** Events are only removed from the queue after the
   server answers `202`.
-* **Session expiry.** A `401` clears the session, opens a new one and re sends
-  the same batch.
+* **One device per batch.** Each request carries the leading run of queued
+  events that share one device id, under that id's session.
+* **Session expiry.** A `401` clears that device's session only, opens a new
+  one and re sends the same batch.
+* **Invalid key.** A refused key stops the flush timer instead of retrying
+  forever. Events keep queueing; `flush()` or `init()` try again.
 * **Rate limits.** A `429` honors `Retry-After` in seconds. With no such header
   the SDK backs off exponentially from 10 seconds up to a 5 minute ceiling. The
   queue is held, never discarded.
@@ -303,6 +376,20 @@ the page goes hidden. It prefers `fetch` with `keepalive: true` rather than
 batch endpoint authenticates with `X-Session-Token`. `sendBeacon` is used only
 where keepalive is unavailable, and then the token travels inside the JSON body
 as `sessionToken`, never in the URL, where proxies and logs could capture it.
+
+## Ravensight Playtest
+
+When a Ravensight Playtest run drives your web build, the runner leaves a
+token for the page. The SDK reads it at construction from
+`window.__RAVENSIGHT_PLAYTEST__`, then the `?rs_playtest=` query parameter,
+then `localStorage` `ravensight.playtest`, and sends it on `POST /session` as
+`X-Ravensight-Playtest`. You do not need to do anything.
+
+The server then marks the session as a playtest, so it never counts as a real
+player, and decides its device id, so the SDK neither reads nor stores one.
+When the playtest job has finished the server answers
+`403 playtest_job_closed` and the client stops for good. `rs.isPlaytest` says
+whether a token was found.
 
 ## What the dashboard does with your events
 

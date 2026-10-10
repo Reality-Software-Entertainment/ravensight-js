@@ -1,6 +1,6 @@
 {
   "name": "ravensight",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Official JavaScript SDK for Ravensight player analytics. Browser and Node, zero dependencies: sessions, batched events, offline queue.",
   "license": "MIT",
   "author": "Reality Software Entertainment",
