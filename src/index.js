@@ -1058,6 +1058,8 @@ export class Ravensight {
    * `offset` skips events already in a batch request awaiting an answer.
    */
   _flushOnHidden(offset = 0) {
+    // There is no page to hide in Node.
+    if (!this._env && !isBrowser()) return false;
     if (!this._canSend || this.queue.length <= offset) return false;
     const deviceId = this.queue[offset].deviceId;
     if (!this.isSessionValid(deviceId)) return false;

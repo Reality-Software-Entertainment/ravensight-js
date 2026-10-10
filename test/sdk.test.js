@@ -257,7 +257,9 @@ test('events are batched at the 50 event server limit', async (t) => {
 
   for (let i = 0; i < 120; i++) rs.track('tick', { i });
   await rs.flush();
-  await waitFor(() => server.state.events.length === 120);
+  // The mock stores events before it answers, so also wait for the SDK to
+  // see the last 202.
+  await waitFor(() => server.state.events.length === 120 && rs.queue.length === 0);
 
   const batches = server.requestsTo('/api/v1/track/batch');
   assert.ok(batches.length >= 3, 'at least three batches were needed');
@@ -1095,6 +1097,18 @@ test('the hidden page flush sends only the head run under its own session', asyn
       ['p2', ['b']],
     ],
   );
+  await rs.dispose({ flush: false });
+});
+
+test('the hidden page flush is a no op in Node without an injected browser env', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server);
+  await rs.init();
+  rs.track('a');
+  assert.equal(rs._flushOnHidden(), false);
+  assert.equal(rs.queue.length, 1);
   await rs.dispose({ flush: false });
 });
 
