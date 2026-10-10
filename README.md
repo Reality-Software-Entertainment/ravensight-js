@@ -130,7 +130,9 @@ process.on('SIGTERM', async () => {
   player, but nothing is ever sent under the wrong id.
 * **Sessions are cached per id**, up to `maxSessions` (default 64). Past that
   the least recently used is dropped and reopens on that player's next
-  event. Raise it if more players than that are active at once.
+  event. Raise it if more players than that are active at once. It is a soft
+  bound: a session still opening, one holding a join token not yet used, and
+  the client's own id are never dropped, so the cache can briefly hold more.
 * **Limits are per game, shared by every player** on the client: 60 session
   creations and 600 tracked events a minute. A burst past that gets `429`
   with `Retry-After`, and the SDK holds the events and retries for all of
@@ -227,6 +229,9 @@ If the server has tracking switched off for your game, the queue is cleared,
 `rs.stats.lastError` holds the last failed request as `{ code, status, at }`
 (`at` in epoch ms, `status` 0 for a network failure), from the session,
 settings or batch requests, or `null`. Read it when events are not arriving.
+It can show `session_expired` after a routine batch `401`, which the SDK has
+already recovered from by opening a new session; look at it together with
+whether `rs.queue` is draining.
 
 ### `rs.track(event, data?, { deviceId }?)`
 

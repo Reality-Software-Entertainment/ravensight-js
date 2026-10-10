@@ -192,7 +192,10 @@ function readPlaytestToken(storage) {
   }
   const stores = [storage];
   try {
-    if (typeof localStorage !== 'undefined' && localStorage && localStorage !== storage) stores.push(localStorage);
+    // Only in a browser: touching the global in Node 25+ prints a warning.
+    if (isBrowser() && typeof localStorage !== 'undefined' && localStorage && localStorage !== storage) {
+      stores.push(localStorage);
+    }
   } catch (_err) {
     // Blocked storage.
   }
@@ -710,20 +713,23 @@ export class Ravensight {
     } else {
       entry = { token: null, expiresAt: 0, promise: null, joinToken: null };
       this._sessions.set(deviceId, entry);
-      this._evictSessions();
+      // Never the entry being created: the caller is about to use it.
+      this._evictSessions(deviceId);
     }
     return entry;
   }
 
   /**
-   * Drops least recently used sessions past `maxSessions`. Never the current
-   * id, one still opening, or one holding a join token not yet used.
+   * Drops least recently used sessions past `maxSessions`. Never `keepId`,
+   * the current id, one still opening, or one holding a join token not yet
+   * used. When every entry is protected the cache stays over the bound until
+   * one frees up, so `maxSessions` is a soft bound.
    */
-  _evictSessions() {
+  _evictSessions(keepId) {
     if (this._sessions.size <= this.maxSessions) return;
     for (const [id, entry] of this._sessions) {
       if (this._sessions.size <= this.maxSessions) break;
-      if (id === this.deviceId || entry.promise || entry.joinToken) continue;
+      if (id === keepId || id === this.deviceId || entry.promise || entry.joinToken) continue;
       this._sessions.delete(id);
       this.stats.sessionsEvicted += 1;
     }
@@ -766,7 +772,7 @@ export class Ravensight {
       if (this._sessions.get(deviceId) !== entry) this._sessions.set(deviceId, entry);
       this.stats.sessions += 1;
       this._resetBackoff();
-      this._evictSessions();
+      this._evictSessions(deviceId);
       if (this._invalidKey) {
         this._invalidKey = false;
         if (this.initialized && this.isActive) this._startTimer();
@@ -899,6 +905,10 @@ export class Ravensight {
       }
       if (this._disposed) break;
       if (this.queue.length === 0) break;
+      // The head can change during the await: the queue cap may have shifted
+      // this device's run out. Never send another device's events under this
+      // token; re-evaluate the head run instead.
+      if (this.queue[0].deviceId !== deviceId) continue;
 
       const size = Math.min(batchLimit, this._runLength(0));
       this._inflightSize = size;

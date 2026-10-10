@@ -1371,3 +1371,70 @@ test('debug mode warns once per event and key about reserved rs_ keys, and never
   await rs.dispose({ flush: false });
   await quiet.dispose({ flush: false });
 });
+
+// --- Fix round 1 ------------------------------------------------------------
+
+test('a cache full of pending joins never drops a join token', async (t) => {
+  const ids = ['p1', 'p2', 'p3', 'p4'];
+  const server = await startMockServer({ joinTokens: ids.map((id) => 'join_' + id).concat(['join_p7']) });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host', maxSessions: 3 });
+  await rs.init();
+  for (const id of ids) rs.joinSession('join_' + id, { deviceId: id });
+  for (const id of ids) rs.track('e', {}, { deviceId: id });
+  await rs.flush();
+
+  for (const id of ids) {
+    const req = server.requestsTo('/api/v1/session').find((r) => r.body.deviceId === id);
+    assert.equal(req.body.joinToken, 'join_' + id, id + ' carried its join token');
+  }
+  assert.equal(server.state.batches.length, 4);
+
+  const tiny = makeClient(server, { deviceId: 'host2', maxSessions: 1 });
+  tiny.joinSession('join_p7', { deviceId: 'p7' });
+  tiny.track('e', {}, { deviceId: 'p7' });
+  await tiny.flush();
+  const p7 = server.requestsTo('/api/v1/session').filter((r) => r.body.deviceId === 'p7');
+  assert.equal(p7.length, 1);
+  assert.equal(p7[0].body.joinToken, 'join_p7');
+  await rs.dispose();
+  await tiny.dispose();
+});
+
+test('concurrent session requests for a new id open one session even when the cache is full', async (t) => {
+  const server = await startMockServer({ sessionDelayMs: 50 });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host', maxSessions: 1 });
+  const first = rs._ensureSession('host');
+  const a = rs._ensureSession('p1');
+  const b = rs._ensureSession('p1');
+  assert.equal(a, b, 'the second call reuses the first one in flight');
+  await Promise.all([first, a, b]);
+  assert.deepEqual(server.state.sessionDevices.sort(), ['host', 'p1']);
+  await rs.dispose({ flush: false });
+});
+
+test('events dropped at the queue cap while a session opens never go out under another device', async (t) => {
+  const server = await startMockServer({ sessionDelayMs: 100 });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { maxQueueSize: 2 });
+  rs.track('a1', { who: 'A' }, { deviceId: 'A' });
+  rs.track('b1', { who: 'B' }, { deviceId: 'B' });
+  const flushing = rs.flush();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  // The session for A is still opening. The cap shifts A's only event out.
+  rs.track('b2', { who: 'B' }, { deviceId: 'B' });
+  assert.deepEqual(rs.queue.map((e) => e.deviceId), ['B', 'B']);
+  await flushing;
+  await rs.flush();
+
+  assert.ok(server.state.batches.length >= 1);
+  for (const batch of server.state.batches) {
+    for (const e of batch.events) assert.equal(e.data.who, batch.device, e.event + ' went out as ' + batch.device);
+  }
+  assert.deepEqual(server.state.events.map((e) => e.event), ['b1', 'b2']);
+  await rs.dispose();
+});
