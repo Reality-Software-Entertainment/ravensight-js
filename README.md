@@ -380,10 +380,11 @@ as `sessionToken`, never in the URL, where proxies and logs could capture it.
 ## Ravensight Playtest
 
 When a Ravensight Playtest run drives your web build, the runner leaves a
-token for the page. The SDK reads it at construction from
-`window.__RAVENSIGHT_PLAYTEST__`, then the `?rs_playtest=` query parameter,
-then `localStorage` `ravensight.playtest`, and sends it on `POST /session` as
-`X-Ravensight-Playtest`. You do not need to do anything.
+token in the page. The SDK reads it at construction from
+`window.__RAVENSIGHT_PLAYTEST__`, then `localStorage` `ravensight.playtest`,
+and sends it on `POST /session` as `X-Ravensight-Playtest`. You do not need
+to do anything. It is never read from the URL, so a link cannot turn a
+visitor into a playtest.
 
 The server then marks the session as a playtest, so it never counts as a real
 player, and decides its device id, so the SDK neither reads nor stores one.

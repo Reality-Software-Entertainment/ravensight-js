@@ -1262,23 +1262,26 @@ test('the playtest token is read from window.__RAVENSIGHT_PLAYTEST__ first', asy
   t.after(() => server.close());
   withWindow(t, {
     __RAVENSIGHT_PLAYTEST__: { token: 'pt_tok_1', runId: 'r1', jobId: 'j1', persona: 'speedrunner' },
-    location: { search: '?rs_playtest=pt_tok_query' },
   });
   const storage = new MemoryStorage();
   storage.setItem('ravensight.playtest', JSON.stringify({ token: 'pt_tok_stored' }));
   await assertPlaytestSession(t, server, storage, 'pt_tok_1');
 });
 
-test('the playtest token is read from ?rs_playtest= second', async (t) => {
+test('a playtest token in the URL query string is ignored', async (t) => {
   const server = await startMockServer();
   t.after(() => server.close());
-  withWindow(t, { location: { search: '?level=2&rs_playtest=pt_tok_2' } });
+  withWindow(t, { location: { search: '?level=2&rs_playtest=pt_tok_query' } });
   const storage = new MemoryStorage();
-  storage.setItem('ravensight.playtest', JSON.stringify({ token: 'pt_tok_stored' }));
-  await assertPlaytestSession(t, server, storage, 'pt_tok_2');
+  const rs = makeClient(server, { storage });
+  assert.equal(rs.isPlaytest, false, 'a link can never make a visitor a playtest');
+  await rs.init();
+  assert.equal(server.requestsTo('/api/v1/session')[0].headers['x-ravensight-playtest'], undefined);
+  assert.equal(storage.getItem('ravensight_device_id'), rs.deviceId);
+  await rs.dispose();
 });
 
-test('the playtest token is read from localStorage ravensight.playtest last', async (t) => {
+test('the playtest token is read from localStorage ravensight.playtest second', async (t) => {
   const server = await startMockServer();
   t.after(() => server.close());
   const storage = new MemoryStorage();

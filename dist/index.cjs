@@ -36,7 +36,6 @@ const DEVICE_ID_KEY = 'ravensight_device_id';
 /** Where the playtest runner leaves its token for the page. */
 const PLAYTEST_STORAGE_KEY = 'ravensight.playtest';
 const PLAYTEST_GLOBAL = '__RAVENSIGHT_PLAYTEST__';
-const PLAYTEST_QUERY_PARAM = 'rs_playtest';
 /** Clock skew allowance so we refresh slightly before the server expires us. */
 const EXPIRY_SKEW_MS = 5000;
 
@@ -174,20 +173,19 @@ function playtestTokenFrom(value) {
 }
 
 /**
- * The Ravensight Playtest runner hands the game a token, read in this order:
- * `window.__RAVENSIGHT_PLAYTEST__`, the `?rs_playtest=` query parameter, then
+ * The Ravensight Playtest runner injects a token into the page, read in this
+ * order: `window.__RAVENSIGHT_PLAYTEST__`, then
  * `localStorage['ravensight.playtest']`. Null outside a playtest.
+ *
+ * Never from the URL: a bearer token in a query string leaks through
+ * referrers, history and server logs, and a crafted link could pin a
+ * visitor's session to a playtest run.
  */
 function readPlaytestToken(storage) {
   try {
     if (typeof window !== 'undefined' && window) {
       const fromGlobal = playtestTokenFrom(window[PLAYTEST_GLOBAL]);
       if (fromGlobal) return fromGlobal;
-      const search = window.location && window.location.search;
-      if (search && typeof URLSearchParams === 'function') {
-        const fromQuery = playtestTokenFrom(new URLSearchParams(search).get(PLAYTEST_QUERY_PARAM));
-        if (fromQuery) return fromQuery;
-      }
     }
   } catch (_err) {
     // A hostile or partial window object. Fall through to storage.

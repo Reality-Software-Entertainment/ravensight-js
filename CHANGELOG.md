@@ -42,8 +42,8 @@ not ready, and a refused key no longer retries forever.
   `debug: true`, `track()` warns once per event and key about an `rs_kind`
   outside it or an `rs_` key Ravensight does not read.
 * Ravensight Playtest support: a token left by the playtest runner in
-  `window.__RAVENSIGHT_PLAYTEST__`, `?rs_playtest=` or `localStorage`
-  `ravensight.playtest` is sent on `POST /session` as
+  `window.__RAVENSIGHT_PLAYTEST__` or `localStorage` `ravensight.playtest`
+  is sent on `POST /session` as
   `X-Ravensight-Playtest`. `rs.isPlaytest` reports it.
 
 ### Changed

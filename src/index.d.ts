@@ -135,7 +135,7 @@ export declare class Ravensight {
   readonly isActive: boolean;
   readonly retryInMs: number;
   readonly maxSessions: number;
-  /** True when a Ravensight Playtest token was found at construction (window.__RAVENSIGHT_PLAYTEST__, ?rs_playtest=, or localStorage ravensight.playtest). */
+  /** True when a Ravensight Playtest token was found at construction (window.__RAVENSIGHT_PLAYTEST__, then localStorage ravensight.playtest). */
   readonly isPlaytest: boolean;
   /** The current device id's session token, or null. */
   readonly sessionToken: string | null;
