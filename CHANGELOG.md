@@ -12,6 +12,10 @@ First release on npm: `npm install ravensight`.
   with `{ sent, dropped }`. Events in a request that timed out are counted
   as dropped and never re sent, so nothing arrives twice. `{ flush: false }`
   keeps the 0.1.0 behavior of discarding the queue.
+* The page-hide flush never re sends a batch that is still in flight, so a
+  batch aborted by a real unload can be lost rather than duplicated. A batch
+  whose response is lost, from a network error or a `5xx` after the server
+  already stored it, can still be sent again on the next flush.
 * `submitFeedback` rejects a category outside `FEEDBACK_CATEGORIES` with
   `invalid_category`, and a rating that is not an integer from 1 to 5 with
   `invalid_rating`, before any request is made. `null`, `undefined` and `''`

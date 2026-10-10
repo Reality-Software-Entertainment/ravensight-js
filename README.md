@@ -289,6 +289,11 @@ Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
 * **Oversize batches.** A `400` halves the batch and retries, down to a single
   event. An event that is still rejected on its own is dropped so it cannot
   block everything behind it.
+* **No re-send while in flight.** The page-hide flush never sends a batch that
+  is still in flight, so a batch aborted by a real unload can be lost rather
+  than duplicated. A batch whose response is lost, from a network error or a
+  `5xx` after the server already stored it, stays queued and can be sent again
+  on the next flush; ingest does not remove duplicates.
 
 ## Flush on page hide
 
