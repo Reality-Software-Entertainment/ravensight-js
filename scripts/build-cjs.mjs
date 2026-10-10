@@ -22,6 +22,7 @@ const NAMED_EXPORTS = [
   'DEFAULT_API_URL',
   'MAX_BATCH_SIZE',
   'FEEDBACK_CATEGORIES',
+  'RS_KINDS',
   'RavensightError',
   'MemoryStorage',
   'Ravensight',

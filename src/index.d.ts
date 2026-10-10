@@ -6,6 +6,10 @@ export type FeedbackCategory = 'bug' | 'suggestion' | 'complaint' | 'praise' | '
 /** The six feedback categories the API accepts, frozen. */
 export declare const FEEDBACK_CATEGORIES: readonly FeedbackCategory[];
 
+export type RsKind = 'level_start' | 'level_complete' | 'death' | 'none';
+/** The values the reserved rs_kind property accepts, frozen. Keys starting with rs_ are reserved. */
+export declare const RS_KINDS: readonly RsKind[];
+
 export interface RavensightStorage {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
@@ -29,6 +33,7 @@ export interface RavensightOptions {
   enabled?: boolean;
   fetch?: typeof fetch;
   now?: () => number;
+  /** Log SDK activity, and warn once per event and key about an unknown rs_kind or rs_ key. */
   debug?: boolean;
 }
 

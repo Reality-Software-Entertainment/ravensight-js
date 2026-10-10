@@ -12,6 +12,7 @@ import Ravensight, {
   parseRetryAfterMs,
   chooseUnloadTransport,
   FEEDBACK_CATEGORIES,
+  RS_KINDS,
   VERSION,
 } from '../src/index.js';
 import { startMockServer, fakeClock } from './helpers/mock-server.js';
@@ -596,6 +597,8 @@ test('the generated CommonJS build exposes the same surface', () => {
   assert.equal(typeof cjs.Ravensight.prototype.setDeviceId, 'function');
   assert.equal(typeof cjs.Ravensight.prototype.resetDeviceId, 'function');
   assert.equal(cjs.MAX_BATCH_SIZE, 50);
+  assert.deepEqual(cjs.RS_KINDS, ['level_start', 'level_complete', 'death', 'none']);
+  assert.equal(typeof cjs.Ravensight.prototype.joinSession, 'function');
   assert.equal(typeof cjs.MemoryStorage, 'function');
   assert.equal(typeof cjs.RavensightError, 'function');
   assert.equal(cjs.normalizeApiUrl('https://x.test'), 'https://x.test/api/v1');
@@ -1303,4 +1306,51 @@ test('a 403 playtest_job_closed is fatal: tracking stops and the timer with it',
   assert.equal(again.trackingEnabled, false, 'a later init() does not revive a closed playtest');
   assert.equal(server.requestsTo('/api/v1/session').length, 1);
   await rs.dispose();
+});
+
+// --- Reserved rs_ keys ----------------------------------------------------
+
+test('RS_KINDS is the four rs_kind values, frozen', () => {
+  assert.deepEqual(RS_KINDS, ['level_start', 'level_complete', 'death', 'none']);
+  assert.ok(Object.isFrozen(RS_KINDS));
+});
+
+test('debug mode warns once per event and key about reserved rs_ keys, and never throws', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const warnings = captureConsole(t, 'warn');
+
+  const rs = makeClient(server, { debug: true });
+  assert.equal(rs.track('lvl', { rs_kind: 'level_begin' }), true, 'the event is still queued');
+  rs.track('lvl', { rs_kind: 'level_begin' });
+  assert.equal(warnings.length, 1, 'once per event and key');
+  assert.ok(warnings[0].includes('rs_kind') && warnings[0].includes('level_begin') && warnings[0].includes('lvl'));
+
+  rs.track('other', { rs_kind: 'level_begin' });
+  assert.equal(warnings.length, 2, 'another event warns again');
+
+  for (const kind of RS_KINDS) rs.track('lvl2', { rs_kind: kind });
+  rs.track('probe', { rs_doctor: 'abc' });
+  rs.track('plain', { level: 3, rs: 1, rsx: 2 });
+  assert.equal(warnings.length, 2, 'known kinds, rs_doctor and non reserved keys are silent');
+
+  rs.track('lvl', { rs_colour: 'red' });
+  rs.track('lvl', { rs_colour: 'blue' });
+  assert.equal(warnings.length, 3, 'an unknown rs_ key warns once');
+  assert.ok(warnings[2].includes('rs_colour'));
+
+  const hostile = {};
+  Object.defineProperty(hostile, 'rs_kind', {
+    enumerable: true,
+    get() {
+      throw new Error('boom');
+    },
+  });
+  assert.doesNotThrow(() => rs.track('hostile', hostile));
+
+  const quiet = makeClient(server);
+  quiet.track('lvl', { rs_kind: 'nope', rs_other: 1 });
+  assert.equal(warnings.length, 3, 'nothing without debug');
+  await rs.dispose({ flush: false });
+  await quiet.dispose({ flush: false });
 });

@@ -17,6 +17,15 @@ const MAX_BATCH_SIZE = 50;
 /** Feedback categories the API accepts. Anything else is rejected locally. */
 const FEEDBACK_CATEGORIES = Object.freeze(['bug', 'suggestion', 'complaint', 'praise', 'playtest', 'other']);
 
+/**
+ * Values the reserved `rs_kind` property accepts: what an event means for the
+ * level funnel. Property keys starting with `rs_` are reserved for Ravensight.
+ */
+const RS_KINDS = Object.freeze(['level_start', 'level_complete', 'death', 'none']);
+
+/** The reserved keys Ravensight reads. Any other `rs_` key is a typo or a clash. */
+const KNOWN_RS_KEYS = Object.freeze(['rs_kind', 'rs_doctor']);
+
 const DEFAULT_QUEUE_CAP = 500;
 const DEFAULT_RETRY_MS = 10000;
 const MAX_BACKOFF_MS = 300000;
@@ -284,6 +293,8 @@ class Ravensight {
     /** Set when POST /session refuses the key. Stops the timer until a session opens. */
     this._invalidKey = false;
     this._invalidKeyWarned = false;
+    /** event + key pairs already warned about in debug mode. */
+    this._reservedWarned = new Set();
     /** Set by a 403 playtest_job_closed. Permanent for this client. */
     this._playtestClosed = false;
   }
@@ -385,6 +396,7 @@ class Ravensight {
       deviceId = options.deviceId;
     }
     if (!this.isActive) return false;
+    if (this.debug && data && typeof data === 'object') this._checkReservedKeys(event, data);
 
     if (this.queue.length >= this.maxQueueSize) {
       this.queue.shift();
@@ -402,6 +414,36 @@ class Ravensight {
     // While the key is refused only an explicit flush() or init() retries.
     if (this.queue.length >= MAX_BATCH_SIZE && !this._invalidKey) this.flush().catch(noop);
     return true;
+  }
+
+  /**
+   * Debug only: warns once per event and key about an `rs_kind` outside
+   * RS_KINDS or an `rs_` key Ravensight does not read. Never throws.
+   */
+  _checkReservedKeys(event, data) {
+    try {
+      for (const key of Object.keys(data)) {
+        if (!key.startsWith('rs_')) continue;
+        let problem = null;
+        if (key === 'rs_kind') {
+          const value = data[key];
+          if (!RS_KINDS.includes(value)) {
+            problem =
+              'rs_kind ' + JSON.stringify(value) + ' is not one of ' + RS_KINDS.join(', ') +
+              '; the dashboard falls back to the event name';
+          }
+        } else if (!KNOWN_RS_KEYS.includes(key)) {
+          problem = key + ' is not a key Ravensight reads; keys starting with rs_ are reserved';
+        }
+        if (!problem) continue;
+        const seen = event + '\u0000' + key;
+        if (this._reservedWarned.has(seen)) continue;
+        this._reservedWarned.add(seen);
+        if (typeof console !== 'undefined') console.warn('[ravensight] event "' + event + '": ' + problem);
+      }
+    } catch (_err) {
+      // A diagnostic must never break tracking.
+    }
   }
 
   /**
@@ -1176,6 +1218,7 @@ module.exports.VERSION = VERSION;
 module.exports.DEFAULT_API_URL = DEFAULT_API_URL;
 module.exports.MAX_BATCH_SIZE = MAX_BATCH_SIZE;
 module.exports.FEEDBACK_CATEGORIES = FEEDBACK_CATEGORIES;
+module.exports.RS_KINDS = RS_KINDS;
 module.exports.RavensightError = RavensightError;
 module.exports.MemoryStorage = MemoryStorage;
 module.exports.Ravensight = Ravensight;
