@@ -44,6 +44,10 @@ export async function startMockServer(config = {}) {
     maxBatchAccept: config.maxBatchAccept == null ? MAX_BATCH_SIZE : config.maxBatchAccept,
     /** Queue of one shot overrides for POST /track/batch. */
     batchOverrides: config.batchOverrides ? config.batchOverrides.slice() : [],
+    /** Status for every POST /track/batch (e.g. 503 for a failing server). */
+    batchStatus: config.batchStatus == null ? null : config.batchStatus,
+    /** Delay before answering POST /track/batch, to simulate a hung server. */
+    batchDelayMs: config.batchDelayMs == null ? 0 : config.batchDelayMs,
     seq: 0,
   };
 
@@ -85,6 +89,12 @@ export async function startMockServer(config = {}) {
     }
 
     if (req.method === 'POST' && path === '/api/v1/track/batch') {
+      if (state.batchDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, state.batchDelayMs).unref());
+      }
+      if (state.batchStatus != null) {
+        return send(res, state.batchStatus, { error: 'unavailable' });
+      }
       const override = state.batchOverrides.shift();
       if (override) {
         return send(res, override.status, override.body || { error: 'forced' }, override.headers || {});
@@ -141,7 +151,10 @@ export async function startMockServer(config = {}) {
       state.tokens.push('rotated_' + (state.seq + 1000));
     },
     async close() {
-      await new Promise((resolve) => server.close(resolve));
+      const closed = new Promise((resolve) => server.close(resolve));
+      // Do not wait on requests a test deliberately left hanging.
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+      await closed;
     },
   };
 }

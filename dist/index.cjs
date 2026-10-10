@@ -14,10 +14,14 @@ const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 /** Server hard limit on POST /track/batch. */
 const MAX_BATCH_SIZE = 50;
 
+/** Feedback categories the API accepts. Anything else is rejected locally. */
+const FEEDBACK_CATEGORIES = Object.freeze(['bug', 'suggestion', 'complaint', 'praise', 'playtest', 'other']);
+
 const DEFAULT_QUEUE_CAP = 500;
 const DEFAULT_RETRY_MS = 10000;
 const MAX_BACKOFF_MS = 300000;
 const DEFAULT_AUTO_FLUSH_MS = 15000;
+const DEFAULT_DISPOSE_TIMEOUT_MS = 2000;
 const DEVICE_ID_KEY = 'ravensight_device_id';
 /** Clock skew allowance so we refresh slightly before the server expires us. */
 const EXPIRY_SKEW_MS = 5000;
@@ -75,9 +79,10 @@ function parseRetryAfterMs(value) {
  *
  * fetch with keepalive is preferred over sendBeacon because sendBeacon cannot
  * set request headers, and the batch endpoint authenticates with the
- * X-Session-Token header. The beacon path therefore has to move the token into
- * the query string, which is only a best effort fallback for browsers where
- * keepalive is unavailable.
+ * X-Session-Token header. The beacon path therefore moves the token into the
+ * JSON body as `sessionToken` (never the URL, where proxies and logs could
+ * capture it). It is a best effort fallback for browsers where keepalive is
+ * unavailable.
  */
 function chooseUnloadTransport(env) {
   if (env && env.hasFetchKeepalive) return 'fetch-keepalive';
@@ -129,6 +134,10 @@ function detectPlatform() {
 
 function noop() {}
 
+function isBrowser() {
+  return typeof window !== 'undefined' && typeof document !== 'undefined';
+}
+
 /**
  * Ravensight analytics client.
  *
@@ -177,7 +186,10 @@ class Ravensight {
     this.stats = { queued: 0, sent: 0, dropped: 0, flushes: 0, sessions: 0 };
 
     this._disposed = false;
+    this._disposing = false;
+    this._disposePromise = null;
     this._flushing = false;
+    this._flushPromise = null;
     this._sessionPromise = null;
     this._timer = null;
     this._nextAttemptAt = 0;
@@ -188,6 +200,11 @@ class Ravensight {
 
   /** True when events may actually be sent. */
   get isActive() {
+    return this._canSend && !this._disposing;
+  }
+
+  /** Like isActive, but still true while dispose() delivers the last events. */
+  get _canSend() {
     return this.enabled && this.trackingEnabled && !this._disposed;
   }
 
@@ -203,7 +220,7 @@ class Ravensight {
    * @returns {Promise<{trackingEnabled: boolean, sessionReady: boolean}>}
    */
   async init() {
-    if (this._disposed) throw new RavensightError('client disposed', 'disposed');
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
 
     await this._checkSettings();
     this.initialized = true;
@@ -267,7 +284,7 @@ class Ravensight {
   async flush(options = {}) {
     const force = Boolean(options && options.force);
 
-    if (!this.isActive) return { sent: 0, queued: this.queue.length, skipped: 'inactive' };
+    if (!this._canSend) return { sent: 0, queued: this.queue.length, skipped: 'inactive' };
     if (this.queue.length === 0) return { sent: 0, queued: 0 };
     if (this._flushing) return { sent: 0, queued: this.queue.length, skipped: 'in-progress' };
     if (!force && this._clock() < this._nextAttemptAt) {
@@ -275,11 +292,17 @@ class Ravensight {
     }
 
     this._flushing = true;
-    try {
-      return await this._drain();
-    } finally {
+    this._flushPromise = this._drain().finally(() => {
       this._flushing = false;
-    }
+      this._flushPromise = null;
+    });
+    return this._flushPromise;
+  }
+
+  /** Waits out a flush already in flight, then forces one more. */
+  async _flushAfterInflight() {
+    if (this._flushPromise) await this._flushPromise.catch(noop);
+    return this.flush({ force: true });
   }
 
   /**
@@ -290,13 +313,22 @@ class Ravensight {
     if (typeof message !== 'string' || message.trim() === '') {
       throw new RavensightError('feedback message is empty', 'empty_message');
     }
+    if (category != null && !FEEDBACK_CATEGORIES.includes(category)) {
+      throw new RavensightError(
+        'feedback category must be one of: ' + FEEDBACK_CATEGORIES.join(', '),
+        'invalid_category',
+      );
+    }
+    if (rating != null && !(Number.isInteger(rating) && rating >= 1 && rating <= 5)) {
+      throw new RavensightError('feedback rating must be an integer from 1 to 5', 'invalid_rating');
+    }
     if (!this.isActive) {
       throw new RavensightError('tracking is disabled', 'tracking_disabled');
     }
 
     const payload = { message };
-    if (category) payload.category = String(category);
-    if (rating) payload.rating = Number(rating);
+    if (category != null) payload.category = category;
+    if (rating != null) payload.rating = rating;
 
     const send = async () => {
       const token = await this._ensureSession();
@@ -359,15 +391,98 @@ class Ravensight {
     }
   }
 
-  /** Stops timers and listeners. The client is unusable afterwards. */
-  dispose() {
-    if (this._disposed) return;
-    this._disposed = true;
+  /**
+   * Changes the device id, for example to the player's account id on a Node
+   * server. Events queued before the switch are flushed first, under the old
+   * session, because the server stamps the device id from the session. Then
+   * the session is dropped, the id is stored under `ravensight_device_id`,
+   * and the next flush opens a new session for the new id.
+   *
+   * Offline edge: events that could not be flushed (no network, rate limited)
+   * stay queued and go out under the new id rather than being dropped.
+   *
+   * @throws {TypeError} when `id` is not a non-empty string.
+   */
+  async setDeviceId(id) {
+    if (typeof id !== 'string' || id.trim() === '') {
+      throw new TypeError('Ravensight: `id` must be a non-empty string');
+    }
+    if (id === this.deviceId) return;
+
+    if (this.queue.length > 0) await this._flushAfterInflight();
+
+    this._invalidateSession();
+    this.deviceId = id;
+    try {
+      this._storage.setItem(DEVICE_ID_KEY, id);
+    } catch (_err) {
+      // Non persistent device id, same as on first run.
+    }
+  }
+
+  /**
+   * Switches to a fresh random device id, so nothing links later events to
+   * this install's earlier ones. Same flush semantics as setDeviceId.
+   *
+   * @returns {Promise<string>} the new id.
+   */
+  async resetDeviceId() {
+    const next = 'dev_' + randomId();
+    await this.setDeviceId(next);
+    return next;
+  }
+
+  /**
+   * Shuts the client down. The timer and page listeners stop at once and
+   * track() returns false from the first call. By default the queue is then
+   * flushed, bounded by `timeoutMs`, and in a browser one last best effort
+   * keepalive or beacon request carries whatever is left. Anything still
+   * queued after that is dropped and counted in stats.dropped.
+   *
+   * @returns {Promise<{sent: number, dropped: number}>}
+   */
+  dispose(options = {}) {
+    if (this._disposePromise) return this._disposePromise.then(() => ({ sent: 0, dropped: 0 }));
+    const opts = options || {};
+    const flush = opts.flush === undefined ? true : Boolean(opts.flush);
+    const timeoutMs = opts.timeoutMs == null ? DEFAULT_DISPOSE_TIMEOUT_MS : Number(opts.timeoutMs);
+
+    this._disposing = true;
     this._stopTimer();
     this._unbindLifecycle();
+
+    this._disposePromise = this._finishDispose(flush, timeoutMs);
+    return this._disposePromise;
+  }
+
+  async _finishDispose(flush, timeoutMs) {
+    let sent = 0;
+
+    if (flush && this.queue.length > 0 && this._canSend) {
+      const sentBefore = this.stats.sent;
+      let timer = null;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMs > 0 ? timeoutMs : 0);
+      });
+      try {
+        await Promise.race([this._flushAfterInflight().catch(noop), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+      sent += this.stats.sent - sentBefore;
+
+      if (this.queue.length > 0 && (this._env || isBrowser())) {
+        const before = this.queue.length;
+        if (this._flushOnHidden()) sent += before - this.queue.length;
+      }
+    }
+
+    const dropped = this.queue.length;
+    this.stats.dropped += dropped;
     this.queue.length = 0;
-    this.sessionToken = null;
-    this.sessionExpiresAt = 0;
+    this._disposed = true;
+    this._invalidateSession();
+    return { sent, dropped };
   }
 
   // --- Session ------------------------------------------------------------
@@ -459,6 +574,10 @@ class Ravensight {
         headers: { 'X-Session-Token': token },
         body: { events: this.queue.slice(0, size) },
       });
+
+      // dispose() timed out while this batch was in flight and has already
+      // counted the queue as dropped. Leave the cleared queue alone.
+      if (this._disposed) break;
 
       if (res.status === 202) {
         this.queue.splice(0, size);
@@ -561,12 +680,15 @@ class Ravensight {
       };
     }
     if (transport === 'beacon') {
-      // sendBeacon cannot set headers, so the token has to ride in the query
-      // string. Best effort only.
+      // sendBeacon cannot set headers, so the token rides INSIDE the JSON
+      // body (never the URL, where proxies and logs could capture it). The
+      // API accepts body.sessionToken on ingest POSTs for exactly this path.
+      const parsed = JSON.parse(body);
+      parsed.sessionToken = token;
       return {
         transport,
-        url: url + '?sessionToken=' + encodeURIComponent(token),
-        body,
+        url,
+        body: JSON.stringify(parsed),
         headers: null,
       };
     }
@@ -575,7 +697,7 @@ class Ravensight {
 
   /** Best effort flush of one batch while the page is being hidden. */
   _flushOnHidden() {
-    if (!this.isActive || this.queue.length === 0 || !this.isSessionValid()) return false;
+    if (!this._canSend || this.queue.length === 0 || !this.isSessionValid()) return false;
 
     const events = this.queue.slice(0, MAX_BATCH_SIZE);
     const req = this._buildUnloadRequest(events, this.sessionToken);
@@ -726,6 +848,7 @@ module.exports.default = Ravensight;
 module.exports.VERSION = VERSION;
 module.exports.DEFAULT_API_URL = DEFAULT_API_URL;
 module.exports.MAX_BATCH_SIZE = MAX_BATCH_SIZE;
+module.exports.FEEDBACK_CATEGORIES = FEEDBACK_CATEGORIES;
 module.exports.RavensightError = RavensightError;
 module.exports.MemoryStorage = MemoryStorage;
 module.exports.Ravensight = Ravensight;

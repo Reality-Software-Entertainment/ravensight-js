@@ -2,6 +2,10 @@ export declare const VERSION: string;
 export declare const DEFAULT_API_URL: string;
 export declare const MAX_BATCH_SIZE: number;
 
+export type FeedbackCategory = 'bug' | 'suggestion' | 'complaint' | 'praise' | 'playtest' | 'other';
+/** The six feedback categories the API accepts, frozen. */
+export declare const FEEDBACK_CATEGORIES: readonly FeedbackCategory[];
+
 export interface RavensightStorage {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
@@ -42,6 +46,18 @@ export interface FlushResult {
   sent: number;
   queued: number;
   skipped?: 'inactive' | 'in-progress' | 'backoff';
+}
+
+export interface DisposeOptions {
+  /** Flush the queue before shutting down. Default true. */
+  flush?: boolean;
+  /** Upper bound on the flush, in ms. Default 2000. */
+  timeoutMs?: number;
+}
+
+export interface DisposeResult {
+  sent: number;
+  dropped: number;
 }
 
 export interface RavensightStats {
@@ -90,11 +106,16 @@ export declare class Ravensight {
   init(): Promise<InitResult>;
   track(event: string, data?: Record<string, unknown>): boolean;
   flush(options?: { force?: boolean }): Promise<FlushResult>;
-  submitFeedback(message: string, category?: string, rating?: number): Promise<{ ok: true }>;
+  /** Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
+  submitFeedback(message: string, category?: FeedbackCategory, rating?: number): Promise<{ ok: true }>;
   fetchSuggestions(): Promise<unknown[]>;
   setEnabled(value: boolean): void;
   isSessionValid(): boolean;
-  dispose(): void;
+  /** Flushes, drops the session, stores the id. The next flush opens a new session. */
+  setDeviceId(id: string): Promise<void>;
+  /** Switches to a fresh random device id. Resolves with the new id. */
+  resetDeviceId(): Promise<string>;
+  dispose(options?: DisposeOptions): Promise<DisposeResult>;
 }
 
 export default Ravensight;
