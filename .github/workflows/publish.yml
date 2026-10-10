@@ -1,0 +1,37 @@
+name: Publish to npm
+
+# Runs only when a version tag is pushed, so ordinary pushes cost no
+# Actions minutes. Publishing uses npm trusted publishing (OIDC), so there
+# is no npm token secret in this repository.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - run: npm test
+
+      - name: Tag matches package.json version
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          if [ "$expected" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $expected"
+            exit 1
+          fi
+
+      - run: npm publish --provenance --access public

@@ -12,20 +12,12 @@ server side kill switch for you.
 
 ## Install
 
-Publishing to npm is pending. Until then install straight from git:
-
-```bash
-npm install github:Reality-Software-Entertainment/ravensight-js
-```
-
-Once the package is on npm:
-
 ```bash
 npm install ravensight
 ```
 
 There is no build step for consumers. The ESM entry is plain source and the
-CommonJS build is committed, so a git install works as is.
+CommonJS build ships alongside it.
 
 ## Quickstart: browser game
 
@@ -44,7 +36,7 @@ rs.track('game_started');
 rs.track('level_completed', { level: 3, deaths: 2, seconds: 91 });
 
 // Optional: player feedback from an in game form.
-await rs.submitFeedback('The boss fight is too long', 'balance', 4);
+await rs.submitFeedback('The boss fight is too long', 'suggestion', 4);
 ```
 
 Events are queued and sent in batches of up to 50, on a timer and when the page
@@ -83,6 +75,9 @@ rs.track('match_finished', { mode: 'ranked', durationSec: 620 });
 // Give it a stable id or your own storage if you want it to persist.
 ```
 
+A Node process that serves many players needs one client per player. See
+[Node servers with many players](#node-servers-with-many-players).
+
 Persisting the device id in Node:
 
 ```js
@@ -97,6 +92,45 @@ const fileStorage = {
 
 const rs = new Ravensight({ ingestKey: 'gt_live_...', storage: fileStorage });
 ```
+
+## Node servers with many players
+
+The device id belongs to the session, and the server fixes it when the session
+opens. One client therefore speaks for one player. On a game server, create a
+client per connected player, keyed on your own player id, and dispose of it
+when they leave:
+
+```js
+import Ravensight, { MemoryStorage } from 'ravensight';
+
+const clients = new Map();
+
+async function onConnect(player) {
+  const rs = new Ravensight({
+    ingestKey: process.env.RAVENSIGHT_KEY,
+    gameVersion: '1.4.0',
+    platform: 'dedicated-server',
+    deviceId: player.id,
+    // Explicit, so no client ever reads or writes another player's id
+    // through a shared localStorage polyfill.
+    storage: new MemoryStorage(),
+  });
+  clients.set(player.id, rs);
+  await rs.init();
+}
+
+async function onDisconnect(player) {
+  const rs = clients.get(player.id);
+  clients.delete(player.id);
+  // Flushes what is queued (bounded by timeoutMs) before shutting down.
+  if (rs) await rs.dispose();
+}
+```
+
+Every client opens its own session, and the limits are per game, not per
+client: 60 session creations and 600 tracked events a minute. A burst of
+joins past that gets `429` with `Retry-After`, and the SDK holds the events
+and retries. See the [limits](https://ravensight.io/docs/#limits).
 
 ## itch.io and HTML5 exports
 
@@ -155,8 +189,21 @@ Sends queued events now. Returns `{ sent, queued }`. Concurrent calls are safe.
 
 ### `await rs.submitFeedback(message, category?, rating?)`
 
-Posts to `POST /feedback`. Throws a `RavensightError` on failure, with a `code`
-such as `empty_message`, `tracking_disabled` or the server's own error string.
+Posts to `POST /feedback`. `category` is optional and must be one of the values
+below, also exported as `FEEDBACK_CATEGORIES`. `rating` is optional and must be
+an integer from 1 to 5. Bad input is rejected before any request is made.
+
+| Category | Use it for |
+| --- | --- |
+| `bug` | Something is broken. |
+| `suggestion` | An idea or a change the player wants. |
+| `complaint` | Something the player dislikes. |
+| `praise` | Something the player enjoyed. |
+| `playtest` | Notes from a playtest session. |
+| `other` | Anything else. |
+
+Throws a `RavensightError` with a `code`: `empty_message`, `invalid_category`,
+`invalid_rating`, `tracking_disabled`, or the server's own error string.
 
 ### `await rs.fetchSuggestions()`
 
@@ -170,9 +217,34 @@ Local opt in and opt out, for a privacy toggle in your settings menu. Disabling
 clears anything still queued, so an opt out does not leave player data sitting
 in memory.
 
-### `rs.dispose()`
+### `await rs.setDeviceId(id)` and `await rs.resetDeviceId()`
 
-Stops timers and listeners. The client cannot be reused afterwards.
+Changes the device id after construction, for example once a player signs in
+on a shared machine. `id` must be a non-empty string, and setting the current
+id again does nothing.
+
+The server stamps the device id from the session, so the switch happens in
+order: events already queued are flushed first under the old session, then the
+session is dropped and the new id is stored under `ravensight_device_id`. The
+next flush opens a new session for the new id.
+
+One edge: if that first flush cannot reach the server (offline, rate limited),
+the queued events are kept and go out later under the new id rather than being
+dropped.
+
+`resetDeviceId()` does the same with a fresh random id and resolves with it.
+Use it for a "reset analytics id" button.
+
+### `await rs.dispose({ flush = true, timeoutMs = 2000 })`
+
+Shuts the client down. The timer and page listeners stop at once and `track()`
+returns `false` from that moment. By default the queue is then flushed, bounded
+by `timeoutMs`. In a browser, whatever is still queued after that goes out in
+one last best effort keepalive or beacon request. Anything left is dropped and
+counted in `rs.stats.dropped`. Resolves with `{ sent, dropped }`.
+
+Pass `{ flush: false }` to discard the queue without sending. The client cannot
+be reused afterwards.
 
 ## Device id and privacy
 
@@ -187,8 +259,10 @@ queued, so an opt out does not leave player data sitting in memory.
 
 The opt-out is not stored by the SDK: keep the player's choice in your own
 settings and call `rs.setEnabled(false)` before the first event on every
-launch. To forget this install's analytics identity, remove `ravensight_device_id` from `localStorage`;
-the next run starts under a fresh id and nothing links the old one back.
+launch. To forget this install's analytics identity, call
+`await rs.resetDeviceId()`, or remove `ravensight_device_id` from
+`localStorage`. Later events go out under a fresh id and nothing links the old
+one back.
 
 A game that sends gameplay events and nothing else can declare Device ID and
 Product Interaction as not linked to the player and not used for tracking,
@@ -218,8 +292,15 @@ In a browser the SDK listens for `visibilitychange` and sends one last batch whe
 the page goes hidden. It prefers `fetch` with `keepalive: true` rather than
 `navigator.sendBeacon`, because `sendBeacon` cannot set request headers and the
 batch endpoint authenticates with `X-Session-Token`. `sendBeacon` is used only
-where keepalive is unavailable, and then the token has to travel in the query
-string, which is a best effort fallback rather than the primary path.
+where keepalive is unavailable, and then the token travels inside the JSON body
+as `sessionToken`, never in the URL, where proxies and logs could capture it.
+
+## What the dashboard does with your events
+
+Some event names and fields have meaning on the dashboard, for example which
+events count as a level start, a completion or a death, and which field names
+the level. See [the JavaScript SDK section of the docs](https://ravensight.io/docs/#javascript-sdk)
+before you name your events.
 
 ## Development
 

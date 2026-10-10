@@ -1,6 +1,6 @@
 {
   "name": "ravensight",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Official JavaScript SDK for Ravensight player analytics. Browser and Node, zero dependencies: sessions, batched events, offline queue.",
   "license": "MIT",
   "author": "Reality Software Entertainment",
@@ -43,6 +43,9 @@
     "events"
   ],
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "node scripts/build-cjs.mjs",
     "pretest": "node scripts/build-cjs.mjs",
