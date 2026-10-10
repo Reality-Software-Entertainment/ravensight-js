@@ -22,6 +22,7 @@ const DEFAULT_RETRY_MS = 10000;
 const MAX_BACKOFF_MS = 300000;
 const DEFAULT_AUTO_FLUSH_MS = 15000;
 const DEFAULT_DISPOSE_TIMEOUT_MS = 2000;
+const DEFAULT_MAX_SESSIONS = 64;
 const DEVICE_ID_KEY = 'ravensight_device_id';
 /** Clock skew allowance so we refresh slightly before the server expires us. */
 const EXPIRY_SKEW_MS = 5000;
@@ -134,6 +135,15 @@ function detectPlatform() {
 
 function noop() {}
 
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim() !== '';
+}
+
+/** Strips the local device id: the server stamps it from the session. */
+function wireEvents(items) {
+  return items.map((item) => ({ event: item.event, data: item.data, timestamp: item.timestamp }));
+}
+
 function isBrowser() {
   return typeof window !== 'undefined' && typeof document !== 'undefined';
 }
@@ -160,6 +170,8 @@ export class Ravensight {
     this.platform = opts.platform == null ? detectPlatform() : String(opts.platform);
     this.autoFlushMs = opts.autoFlushMs == null ? DEFAULT_AUTO_FLUSH_MS : Number(opts.autoFlushMs);
     this.maxQueueSize = opts.maxQueueSize == null ? DEFAULT_QUEUE_CAP : Number(opts.maxQueueSize);
+    this.maxSessions =
+      opts.maxSessions == null ? DEFAULT_MAX_SESSIONS : Math.max(1, Math.floor(Number(opts.maxSessions)) || 1);
     this.debug = Boolean(opts.debug);
 
     this._fetch = opts.fetch || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
@@ -179,11 +191,14 @@ export class Ravensight {
     this.trackingEnabled = true;
     this.initialized = false;
 
-    this.sessionToken = null;
-    this.sessionExpiresAt = 0;
+    /**
+     * One cached session per device id, least recently used first:
+     * deviceId -> { token, expiresAt, promise, joinToken }.
+     */
+    this._sessions = new Map();
 
     this.queue = [];
-    this.stats = { queued: 0, sent: 0, dropped: 0, flushes: 0, sessions: 0 };
+    this.stats = { queued: 0, sent: 0, dropped: 0, flushes: 0, sessions: 0, sessionsEvicted: 0 };
 
     this._disposed = false;
     this._disposing = false;
@@ -192,7 +207,6 @@ export class Ravensight {
     this._flushPromise = null;
     /** Events in the batch request currently awaiting an answer. */
     this._inflightSize = 0;
-    this._sessionPromise = null;
     this._timer = null;
     this._nextAttemptAt = 0;
     this._backoffMs = DEFAULT_RETRY_MS;
@@ -208,6 +222,18 @@ export class Ravensight {
   /** Like isActive, but still true while dispose() delivers the last events. */
   get _canSend() {
     return this.enabled && this.trackingEnabled && !this._disposed;
+  }
+
+  /** The current id's session token, or null. Read only. */
+  get sessionToken() {
+    const entry = this._sessions.get(this.deviceId);
+    return entry && entry.token ? entry.token : null;
+  }
+
+  /** When the current id's session expires, in epoch ms, or 0. Read only. */
+  get sessionExpiresAt() {
+    const entry = this._sessions.get(this.deviceId);
+    return entry && entry.token ? entry.expiresAt : 0;
   }
 
   /** Milliseconds until the next allowed network attempt (0 when clear). */
@@ -254,10 +280,20 @@ export class Ravensight {
   /**
    * Queues an event. Safe to call before init(): events are held and sent once
    * a session exists. Returns false when tracking is off.
+   *
+   * `options.deviceId` sends this one event as another device, so one Node
+   * client can serve many players. Each device gets its own session.
    */
-  track(event, data) {
+  track(event, data, options) {
     if (typeof event !== 'string' || event.trim() === '') {
       throw new TypeError('Ravensight: `event` must be a non-empty string');
+    }
+    let deviceId = this.deviceId;
+    if (options && options.deviceId !== undefined) {
+      if (!isNonEmptyString(options.deviceId)) {
+        throw new TypeError('Ravensight: `deviceId` must be a non-empty string');
+      }
+      deviceId = options.deviceId;
     }
     if (!this.isActive) return false;
 
@@ -270,6 +306,7 @@ export class Ravensight {
       event,
       data: data && typeof data === 'object' ? data : {},
       timestamp: Math.floor(this._clock() / 1000),
+      deviceId,
     });
     this.stats.queued += 1;
 
@@ -397,46 +434,33 @@ export class Ravensight {
   }
 
   /**
-   * Changes the device id, for example to the player's account id on a Node
-   * server. Events queued before the switch are flushed first, under the old
-   * session, because the server stamps the device id from the session. Then
-   * the session is dropped, the id is stored under `ravensight_device_id`,
-   * and the next flush opens a new session for the new id.
+   * Changes the device id, for example once a player signs in. The switch is
+   * immediate: nothing is flushed or waited for. Events already queued keep
+   * the id they were tracked under and drain under that id's own session,
+   * which stays cached. The new id is stored under `ravensight_device_id`
+   * and its session opens on the next flush.
    *
-   * Offline edge: events that could not be flushed (no network, rate limited)
-   * stay queued and go out under the new id rather than being dropped.
-   *
+   * @returns {Promise<{previousId: string, queuedUnderPreviousId: number}>}
    * @throws {TypeError} when `id` is not a non-empty string.
    * @throws {RavensightError} code `disposed` after dispose().
    */
   async setDeviceId(id) {
     if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
-    if (typeof id !== 'string' || id.trim() === '') {
+    if (!isNonEmptyString(id)) {
       throw new TypeError('Ravensight: `id` must be a non-empty string');
     }
-    if (id === this.deviceId) return;
-
-    // A session already opening was requested for the old id. Let it and any
-    // flush in flight finish first, or it would land after the switch and
-    // carry later events under the old identity.
-    if (this._sessionPromise) await this._sessionPromise.catch(noop);
-    if (this._flushPromise) await this._flushPromise.catch(noop);
-    if (this.queue.length > 0) await this._flushAfterInflight();
-    if (this._sessionPromise) await this._sessionPromise.catch(noop);
-
-    // No await from here on, so nothing can open a session in between.
-    this._invalidateSession();
-    this.deviceId = id;
-    try {
-      this._storage.setItem(DEVICE_ID_KEY, id);
-    } catch (_err) {
-      // Non persistent device id, same as on first run.
+    const previousId = this.deviceId;
+    const queuedUnderPreviousId = this.queue.filter((item) => item.deviceId === previousId).length;
+    if (id !== previousId) {
+      this.deviceId = id;
+      this._persistDeviceId(id);
     }
+    return { previousId, queuedUnderPreviousId };
   }
 
   /**
    * Switches to a fresh random device id, so nothing links later events to
-   * this install's earlier ones. Same flush semantics as setDeviceId.
+   * this install's earlier ones. Same semantics as setDeviceId.
    *
    * @returns {Promise<string>} the new id.
    */
@@ -499,53 +523,90 @@ export class Ravensight {
     this.stats.dropped += dropped;
     this.queue.length = 0;
     this._disposed = true;
-    this._invalidateSession();
+    this._sessions.clear();
     return { sent, dropped };
   }
 
   // --- Session ------------------------------------------------------------
 
-  isSessionValid() {
-    return Boolean(this.sessionToken) && this._clock() < this.sessionExpiresAt - EXPIRY_SKEW_MS;
+  /** True when `deviceId` (default: the current id) has a session that has not expired. */
+  isSessionValid(deviceId = this.deviceId) {
+    const entry = this._sessions.get(deviceId);
+    return Boolean(entry && entry.token) && this._clock() < entry.expiresAt - EXPIRY_SKEW_MS;
   }
 
-  _invalidateSession() {
-    this.sessionToken = null;
-    this.sessionExpiresAt = 0;
+  _invalidateSession(deviceId = this.deviceId) {
+    const entry = this._sessions.get(deviceId);
+    if (!entry) return;
+    entry.token = null;
+    entry.expiresAt = 0;
   }
 
-  /** Returns a valid session token, creating one if needed. Deduplicated. */
-  _ensureSession() {
-    if (this.isSessionValid()) return Promise.resolve(this.sessionToken);
-    if (this._sessionPromise) return this._sessionPromise;
+  /** The cache entry for `deviceId`, created if absent and marked most recently used. */
+  _sessionEntry(deviceId) {
+    let entry = this._sessions.get(deviceId);
+    if (entry) {
+      this._sessions.delete(deviceId);
+      this._sessions.set(deviceId, entry);
+    } else {
+      entry = { token: null, expiresAt: 0, promise: null, joinToken: null };
+      this._sessions.set(deviceId, entry);
+      this._evictSessions();
+    }
+    return entry;
+  }
 
-    this._sessionPromise = this._createSession().finally(() => {
-      this._sessionPromise = null;
+  /**
+   * Drops least recently used sessions past `maxSessions`. Never the current
+   * id, one still opening, or one holding a join token not yet used.
+   */
+  _evictSessions() {
+    if (this._sessions.size <= this.maxSessions) return;
+    for (const [id, entry] of this._sessions) {
+      if (this._sessions.size <= this.maxSessions) break;
+      if (id === this.deviceId || entry.promise || entry.joinToken) continue;
+      this._sessions.delete(id);
+      this.stats.sessionsEvicted += 1;
+    }
+  }
+
+  /** Returns a valid session token for `deviceId`, creating one if needed. Deduplicated per id. */
+  _ensureSession(deviceId = this.deviceId) {
+    const entry = this._sessionEntry(deviceId);
+    if (this.isSessionValid(deviceId)) return Promise.resolve(entry.token);
+    if (entry.promise) return entry.promise;
+
+    entry.promise = this._createSession(deviceId, entry).finally(() => {
+      entry.promise = null;
     });
-    return this._sessionPromise;
+    return entry.promise;
   }
 
-  async _createSession() {
+  async _createSession(deviceId, entry) {
     const res = await this._request('POST', '/session', {
       headers: { 'X-API-Key': this.ingestKey },
       body: {
-        deviceId: this.deviceId,
+        deviceId,
         gameVersion: this.gameVersion,
         platform: this.platform,
       },
     });
 
     if (res.status === 201 && res.body && res.body.token) {
+      const token = String(res.body.token);
       if (this._disposed) {
         // dispose() finished while this was in flight. Do not store it.
-        return String(res.body.token);
+        return token;
       }
-      this.sessionToken = String(res.body.token);
-      this.sessionExpiresAt = this._resolveExpiry(res.body);
+      entry.token = token;
+      entry.expiresAt = this._resolveExpiry(res.body);
+      // The entry may have been evicted meanwhile; put it back.
+      if (this._sessions.get(deviceId) !== entry) this._sessions.set(deviceId, entry);
       this.stats.sessions += 1;
       this._resetBackoff();
+      this._evictSessions();
       this._log('session ready');
-      return this.sessionToken;
+      return token;
     }
 
     if (res.status === 429) {
@@ -584,21 +645,24 @@ export class Ravensight {
     while (this.queue.length > 0) {
       if (this._clock() < this._nextAttemptAt) break;
 
+      // One request carries one device: the leading run sharing the head's id.
+      const deviceId = this.queue[0].deviceId;
       let token;
       try {
-        token = await this._ensureSession();
+        token = await this._ensureSession(deviceId);
       } catch (_err) {
         break;
       }
       if (this._disposed) break;
+      if (this.queue.length === 0) break;
 
-      const size = Math.min(batchLimit, this.queue.length);
+      const size = Math.min(batchLimit, this._runLength(0));
       this._inflightSize = size;
       let res;
       try {
         res = await this._request('POST', '/track/batch', {
           headers: { 'X-Session-Token': token },
-          body: { events: this.queue.slice(0, size) },
+          body: { events: wireEvents(this.queue.slice(0, size)) },
         });
       } finally {
         this._inflightSize = 0;
@@ -614,14 +678,15 @@ export class Ravensight {
         this.stats.sent += size;
         this.stats.flushes += 1;
         batchLimit = MAX_BATCH_SIZE;
+        reauthAttempts = 0;
         this._resetBackoff();
         continue;
       }
 
       if (res.status === 401) {
-        // Session expired or revoked. Events stay queued and are re sent as
-        // soon as a fresh session is issued.
-        this._invalidateSession();
+        // That device's session expired or was revoked. Its events stay
+        // queued and are re sent as soon as a fresh session is issued.
+        this._invalidateSession(deviceId);
         reauthAttempts += 1;
         if (reauthAttempts > 2) break;
         this._log('session expired, re authenticating');
@@ -654,6 +719,21 @@ export class Ravensight {
     }
 
     return { sent, queued: this.queue.length };
+  }
+
+  /** How many events from `offset` share that event's device id, capped at one batch. */
+  _runLength(offset) {
+    const head = this.queue[offset];
+    if (!head) return 0;
+    let n = 1;
+    while (
+      n < MAX_BATCH_SIZE &&
+      offset + n < this.queue.length &&
+      this.queue[offset + n].deviceId === head.deviceId
+    ) {
+      n += 1;
+    }
+    return n;
   }
 
   _resetBackoff() {
@@ -697,7 +777,7 @@ export class Ravensight {
    */
   _buildUnloadRequest(events, token, env) {
     const transport = chooseUnloadTransport(env || this._unloadEnv());
-    const body = JSON.stringify({ events });
+    const body = JSON.stringify({ events: wireEvents(events) });
     const url = this.apiUrl + '/track/batch';
 
     if (transport === 'fetch-keepalive') {
@@ -725,14 +805,17 @@ export class Ravensight {
   }
 
   /**
-   * Best effort flush of one batch while the page is being hidden. `offset`
-   * skips events already in a batch request awaiting an answer.
+   * Best effort flush of one batch while the page is being hidden: the run of
+   * events sharing the device id at `offset`, under that id's cached session.
+   * `offset` skips events already in a batch request awaiting an answer.
    */
   _flushOnHidden(offset = 0) {
-    if (!this._canSend || this.queue.length <= offset || !this.isSessionValid()) return false;
+    if (!this._canSend || this.queue.length <= offset) return false;
+    const deviceId = this.queue[offset].deviceId;
+    if (!this.isSessionValid(deviceId)) return false;
 
-    const events = this.queue.slice(offset, offset + MAX_BATCH_SIZE);
-    const req = this._buildUnloadRequest(events, this.sessionToken);
+    const events = this.queue.slice(offset, offset + this._runLength(offset));
+    const req = this._buildUnloadRequest(events, this._sessions.get(deviceId).token);
     if (req.transport === 'none') return false;
 
     try {
@@ -859,12 +942,16 @@ export class Ravensight {
       // ignore
     }
     const created = 'dev_' + randomId();
+    this._persistDeviceId(created);
+    return created;
+  }
+
+  _persistDeviceId(id) {
     try {
-      this._storage.setItem(DEVICE_ID_KEY, created);
+      this._storage.setItem(DEVICE_ID_KEY, id);
     } catch (_err) {
       // Non persistent device id. Sessions still work, retention will be noisy.
     }
-    return created;
   }
 
   _log(message) {

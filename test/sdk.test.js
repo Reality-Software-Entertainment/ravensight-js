@@ -683,7 +683,7 @@ test('a session that opens after dispose timed out is never used', async (t) => 
 
 // --- Device id ------------------------------------------------------------
 
-test('setDeviceId flushes under the old session, then the next session carries the new id', async (t) => {
+test('setDeviceId switches at once and earlier events keep their own id', async (t) => {
   const server = await startMockServer();
   t.after(() => server.close());
 
@@ -696,30 +696,26 @@ test('setDeviceId flushes under the old session, then the next session carries t
   rs.track('before_switch_a');
   rs.track('before_switch_b');
 
-  await rs.setDeviceId('player_42');
-
-  const firstBatches = server.requestsTo('/api/v1/track/batch');
-  assert.equal(firstBatches.length, 1);
-  assert.equal(firstBatches[0].headers['x-session-token'], oldToken, 'earlier events used the old token');
-  assert.deepEqual(
-    firstBatches[0].body.events.map((e) => e.event),
-    ['before_switch_a', 'before_switch_b'],
-  );
+  const result = await rs.setDeviceId('player_42');
+  assert.deepEqual(result, { previousId: oldId, queuedUnderPreviousId: 2 });
+  assert.equal(server.requestsTo('/api/v1/track/batch').length, 0, 'nothing is flushed by the switch');
   assert.equal(rs.deviceId, 'player_42');
-  assert.equal(rs.sessionToken, null, 'the old session is invalidated');
+  assert.equal(rs.sessionToken, null, 'the new id has no session yet');
+  assert.equal(rs.isSessionValid(oldId), true, 'the old id keeps its session');
   assert.equal(storage.getItem('ravensight_device_id'), 'player_42', 'the id is persisted');
-  assert.equal(server.requestsTo('/api/v1/session').length, 1, 'the new session opens lazily');
 
   rs.track('after_switch');
   await rs.flush();
 
   const sessions = server.requestsTo('/api/v1/session');
-  assert.equal(sessions.length, 2);
-  assert.equal(sessions[0].body.deviceId, oldId);
-  assert.equal(sessions[1].body.deviceId, 'player_42');
-  const last = server.requestsTo('/api/v1/track/batch').at(-1);
-  assert.equal(last.headers['x-session-token'], server.state.tokens[1]);
-  assert.deepEqual(last.body.events.map((e) => e.event), ['after_switch']);
+  assert.deepEqual(sessions.map((r) => r.body.deviceId), [oldId, 'player_42']);
+  const batches = server.requestsTo('/api/v1/track/batch');
+  assert.equal(batches.length, 2);
+  assert.equal(batches[0].headers['x-session-token'], oldToken, 'earlier events used the old token');
+  assert.deepEqual(batches[0].body.events.map((e) => e.event), ['before_switch_a', 'before_switch_b']);
+  assert.equal(batches[1].headers['x-session-token'], server.state.tokens[1]);
+  assert.deepEqual(batches[1].body.events.map((e) => e.event), ['after_switch']);
+  assert.deepEqual(server.state.batches.map((b) => b.device), [oldId, 'player_42']);
 
   const second = makeClient(server, { storage });
   assert.equal(second.deviceId, 'player_42', 'a second client on the same storage picks it up');
@@ -741,21 +737,29 @@ test('setDeviceId validates, and an unchanged id is a no op', async (t) => {
 
   const token = rs.sessionToken;
   rs.track('x');
-  await rs.setDeviceId('same');
+  const result = await rs.setDeviceId('same');
+  assert.deepEqual(result, { previousId: 'same', queuedUnderPreviousId: 1 });
   assert.equal(rs.sessionToken, token, 'the session is kept');
   assert.equal(rs.queue.length, 1, 'nothing was flushed');
   assert.equal(server.requestsTo('/api/v1/track/batch').length, 0);
   await rs.dispose({ flush: false });
 });
 
-test('setDeviceId waits for a session already opening under the old id', async (t) => {
-  const server = await startMockServer({ sessionDelayMs: 50 });
+test('setDeviceId does not wait for a session opening under the old id', async (t) => {
+  const server = await startMockServer({ sessionDelayMs: 80 });
   t.after(() => server.close());
 
   const rs = makeClient(server, { deviceId: 'old' });
   const opening = rs._ensureSession();
+  let opened = false;
+  opening.then(() => {
+    opened = true;
+  });
   await rs.setDeviceId('new');
-  await opening;
+  assert.equal(opened, false, 'the switch resolved before the old session answered');
+  const oldToken = await opening;
+  assert.equal(rs.isSessionValid('old'), true, 'the late session is cached under the old id');
+  assert.equal(rs.sessionToken, null, 'and not under the new one');
 
   rs.track('x');
   await rs.flush();
@@ -763,8 +767,8 @@ test('setDeviceId waits for a session already opening under the old id', async (
   const sessions = server.requestsTo('/api/v1/session').map((r) => r.body.deviceId);
   assert.deepEqual(sessions, ['old', 'new'], 'the event opened a session for the new id');
   const batch = server.requestsTo('/api/v1/track/batch').at(-1);
-  assert.equal(batch.headers['x-session-token'], server.state.tokens[1]);
-  assert.equal(rs.deviceId, 'new');
+  assert.notEqual(batch.headers['x-session-token'], oldToken);
+  assert.equal(server.state.batches.at(-1).device, 'new');
   await rs.dispose();
 });
 
@@ -781,7 +785,7 @@ test('setDeviceId on a disposed client throws and stores nothing', async (t) => 
   assert.equal(storage.getItem('ravensight_device_id'), before);
 });
 
-test('resetDeviceId switches to a fresh random id', async (t) => {
+test('resetDeviceId switches to a fresh random id and keeps the old session', async (t) => {
   const server = await startMockServer();
   t.after(() => server.close());
 
@@ -789,6 +793,8 @@ test('resetDeviceId switches to a fresh random id', async (t) => {
   const rs = makeClient(server, { storage });
   await rs.init();
   const oldId = rs.deviceId;
+  const oldToken = rs.sessionToken;
+  rs.track('a');
 
   const next = await rs.resetDeviceId();
   assert.equal(next, rs.deviceId);
@@ -796,5 +802,192 @@ test('resetDeviceId switches to a fresh random id', async (t) => {
   assert.ok(next.startsWith('dev_'));
   assert.equal(storage.getItem('ravensight_device_id'), next);
   assert.equal(rs.sessionToken, null);
+  assert.equal(rs.isSessionValid(oldId), true);
+
+  await rs.flush();
+  assert.equal(server.requestsTo('/api/v1/session').length, 1, 'no new session for the old id');
+  assert.equal(server.requestsTo('/api/v1/track/batch')[0].headers['x-session-token'], oldToken);
+  await rs.dispose();
+});
+
+// --- Per-device sessions --------------------------------------------------
+
+test('track takes a per-event device id and each run drains under its own session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host' });
+  await rs.init();
+  rs.track('a');
+  rs.track('b');
+  rs.track('c', { x: 1 }, { deviceId: 'p2' });
+  rs.track('d');
+  assert.deepEqual(rs.queue.map((e) => e.deviceId), ['host', 'host', 'p2', 'host']);
+
+  const result = await rs.flush();
+  assert.equal(result.sent, 4);
+
+  assert.deepEqual(server.state.sessionDevices, ['host', 'p2']);
+  assert.deepEqual(
+    server.state.batches.map((b) => [b.device, b.events.map((e) => e.event)]),
+    [
+      ['host', ['a', 'b']],
+      ['p2', ['c']],
+      ['host', ['d']],
+    ],
+  );
+  for (const req of server.requestsTo('/api/v1/track/batch')) {
+    assert.deepEqual(Object.keys(req.body), ['events'], 'the wire body is only events');
+    for (const e of req.body.events) {
+      assert.deepEqual(Object.keys(e).sort(), ['data', 'event', 'timestamp'], 'no deviceId on the wire');
+    }
+  }
+  await rs.dispose();
+});
+
+test('a run of one device is capped at 50 per batch', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server);
+  // The 50th event starts a flush on its own; it drains all 60.
+  for (let i = 0; i < 60; i++) rs.track('e', { i }, { deviceId: 'p1' });
+  await waitFor(() => server.state.events.length === 60);
+
+  assert.deepEqual(server.state.batches.map((b) => b.events.length), [50, 10]);
+  assert.deepEqual(server.state.sessionDevices, ['p1'], 'only p1 needed a session');
+  await rs.dispose();
+});
+
+test('track rejects a deviceId option that is not a non-empty string', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server);
+  for (const bad of ['', '   ', 42, null, {}]) {
+    assert.throws(() => rs.track('x', {}, { deviceId: bad }), TypeError, 'rejects ' + String(bad));
+  }
+  assert.equal(rs.queue.length, 0);
+  assert.equal(rs.track('x', {}, {}), true, 'an empty options object is fine');
+  assert.equal(rs.track('y', {}, undefined), true);
+  await rs.dispose({ flush: false });
+});
+
+test('the session cache is bounded by maxSessions and never evicts the current id', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host', maxSessions: 2 });
+  assert.equal(makeClient(server).maxSessions, 64, 'the default is 64');
+  await rs.init();
+  for (const id of ['p1', 'p2', 'p3']) {
+    rs.track('e', {}, { deviceId: id });
+    await rs.flush();
+  }
+
+  assert.equal(rs._sessions.size, 2);
+  assert.ok(rs._sessions.has('host'), 'the current id survives');
+  assert.ok(rs._sessions.has('p3'), 'the newest survives');
+  assert.equal(rs.stats.sessionsEvicted, 2);
+  assert.equal(rs.isSessionValid(), true);
+
+  rs.track('again', {}, { deviceId: 'p1' });
+  await rs.flush();
+  assert.deepEqual(server.state.sessionDevices, ['host', 'p1', 'p2', 'p3', 'p1'], 'an evicted id reopens');
+  await rs.dispose();
+});
+
+test('a 401 re opens only the session of the device whose batch was refused', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host' });
+  await rs.init();
+  rs.track('warm', {}, { deviceId: 'p2' });
+  await rs.flush();
+  const p2Token = server.state.tokens[1];
+  server.expireSession(p2Token);
+
+  rs.track('a');
+  rs.track('b', {}, { deviceId: 'p2' });
+  rs.track('c');
+  const result = await rs.flush();
+
+  assert.equal(result.sent, 3);
+  assert.deepEqual(server.state.sessionDevices, ['host', 'p2', 'p2'], 'host was never re opened');
+  assert.deepEqual(
+    server.state.batches.map((b) => [b.device, b.events.map((e) => e.event)]),
+    [
+      ['p2', ['warm']],
+      ['host', ['a']],
+      ['p2', ['b']],
+      ['host', ['c']],
+    ],
+  );
+  await rs.dispose();
+});
+
+test('the hidden page flush sends only the head run under its own session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host', env: { hasFetchKeepalive: true, hasBeacon: false } });
+  await rs.init();
+  rs.track('warm', {}, { deviceId: 'p2' });
+  await rs.flush();
+
+  rs.track('a');
+  rs.track('b', {}, { deviceId: 'p2' });
+  rs.track('c');
+
+  assert.equal(rs._flushOnHidden(), true);
+  assert.deepEqual(rs.queue.map((e) => e.event), ['b', 'c']);
+  assert.equal(rs._flushOnHidden(), true);
+  assert.deepEqual(rs.queue.map((e) => e.event), ['c']);
+  await waitFor(() => server.state.batches.length === 3);
+  // Both keepalive requests are in the air at once, so arrival order is free.
+  assert.deepEqual(
+    server.state.batches
+      .slice(1)
+      .map((b) => [b.device, b.events.map((e) => e.event)])
+      .sort((x, y) => x[1][0].localeCompare(y[1][0])),
+    [
+      ['host', ['a']],
+      ['p2', ['b']],
+    ],
+  );
+  await rs.dispose({ flush: false });
+});
+
+test('dispose in a browser sends only the head run in its unload request', async (t) => {
+  const server = await startMockServer({ batchStatus: 503 });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { deviceId: 'host', env: { hasFetchKeepalive: true, hasBeacon: false } });
+  await rs.init();
+  rs.track('a');
+  rs.track('b');
+  rs.track('c', {}, { deviceId: 'p2' });
+
+  const result = await rs.dispose();
+  assert.deepEqual(result, { sent: 2, dropped: 1 }, 'the p2 event had no session and was dropped');
+  await waitFor(() => server.requestsTo('/api/v1/track/batch').length === 2);
+  const sizes = server.requestsTo('/api/v1/track/batch').map((r) => r.body.events.length);
+  assert.deepEqual(sizes, [2, 2], 'one failed flush, then one unload request for the host run');
+});
+
+test('sessionToken and sessionExpiresAt are read only views of the current id', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+
+  const rs = makeClient(server);
+  assert.equal(rs.sessionToken, null);
+  assert.equal(rs.sessionExpiresAt, 0);
+  await rs.init();
+  assert.equal(rs.sessionToken, server.state.tokens[0]);
+  assert.ok(rs.sessionExpiresAt > Date.now());
+  assert.throws(() => {
+    rs.sessionToken = 'forged';
+  }, TypeError);
   await rs.dispose();
 });

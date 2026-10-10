@@ -24,6 +24,8 @@ export interface RavensightOptions {
   maxQueueSize?: number;
   storage?: RavensightStorage;
   deviceId?: string;
+  /** Sessions cached at once, one per device id, least recently used dropped first. Default 64. */
+  maxSessions?: number;
   enabled?: boolean;
   fetch?: typeof fetch;
   now?: () => number;
@@ -35,6 +37,19 @@ export interface TrackedEvent {
   data: Record<string, unknown>;
   /** Unix seconds. */
   timestamp: number;
+  /** The device the event was tracked as. Local only: never sent, the server stamps it from the session. */
+  deviceId: string;
+}
+
+export interface TrackOptions {
+  /** Send this event as another device, with its own session. A non-empty string. */
+  deviceId?: string;
+}
+
+export interface SetDeviceIdResult {
+  previousId: string;
+  /** Events still queued under the previous id. They drain under its own session. */
+  queuedUnderPreviousId: number;
 }
 
 export interface InitResult {
@@ -66,6 +81,8 @@ export interface RavensightStats {
   dropped: number;
   flushes: number;
   sessions: number;
+  /** Cached sessions dropped to stay within maxSessions. */
+  sessionsEvicted: number;
 }
 
 export declare class RavensightError extends Error {
@@ -96,23 +113,28 @@ export declare class Ravensight {
   readonly stats: RavensightStats;
   readonly isActive: boolean;
   readonly retryInMs: number;
+  readonly maxSessions: number;
+  /** The current device id's session token, or null. */
+  readonly sessionToken: string | null;
+  /** When the current device id's session expires, epoch ms, or 0. */
+  readonly sessionExpiresAt: number;
 
   enabled: boolean;
   trackingEnabled: boolean;
   initialized: boolean;
-  sessionToken: string | null;
-  sessionExpiresAt: number;
 
   init(): Promise<InitResult>;
-  track(event: string, data?: Record<string, unknown>): boolean;
+  /** Throws TypeError when options.deviceId is given and is not a non-empty string. */
+  track(event: string, data?: Record<string, unknown>, options?: TrackOptions): boolean;
   flush(options?: { force?: boolean }): Promise<FlushResult>;
   /** null, undefined and '' mean not given. Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
   submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null): Promise<{ ok: true }>;
   fetchSuggestions(): Promise<unknown[]>;
   setEnabled(value: boolean): void;
-  isSessionValid(): boolean;
-  /** Flushes, drops the session, stores the id. The next flush opens a new session. Rejects with code disposed after dispose(). */
-  setDeviceId(id: string): Promise<void>;
+  /** For deviceId, default the current id. */
+  isSessionValid(deviceId?: string): boolean;
+  /** Switches at once and stores the id; nothing is flushed. Queued events keep their id and its session. Rejects with code disposed after dispose(). */
+  setDeviceId(id: string): Promise<SetDeviceIdResult>;
   /** Switches to a fresh random device id. Resolves with the new id. */
   resetDeviceId(): Promise<string>;
   dispose(options?: DisposeOptions): Promise<DisposeResult>;

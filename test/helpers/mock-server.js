@@ -34,7 +34,18 @@ export async function startMockServer(config = {}) {
     requests: [],
     events: [],
     feedback: [],
+    /** Every token issued, in order. */
     tokens: [],
+    /** Tokens the server currently accepts. Several are valid at once, one per device. */
+    validTokens: new Set(),
+    /** token -> the device id its session was opened for. */
+    tokenDevices: new Map(),
+    /** Device id of every session opened, in order. */
+    sessionDevices: [],
+    /** Accepted batches with the device their session belongs to. */
+    batches: [],
+    /** Join tokens the server will honor. Anything else answers 401 invalid_join_token. */
+    joinTokens: new Set(config.joinTokens || []),
     trackingEnabled: config.trackingEnabled !== false,
     settingsStatus: config.settingsStatus == null ? 200 : config.settingsStatus,
     sessionStatus: config.sessionStatus == null ? 201 : config.sessionStatus,
@@ -44,6 +55,8 @@ export async function startMockServer(config = {}) {
     maxBatchAccept: config.maxBatchAccept == null ? MAX_BATCH_SIZE : config.maxBatchAccept,
     /** Queue of one shot overrides for POST /track/batch. */
     batchOverrides: config.batchOverrides ? config.batchOverrides.slice() : [],
+    /** Queue of one shot overrides for POST /session: { status, body, headers }. */
+    sessionOverrides: config.sessionOverrides ? config.sessionOverrides.slice() : [],
     /** Status for every POST /track/batch (e.g. 503 for a failing server). */
     batchStatus: config.batchStatus == null ? null : config.batchStatus,
     /** Delay before answering POST /track/batch, to simulate a hung server. */
@@ -53,7 +66,7 @@ export async function startMockServer(config = {}) {
     seq: 0,
   };
 
-  const currentToken = () => (state.tokens.length ? state.tokens[state.tokens.length - 1] : null);
+  const isValid = (token) => typeof token === 'string' && state.validTokens.has(token);
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -77,15 +90,32 @@ export async function startMockServer(config = {}) {
       if (state.sessionDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, state.sessionDelayMs).unref());
       }
+      const sessionOverride = state.sessionOverrides.shift();
+      if (sessionOverride) {
+        return send(
+          res,
+          sessionOverride.status,
+          sessionOverride.body || { error: 'forced' },
+          sessionOverride.headers || {},
+        );
+      }
       if (!String(req.headers['x-api-key'] || '').startsWith('gt_live_')) {
-        return send(res, 401, { error: 'invalid_key' });
+        return send(res, 401, { error: 'invalid_api_key' });
       }
       if (state.sessionStatus !== 201) {
         return send(res, state.sessionStatus, { error: 'session_rejected' });
       }
+      if (body && body.joinToken != null && !state.joinTokens.has(body.joinToken)) {
+        return send(res, 401, { error: 'invalid_join_token' });
+      }
+      // Like the real server, a playtest header decides the device id.
+      const device = req.headers['x-ravensight-playtest'] ? 'pt-run' : body && body.deviceId;
       state.seq += 1;
       const token = 'sess_' + state.seq;
       state.tokens.push(token);
+      state.validTokens.add(token);
+      state.tokenDevices.set(token, device);
+      state.sessionDevices.push(device);
       return send(res, 201, {
         token,
         expiresIn: state.sessionExpiresIn,
@@ -104,7 +134,7 @@ export async function startMockServer(config = {}) {
       if (override) {
         return send(res, override.status, override.body || { error: 'forced' }, override.headers || {});
       }
-      if (req.headers['x-session-token'] !== currentToken()) {
+      if (!isValid(req.headers['x-session-token'])) {
         return send(res, 401, { error: 'session_expired' });
       }
       const events = body && Array.isArray(body.events) ? body.events : null;
@@ -112,11 +142,16 @@ export async function startMockServer(config = {}) {
       if (events.length > MAX_BATCH_SIZE) return send(res, 400, { error: 'batch_too_large' });
       if (events.length > state.maxBatchAccept) return send(res, 400, { error: 'payload_too_large' });
       state.events.push(...events);
+      state.batches.push({
+        token: req.headers['x-session-token'],
+        device: state.tokenDevices.get(req.headers['x-session-token']),
+        events,
+      });
       return send(res, 202, { accepted: events.length });
     }
 
     if (req.method === 'POST' && path === '/api/v1/track') {
-      if (req.headers['x-session-token'] !== currentToken()) {
+      if (!isValid(req.headers['x-session-token'])) {
         return send(res, 401, { error: 'session_expired' });
       }
       state.events.push(body);
@@ -124,7 +159,7 @@ export async function startMockServer(config = {}) {
     }
 
     if (req.method === 'POST' && path === '/api/v1/feedback') {
-      if (req.headers['x-session-token'] !== currentToken()) {
+      if (!isValid(req.headers['x-session-token'])) {
         return send(res, 401, { error: 'session_expired' });
       }
       state.feedback.push(body);
@@ -133,7 +168,7 @@ export async function startMockServer(config = {}) {
 
     if (req.method === 'GET' && path === '/api/v1/agent/suggestions') {
       if (!String(req.headers['x-api-key'] || '').startsWith('gt_live_')) {
-        return send(res, 401, { error: 'invalid_key' });
+        return send(res, 401, { error: 'invalid_api_key' });
       }
       return send(res, 200, { suggestions: state.suggestions });
     }
@@ -151,9 +186,13 @@ export async function startMockServer(config = {}) {
     requestsTo(path) {
       return state.requests.filter((r) => r.path === path);
     },
-    /** Forces the next batch to 401 by rotating the accepted token. */
-    expireSession() {
-      state.tokens.push('rotated_' + (state.seq + 1000));
+    /**
+     * Revokes one session token, or every token when none is named, so the
+     * next request carrying it answers 401.
+     */
+    expireSession(token) {
+      if (token === undefined) state.validTokens.clear();
+      else state.validTokens.delete(token);
     },
     async close() {
       const closed = new Promise((resolve) => server.close(resolve));
