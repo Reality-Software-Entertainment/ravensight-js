@@ -1438,3 +1438,102 @@ test('events dropped at the queue cap while a session opens never go out under a
   assert.deepEqual(server.state.events.map((e) => e.event), ['b1', 'b2']);
   await rs.dispose();
 });
+
+// --- Automatic lifecycle events ------------------------------------------
+
+function withBrowser(t) {
+  const listeners = new Map();
+  const win = {
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (listeners.has(type)) listeners.get(type).delete(fn);
+    },
+  };
+  const doc = { visibilityState: 'visible', addEventListener() {}, removeEventListener() {} };
+  const saved = {};
+  for (const [k, v] of [['window', win], ['document', doc]]) {
+    saved[k] = [Object.prototype.hasOwnProperty.call(globalThis, k), globalThis[k]];
+    globalThis[k] = v;
+  }
+  t.after(() => {
+    for (const k of Object.keys(saved)) {
+      if (saved[k][0]) globalThis[k] = saved[k][1];
+      else delete globalThis[k];
+    }
+  });
+  return {
+    count: (type) => (listeners.get(type) ? listeners.get(type).size : 0),
+    fire: (type) => [...(listeners.get(type) || [])].forEach((fn) => fn({ type })),
+  };
+}
+
+const names = (rs) => rs.queue.map((e) => e.event);
+
+test('a browser client queues game_started at construction under the current device id', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  withBrowser(t);
+  const rs = makeClient(server);
+  assert.deepEqual(names(rs), ['game_started']);
+  assert.equal(rs.queue[0].deviceId, rs.deviceId);
+  await rs.dispose({ flush: false });
+});
+
+test('game_started is not queued from a disabled client, nor sent later by setEnabled(true)', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  withBrowser(t);
+  const rs = makeClient(server, { enabled: false });
+  rs.setEnabled(true);
+  assert.deepEqual(names(rs), []);
+  await rs.dispose({ flush: false });
+});
+
+test('a Node client sends no automatic events', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  assert.deepEqual(names(rs), []);
+  await rs.dispose({ flush: false });
+});
+
+test('autoEvents: false sends neither event and binds no listener', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const b = withBrowser(t);
+  const rs = makeClient(server, { autoEvents: false });
+  assert.deepEqual(names(rs), []);
+  assert.equal(b.count('pagehide'), 0);
+  b.fire('pagehide');
+  assert.deepEqual(names(rs), []);
+  await rs.dispose({ flush: false });
+});
+
+test('game_exited is sent once on pagehide, even with two pagehide events', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const b = withBrowser(t);
+  const rs = makeClient(server);
+  await rs.init();
+  await rs.flush();
+  b.fire('pagehide');
+  b.fire('pagehide');
+  await waitFor(() => server.requestsTo('/api/v1/track/batch').length >= 2);
+  const sent = server.requestsTo('/api/v1/track/batch').flatMap((r) => r.body.events.map((e) => e.event));
+  assert.deepEqual(sent.filter((n) => n === 'game_started'), ['game_started']);
+  assert.deepEqual(sent.filter((n) => n === 'game_exited'), ['game_exited']);
+  await rs.dispose({ flush: false });
+});
+
+test('dispose removes the pagehide listener', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const b = withBrowser(t);
+  const rs = makeClient(server);
+  assert.equal(b.count('pagehide'), 1);
+  await rs.dispose({ flush: false });
+  assert.equal(b.count('pagehide'), 0);
+});

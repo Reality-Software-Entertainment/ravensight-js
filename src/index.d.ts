@@ -31,6 +31,11 @@ export interface RavensightOptions {
   /** Sessions cached at once, one per device id, least recently used dropped first. Default 64. */
   maxSessions?: number;
   enabled?: boolean;
+  /**
+   * Send `game_started` at construction and `game_exited` on the first `pagehide`.
+   * Browser only, never in Node. Default true. Pass false if your game tracks them itself.
+   */
+  autoEvents?: boolean;
   fetch?: typeof fetch;
   now?: () => number;
   /** Log SDK activity, and warn once per event and key about an unknown rs_kind or rs_ key. */
@@ -143,6 +148,7 @@ export declare class Ravensight {
   readonly sessionExpiresAt: number;
 
   enabled: boolean;
+  readonly autoEvents: boolean;
   trackingEnabled: boolean;
   initialized: boolean;
 

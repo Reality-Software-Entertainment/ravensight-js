@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -291,6 +291,9 @@ class Ravensight {
     this._backoffMs = DEFAULT_RETRY_MS;
     this._listenersBound = false;
     this._onVisibilityChange = null;
+    this._onPageHide = null;
+    this._pageHideBound = false;
+    this._exitSent = false;
     /** Set when POST /session refuses the key. Stops the timer until a session opens. */
     this._invalidKey = false;
     this._invalidKeyWarned = false;
@@ -298,6 +301,14 @@ class Ravensight {
     this._reservedWarned = new Set();
     /** Set by a 403 playtest_job_closed. Permanent for this client. */
     this._playtestClosed = false;
+
+    // Automatic lifecycle events, in a browser only: a Node client serves many
+    // players and has no single game to start or exit.
+    this.autoEvents = opts.autoEvents === undefined ? true : Boolean(opts.autoEvents);
+    if (this.autoEvents && isBrowser()) {
+      this._bindPageHide();
+      if (this.enabled) this.track('game_started');
+    }
   }
 
   /** True when events may actually be sent. */
@@ -1109,7 +1120,33 @@ class Ravensight {
     this._listenersBound = true;
   }
 
+  /** Sends `game_exited` once, on the first `pagehide`, through the hidden-flush path. */
+  _bindPageHide() {
+    if (this._pageHideBound || typeof window === 'undefined' || !window) return;
+    if (typeof window.addEventListener !== 'function') return;
+    this._onPageHide = () => {
+      if (this._exitSent) return;
+      this._exitSent = true;
+      if (!this.track('game_exited')) return;
+      this._flushOnHidden(this._inflightSize);
+    };
+    window.addEventListener('pagehide', this._onPageHide);
+    this._pageHideBound = true;
+  }
+
+  _unbindPageHide() {
+    if (!this._pageHideBound) return;
+    try {
+      window.removeEventListener('pagehide', this._onPageHide);
+    } catch (_err) {
+      // ignore
+    }
+    this._pageHideBound = false;
+    this._onPageHide = null;
+  }
+
   _unbindLifecycle() {
+    this._unbindPageHide();
     if (!this._listenersBound) return;
     try {
       document.removeEventListener('visibilitychange', this._onVisibilityChange);

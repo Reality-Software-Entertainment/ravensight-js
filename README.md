@@ -32,7 +32,6 @@ const rs = new Ravensight({
 // Reads the server kill switch and opens a session.
 await rs.init();
 
-rs.track('game_started');
 rs.track('level_completed', { level: 3, deaths: 2, seconds: 91 });
 
 // Optional: player feedback from an in game form.
@@ -196,6 +195,7 @@ and hand written canvas games.
 | `storage` | auto | Anything with `getItem` and `setItem`. Used for the device id. |
 | `deviceId` | auto | Override the generated device id entirely. |
 | `enabled` | `true` | Start opted out by passing `false`. |
+| `autoEvents` | `true` | Send `game_started` and `game_exited` for you, in a browser. See [Automatic events](#automatic-events). |
 | `fetch` | global | Inject a custom fetch. |
 | `debug` | `false` | Log SDK activity to the console, and warn about reserved `rs_` keys. |
 
@@ -324,6 +324,27 @@ called.
 Pass `{ flush: false }` to discard the queue without sending. The client cannot
 be reused afterwards.
 
+## Automatic events
+
+In a browser the SDK sends two lifecycle events for you, so you do not track
+them by hand:
+
+* `game_started`, queued when you construct the client, under the current
+  device id and with no data. It is only queued when the client is enabled at
+  that moment. If the game starts with `enabled: false` and later calls
+  `setEnabled(true)`, `game_started` is not sent retroactively.
+* `game_exited`, queued on the first `pagehide` event and sent at once with
+  the same keepalive path the page hide flush uses. It is sent once, however
+  many `pagehide` events fire, and `dispose()` removes the listener.
+
+Neither is ever sent from Node, where one client serves many players and there
+is no single game to start or exit. Pass `autoEvents: false` to turn both off.
+A game that already sends `game_started` itself should pass `autoEvents: false`
+or remove its own call, otherwise every session counts twice. These are the
+same two names the LÖVE SDK sends, so a dashboard covering both platforms
+counts sessions the same way. Playtest sessions run in a browser, so they send
+them too.
+
 ## Device id and privacy
 
 The SDK generates a random device id on first run (`crypto.randomUUID`
@@ -346,6 +367,48 @@ A game that sends gameplay events and nothing else can declare Device ID and
 Product Interaction as not linked to the player and not used for tracking,
 and needs no tracking permission prompt. The row by row answers for the App
 Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
+
+## Telling players
+
+Tell players what the game sends and give them a switch. A paragraph you can
+show in your settings or first launch screen:
+
+> This game sends anonymous gameplay events (what happens in the game, never
+> who you are) to Ravensight so we can improve it. You can turn this off in
+> Settings at any time.
+
+The SDK does not remember the player's choice, so store it in your own settings
+and apply it on every launch:
+
+```js
+const settings = JSON.parse(localStorage.getItem('my_game_settings') || '{}');
+
+// Pass the stored choice at construction so nothing is queued while opted out.
+const rs = new Ravensight({
+  ingestKey: 'gt_live_your_publishable_key',
+  enabled: settings.analytics !== false,
+});
+
+// Wire this to the checkbox in your Settings screen.
+function onAnalyticsToggled(checked) {
+  settings.analytics = checked;
+  localStorage.setItem('my_game_settings', JSON.stringify(settings));
+  rs.setEnabled(checked);
+  if (!checked) rs.resetDeviceId(); // optional: also forget this install's id
+}
+```
+
+## How this compares with the LÖVE SDK
+
+| | JavaScript (this SDK) | LÖVE |
+| --- | --- | --- |
+| Automatic events | `game_started`, `game_exited` (browser only) | `game_started`, `game_exited` |
+| `apiUrl` | with or without `/api/v1` | with or without `/api/v1` |
+| `maxQueueSize` default | 500 | 500 |
+| `enabled` option | yes | yes |
+| Opt-out | `setEnabled` | `setTrackingEnabled` |
+| Batching | timer (`autoFlushMs`, 15 s) | 2 s |
+| Web | native | bridge |
 
 ## How delivery works
 
