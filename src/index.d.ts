@@ -63,7 +63,7 @@ export interface SetDeviceIdResult {
 }
 
 /** Why init() could not open a session. */
-export type InitReason = 'invalid_key' | 'tracking_disabled' | 'offline' | 'rate_limited' | 'session_failed';
+export type InitReason = 'invalid_key' | 'tracking_disabled' | 'disabled' | 'offline' | 'rate_limited' | 'session_failed';
 
 export interface InitResult {
   trackingEnabled: boolean;

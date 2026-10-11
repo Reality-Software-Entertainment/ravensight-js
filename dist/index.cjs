@@ -356,6 +356,12 @@ class Ravensight {
   async init() {
     if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
 
+    // Opted out: no settings check, no session, nothing on the network.
+    if (!this.enabled) {
+      this._log('client is disabled, init() does nothing');
+      return { trackingEnabled: false, sessionReady: false, reason: 'disabled' };
+    }
+
     await this._checkSettings();
     this.initialized = true;
     if (this._playtestClosed) this.trackingEnabled = false;

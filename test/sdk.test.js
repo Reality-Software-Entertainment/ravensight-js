@@ -1555,3 +1555,26 @@ test('a client that starts disabled sends no game_exited after setEnabled(true)'
   assert.deepEqual(names(rs), []);
   await rs.dispose({ flush: false });
 });
+
+test('init() on a disabled client makes no network call; setEnabled(true) then init() opens a session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  let calls = 0;
+  const rs = makeClient(server, {
+    enabled: false,
+    fetch: (...a) => {
+      calls++;
+      return fetch(...a);
+    },
+  });
+  const res = await rs.init();
+  assert.deepEqual(res, { trackingEnabled: false, sessionReady: false, reason: 'disabled' });
+  assert.deepEqual(await rs.flush(), { sent: 0, queued: 0, skipped: 'inactive' });
+  assert.equal(calls, 0);
+  assert.equal(server.state.requests.length, 0);
+  rs.setEnabled(true);
+  const again = await rs.init();
+  assert.equal(again.sessionReady, true);
+  assert.equal(server.requestsTo('/api/v1/session').length, 1);
+  await rs.dispose({ flush: false });
+});

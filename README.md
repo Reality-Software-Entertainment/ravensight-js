@@ -213,6 +213,7 @@ retry succeeds.
 | --- | --- |
 | `invalid_key` | The key was refused (`401`, or a `403` other than the kill switch). The flush timer stops; see below. |
 | `tracking_disabled` | Tracking is switched off for this game. Nothing is sent. |
+| `disabled` | The client is opted out (`enabled: false` or `setEnabled(false)`). `init()` makes no network call. Call `setEnabled(true)` and then `init()` to start. |
 | `offline` | No answer from the network. Retried with backoff. |
 | `rate_limited` | `429`. Retried after `Retry-After`. |
 | `session_failed` | Any other answer. Retried with backoff. |

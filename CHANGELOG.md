@@ -13,6 +13,12 @@ dashboards that cover both platforms count sessions the same way.
   already track `game_started` themselves should pass `autoEvents: false` or
   remove their call, or sessions will count twice.
 
+### Fixed
+
+* `init()` on a client that is opted out (`enabled: false`) no longer reads the
+  settings or opens a session. It makes no network call and returns the reason
+  `disabled`.
+
 ### Upgrading from 0.3.0
 
 Delete your own `rs.track('game_started')` or pass `autoEvents: false`,
