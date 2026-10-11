@@ -339,7 +339,10 @@ them by hand:
   client queued `game_started`, so a client that starts disabled sends neither
   automatic event. It is sent once, however many `pagehide` events fire, and
   `dispose()` removes the listener. A page restored from the back-forward cache
-  sends no second `game_started`.
+  sends no second `game_started`. A game that calls `dispose()` mid-page (for
+  example a single-page app unmounting the game) should track `game_exited`
+  itself first, because `dispose()` unbinds the page hide listener and sends no
+  exit.
 
 A game that sets its own device id should pass `deviceId` in the constructor
 options so `game_started` carries it, rather than calling `setDeviceId`

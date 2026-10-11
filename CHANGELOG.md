@@ -5,13 +5,18 @@
 The browser SDK now sends the same two lifecycle events as the LÖVE SDK, so
 dashboards that cover both platforms count sessions the same way.
 
-### Behaviour change
+### Breaking
 
 * New option `autoEvents` (default `true`). In a browser the client queues
   `game_started` at construction (only when enabled) and `game_exited` on the
   first `pagehide`, flushed with keepalive. Never sent from Node. Games that
   already track `game_started` themselves should pass `autoEvents: false` or
   remove their call, or sessions will count twice.
+
+### Upgrading from 0.3.0
+
+Delete your own `rs.track('game_started')` or pass `autoEvents: false`,
+otherwise every browser session counts twice.
 
 ### Docs
 
