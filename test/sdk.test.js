@@ -1519,8 +1519,15 @@ test('game_exited is sent once on pagehide, even with two pagehide events', asyn
   const rs = makeClient(server);
   await rs.init();
   await rs.flush();
+  const fetches = [];
+  const realFetch = rs._fetch;
+  rs._fetch = (...a) => {
+    fetches.push(a);
+    return realFetch(...a);
+  };
   b.fire('pagehide');
   b.fire('pagehide');
+  assert.equal(rs.queue.filter((e) => e.event === 'game_exited').length + fetches.length, 1, 'one exit, synchronously');
   await waitFor(() => server.requestsTo('/api/v1/track/batch').length >= 2);
   const sent = server.requestsTo('/api/v1/track/batch').flatMap((r) => r.body.events.map((e) => e.event));
   assert.deepEqual(sent.filter((n) => n === 'game_started'), ['game_started']);
@@ -1536,4 +1543,15 @@ test('dispose removes the pagehide listener', async (t) => {
   assert.equal(b.count('pagehide'), 1);
   await rs.dispose({ flush: false });
   assert.equal(b.count('pagehide'), 0);
+});
+
+test('a client that starts disabled sends no game_exited after setEnabled(true)', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const b = withBrowser(t);
+  const rs = makeClient(server, { enabled: false });
+  rs.setEnabled(true);
+  b.fire('pagehide');
+  assert.deepEqual(names(rs), []);
+  await rs.dispose({ flush: false });
 });

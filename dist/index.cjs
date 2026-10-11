@@ -294,6 +294,7 @@ class Ravensight {
     this._onPageHide = null;
     this._pageHideBound = false;
     this._exitSent = false;
+    this._startSent = false;
     /** Set when POST /session refuses the key. Stops the timer until a session opens. */
     this._invalidKey = false;
     this._invalidKeyWarned = false;
@@ -307,7 +308,7 @@ class Ravensight {
     this.autoEvents = opts.autoEvents === undefined ? true : Boolean(opts.autoEvents);
     if (this.autoEvents && isBrowser()) {
       this._bindPageHide();
-      if (this.enabled) this.track('game_started');
+      if (this.enabled) this._startSent = this.track('game_started');
     }
   }
 
@@ -1125,7 +1126,7 @@ class Ravensight {
     if (this._pageHideBound || typeof window === 'undefined' || !window) return;
     if (typeof window.addEventListener !== 'function') return;
     this._onPageHide = () => {
-      if (this._exitSent) return;
+      if (this._exitSent || !this._startSent) return;
       this._exitSent = true;
       if (!this.track('game_exited')) return;
       this._flushOnHidden(this._inflightSize);

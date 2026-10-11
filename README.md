@@ -333,9 +333,17 @@ them by hand:
   device id and with no data. It is only queued when the client is enabled at
   that moment. If the game starts with `enabled: false` and later calls
   `setEnabled(true)`, `game_started` is not sent retroactively.
-* `game_exited`, queued on the first `pagehide` event and sent at once with
-  the same keepalive path the page hide flush uses. It is sent once, however
-  many `pagehide` events fire, and `dispose()` removes the listener.
+* `game_exited`, queued on the first `pagehide` event and sent best effort
+  through the page hide flush (keepalive). It needs a session, so `init()` must
+  have opened one first, otherwise it stays queued. It is only queued when this
+  client queued `game_started`, so a client that starts disabled sends neither
+  automatic event. It is sent once, however many `pagehide` events fire, and
+  `dispose()` removes the listener. A page restored from the back-forward cache
+  sends no second `game_started`.
+
+A game that sets its own device id should pass `deviceId` in the constructor
+options so `game_started` carries it, rather than calling `setDeviceId`
+afterwards.
 
 Neither is ever sent from Node, where one client serves many players and there
 is no single game to start or exit. Pass `autoEvents: false` to turn both off.
