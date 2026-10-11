@@ -726,7 +726,8 @@ class Ravensight {
    * flush uses, so concurrent calls share one request. Rejects, never throws,
    * with a RavensightError whose `code` is the init reason: `invalid_key`,
    * `tracking_disabled`, `offline`, `rate_limited`, `session_failed`,
-   * `disabled` or `disposed`.
+   * `disabled` or `disposed` (also when dispose() runs mid-open), or
+   * `session_failed` when a joinSession() race replaced the session mid-open.
    *
    * @returns {Promise<{token: string, expiresAt: number}>}
    */
@@ -746,8 +747,14 @@ class Ravensight {
       const reason = (err && err.reason) || 'session_failed';
       throw new RavensightError((err && err.message) || 'session creation failed', reason, err && err.status);
     }
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
     const entry = this._sessions.get(deviceId);
-    return { token, expiresAt: entry && entry.token === token ? entry.expiresAt : 0 };
+    // The entry changed while opening (a joinSession race): there is no
+    // expiry to report for this token, so say the open did not settle.
+    if (!entry || entry.token !== token) {
+      throw new RavensightError('session changed while opening', 'session_failed');
+    }
+    return { token, expiresAt: entry.expiresAt };
   }
 
   _invalidateSession(deviceId = this.deviceId) {

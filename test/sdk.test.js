@@ -1621,3 +1621,57 @@ test('sessionTokenFor() sees a second device after track({ deviceId }) and a flu
   assert.equal((await rs.session('p9')).token, token);
   await rs.dispose({ flush: false });
 });
+
+test('dispose() during an in-flight session() rejects with disposed', async (t) => {
+  const server = await startMockServer({ sessionDelayMs: 80 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  const p = rs.session();
+  await rs.dispose({ flush: false });
+  await assert.rejects(p, (e) => e.code === 'disposed');
+});
+
+test('session(other) opens a session for that device id directly', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server, { deviceId: 'host', autoFlushMs: 60000 });
+  const { token } = await rs.session('other');
+  const posts = server.requestsTo('/api/v1/session');
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.stringify(posts[0].body).includes('"deviceId":"other"'), true);
+  assert.equal(rs.sessionTokenFor('other'), token);
+  assert.equal(rs.sessionTokenFor('host'), null);
+  await rs.dispose({ flush: false });
+});
+
+test('session() racing a flush for the same device makes one POST /session', async (t) => {
+  const server = await startMockServer({ sessionDelayMs: 40 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  rs.track('x');
+  const [s] = await Promise.all([rs.session(), rs.flush()]);
+  assert.equal(server.requestsTo('/api/v1/session').length, 1);
+  assert.equal(s.token, rs.sessionTokenFor());
+  await rs.dispose({ flush: false });
+});
+
+test('session() rejects with offline and with tracking_disabled', async (t) => {
+  const down = new Ravensight({
+    ingestKey: INGEST_KEY,
+    apiUrl: 'http://127.0.0.1:9',
+    autoFlushMs: 0,
+    storage: new MemoryStorage(),
+    fetch: async () => {
+      throw new Error('ENOTFOUND');
+    },
+  });
+  await assert.rejects(down.session(), (e) => e.code === 'offline');
+  await down.dispose({ flush: false });
+
+  const server = await startMockServer({ sessionOverrides: [{ status: 403, body: { error: 'tracking_disabled' } }] });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  await assert.rejects(rs.session(), (e) => e.code === 'tracking_disabled');
+  await assert.rejects(rs.session(), (e) => e.code === 'tracking_disabled');
+  await rs.dispose({ flush: false });
+});
