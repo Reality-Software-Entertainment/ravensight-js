@@ -146,16 +146,22 @@ session to your server, so server side events land in the same analytics
 session as the player's own:
 
 ```js
-// Browser: send the token to your server with your own request.
+// Browser: wait for the session, then send the token to your server.
+const { token } = await rs.session();
 await fetch('/api/link-analytics', {
   method: 'POST',
-  body: JSON.stringify({ rsToken: rs.sessionToken }),
+  body: JSON.stringify({ rsToken: token }),
 });
 
 // Server: one call per player, before that player's next event.
 rs.joinSession(body.rsToken, { deviceId: player.id });
 rs.track('purchase_verified', { sku: 'gold_pack' }, { deviceId: player.id });
 ```
+
+`rs.session()` resolves as soon as the session is open, so there is no timer
+to poll `rs.sessionToken`. On the server, `await rs.session(player.id)` opens
+a player's session eagerly if you want it open before their first event;
+`joinSession` itself needs no wait.
 
 The next session opened for that id carries the token once, and the server
 copies the browser's device id. The local id is only the key the SDK caches
@@ -302,6 +308,15 @@ changes nothing.
 
 `resetDeviceId()` does the same with a fresh random id and resolves with it.
 Use it for a "reset analytics id" button.
+
+### `rs.session(deviceId?)` and `rs.sessionTokenFor(deviceId?)`
+
+`session()` resolves with `{ token, expiresAt }` once the device (default: the
+client's own id) has an open session, opening one if needed. Concurrent calls
+share one request. It rejects with an error whose `code` is the reason
+`init()` would give: `invalid_key`, `tracking_disabled`, `offline`,
+`rate_limited`, `session_failed`, `disabled` or `disposed`.
+`sessionTokenFor()` returns the cached token or `null`, synchronously.
 
 ### `rs.joinSession(token, { deviceId }?)`
 

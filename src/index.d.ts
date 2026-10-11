@@ -162,6 +162,14 @@ export declare class Ravensight {
   setEnabled(value: boolean): void;
   /** For deviceId, default the current id. */
   isSessionValid(deviceId?: string): boolean;
+  /** The cached session token for deviceId (default: the current id) while valid, else null. Synchronous. */
+  sessionTokenFor(deviceId?: string): string | null;
+  /**
+   * Resolves once deviceId (default: the current id) has an open session, opening one if needed.
+   * Concurrent calls share one request. Rejects with a RavensightError whose code is invalid_key,
+   * tracking_disabled, offline, rate_limited, session_failed, disabled or disposed.
+   */
+  session(deviceId?: string): Promise<{ token: string; expiresAt: number }>;
   /** Switches at once and stores the id; nothing is flushed. Queued events keep their id and its session. Rejects with code disposed after dispose(). */
   setDeviceId(id: string): Promise<SetDeviceIdResult>;
   /**

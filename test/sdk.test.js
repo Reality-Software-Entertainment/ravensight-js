@@ -1578,3 +1578,46 @@ test('init() on a disabled client makes no network call; setEnabled(true) then i
   assert.equal(server.requestsTo('/api/v1/session').length, 1);
   await rs.dispose({ flush: false });
 });
+
+test('session() resolves after open, and two concurrent calls share one POST /session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  assert.equal(rs.sessionTokenFor(), null);
+  const [a, b] = await Promise.all([rs.session(), rs.session()]);
+  assert.equal(a.token, b.token);
+  assert.equal(a.token, rs.sessionToken);
+  assert.equal(rs.sessionTokenFor(), a.token);
+  assert.ok(a.expiresAt > 0);
+  assert.equal(server.requestsTo('/api/v1/session').length, 1);
+  await rs.session();
+  assert.equal(server.requestsTo('/api/v1/session').length, 1, 'a valid session resolves from the cache');
+  await rs.dispose({ flush: false });
+});
+
+test('session() rejects with invalid_key on 401 and with disabled when enabled is false', async (t) => {
+  const refused = { status: 401, body: { error: 'invalid_api_key' } };
+  const server = await startMockServer({ sessionOverrides: [refused] });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  await assert.rejects(rs.session(), (e) => e.code === 'invalid_key');
+  await rs.dispose({ flush: false });
+
+  const off = makeClient(server, { enabled: false });
+  await assert.rejects(off.session(), (e) => e.code === 'disabled');
+  await off.dispose({ flush: false });
+});
+
+test('sessionTokenFor() sees a second device after track({ deviceId }) and a flush', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server, { deviceId: 'host', autoFlushMs: 60000 });
+  assert.equal(rs.sessionTokenFor('p9'), null);
+  rs.track('x', {}, { deviceId: 'p9' });
+  await rs.flush();
+  const token = rs.sessionTokenFor('p9');
+  assert.equal(typeof token, 'string');
+  assert.notEqual(token, rs.sessionTokenFor('host'));
+  assert.equal((await rs.session('p9')).token, token);
+  await rs.dispose({ flush: false });
+});

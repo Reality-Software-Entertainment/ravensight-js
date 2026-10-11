@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1
+
+### Added
+
+* `rs.session(deviceId?)` returns a promise for `{ token, expiresAt }` that
+  resolves once the device's session is open, opening it if needed. Use it to
+  hand the browser's session to your server without polling `rs.sessionToken`.
+  It rejects with an error whose `code` is the init reason.
+* `rs.sessionTokenFor(deviceId?)` returns a device's cached session token, or
+  `null`, synchronously.
+
 ## 0.4.0
 
 The browser SDK now sends the same two lifecycle events as the LÖVE SDK, so

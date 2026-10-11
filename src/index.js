@@ -715,6 +715,41 @@ export class Ravensight {
     return Boolean(entry && entry.token) && this._clock() < entry.expiresAt - EXPIRY_SKEW_MS;
   }
 
+  /** The cached session token for `deviceId` (default: the current id) while it is valid, else null. */
+  sessionTokenFor(deviceId = this.deviceId) {
+    return this.isSessionValid(deviceId) ? this._sessions.get(deviceId).token : null;
+  }
+
+  /**
+   * Resolves with `{ token, expiresAt }` once `deviceId` (default: the current
+   * id) has an open session, opening one if needed through the same path the
+   * flush uses, so concurrent calls share one request. Rejects, never throws,
+   * with a RavensightError whose `code` is the init reason: `invalid_key`,
+   * `tracking_disabled`, `offline`, `rate_limited`, `session_failed`,
+   * `disabled` or `disposed`.
+   *
+   * @returns {Promise<{token: string, expiresAt: number}>}
+   */
+  async session(deviceId = this.deviceId) {
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+    if (!this.enabled) throw new RavensightError('client is disabled', 'disabled');
+    if (!this.trackingEnabled || this._playtestClosed) {
+      throw new RavensightError('tracking is disabled', 'tracking_disabled');
+    }
+    if (!isNonEmptyString(deviceId)) {
+      throw new TypeError('Ravensight: `deviceId` must be a non-empty string');
+    }
+    let token;
+    try {
+      token = await this._ensureSession(deviceId);
+    } catch (err) {
+      const reason = (err && err.reason) || 'session_failed';
+      throw new RavensightError((err && err.message) || 'session creation failed', reason, err && err.status);
+    }
+    const entry = this._sessions.get(deviceId);
+    return { token, expiresAt: entry && entry.token === token ? entry.expiresAt : 0 };
+  }
+
   _invalidateSession(deviceId = this.deviceId) {
     const entry = this._sessions.get(deviceId);
     if (!entry) return;
