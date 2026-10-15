@@ -13,7 +13,8 @@ permissions:
 
 jobs:
   publish:
-    if: github.repository_owner == 'Reality-Software-Entertainment'
+    # Skipped until the owner sets repository variable NPM_TRUSTED_PUBLISHING to true, after npmjs.com, package ravensight, Settings, Trusted publishing, adds GitHub Actions for Reality-Software-Entertainment/ravensight-js with workflow file publish.yml.
+    if: github.repository_owner == 'Reality-Software-Entertainment' && vars.NPM_TRUSTED_PUBLISHING == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
