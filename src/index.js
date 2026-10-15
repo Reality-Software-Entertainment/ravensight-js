@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-export const VERSION = '0.4.2';
+export const VERSION = '0.5.0';
 
 export const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -21,10 +21,39 @@ export const FEEDBACK_CATEGORIES = Object.freeze(['bug', 'suggestion', 'complain
  * Values the reserved `rs_kind` property accepts: what an event means for the
  * level funnel. Property keys starting with `rs_` are reserved for Ravensight.
  */
-export const RS_KINDS = Object.freeze(['level_start', 'level_complete', 'death', 'none']);
+export const RS_KINDS = Object.freeze([
+  'level_start', 'level_complete', 'death', 'none',
+  'purchase', 'resource', 'progression', 'error', 'health',
+]);
 
 /** The reserved keys Ravensight reads. Any other `rs_` key is a typo or a clash. */
-const KNOWN_RS_KEYS = Object.freeze(['rs_kind', 'rs_doctor']);
+// `rs_invalid` is deliberately absent: only the server writes it.
+const KNOWN_RS_KEYS = Object.freeze([
+  'rs_kind', 'rs_doctor',
+  'rs_status', 'rs_p1', 'rs_p2', 'rs_p3', 'rs_score',
+  'rs_amount', 'rs_currency', 'rs_item_type', 'rs_item_id', 'rs_cart', 'rs_transaction_id',
+  'rs_flow', 'rs_resource',
+  'rs_severity', 'rs_message', 'rs_stack',
+  'rs_fps_median', 'rs_fps_p10', 'rs_memory_mb', 'rs_boot_ms',
+]);
+
+const MAX_MESSAGE_CHARS = 200;
+const MAX_STACK_CHARS = 2000;
+const MAX_FPS_SAMPLES = 600;
+const SAMPLE_INTERVAL_MS = 1000;
+
+const cutText = (value, max) =>
+  typeof value === 'string' && value.length > max ? Array.from(value).slice(0, max).join('') : value;
+
+/** The value at fraction `q` of an ascending list, interpolated between neighbours. */
+function quantile(sorted, q) {
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+const round2 = (n) => Math.round(n * 100) / 100;
 
 const DEFAULT_QUEUE_CAP = 500;
 const DEFAULT_RETRY_MS = 10000;
@@ -310,6 +339,19 @@ export class Ravensight {
       this._bindPageHide();
       if (this.enabled) this._startSent = this.track('game_started');
     }
+
+    // Opt-in per-session performance sampling, browser only. One `health`
+    // event goes out on the first `pagehide`, never from the frame hook.
+    this.performance = Boolean(opts.performance);
+    this._fpsSamples = [];
+    this._healthSent = false;
+    this._healthBound = false;
+    this._onHealthHide = null;
+    this._frameHandle = null;
+    this._lastFrameTs = null;
+    this._nextSampleAt = 0;
+    this._bootMs = null;
+    if (this.performance && isBrowser()) this._startPerformance();
   }
 
   /** True when events may actually be sent. */
@@ -433,6 +475,164 @@ export class Ravensight {
     // While the key is refused only an explicit flush() or init() retries.
     if (this.queue.length >= MAX_BATCH_SIZE && !this._invalidKey) this.flush().catch(noop);
     return true;
+  }
+
+  // --- Typed events -------------------------------------------------------
+  //
+  // Thin builders over track(): they set the reserved rs_ properties and call
+  // it, so queueing, batching, retries and opt out are unchanged. They return
+  // what track returns and never throw on bad input; the server flags a wrong
+  // value with rs_invalid. `data` is merged first, so reserved keys win, and
+  // `event` overrides the default event name. The second argument is track's
+  // own options ({ deviceId }).
+
+  /** rs_amount is whole minor units (499 is 4.99), an integer or a digit string. */
+  trackPurchase(options, trackOptions) {
+    const o = options || {};
+    const currency = typeof o.currency === 'string' ? o.currency.toUpperCase() : o.currency;
+    const props = this._typed('purchase', {
+      rs_amount: o.amount,
+      rs_currency: currency,
+      rs_item_type: o.itemType,
+      rs_item_id: o.itemId,
+      rs_cart: o.cart,
+      rs_transaction_id: o.transactionId,
+    }, o.data);
+    return this.track(o.event || 'purchase', props, trackOptions);
+  }
+
+  /** flow is 'source' or 'sink'; rs_amount is a plain number, not money. */
+  trackResource(options, trackOptions) {
+    const o = options || {};
+    const props = this._typed('resource', {
+      rs_flow: o.flow,
+      rs_resource: o.resource,
+      rs_amount: o.amount,
+      rs_item_type: o.itemType,
+      rs_item_id: o.itemId,
+    }, o.data);
+    return this.track(o.event || 'resource_' + o.flow, props, trackOptions);
+  }
+
+  /** status is 'start', 'complete' or 'fail'. */
+  trackProgression(options, trackOptions) {
+    const o = options || {};
+    const props = this._typed('progression', {
+      rs_status: o.status,
+      rs_p1: o.p1,
+      rs_p2: o.p2,
+      rs_p3: o.p3,
+      rs_score: o.score,
+    }, o.data);
+    return this.track(o.event || 'progression_' + o.status, props, trackOptions);
+  }
+
+  /** severity is 'debug', 'info', 'warning', 'error' or 'critical'. Message is cut to 200 characters, stack to 2000. */
+  trackError(options, trackOptions) {
+    const o = options || {};
+    const props = this._typed('error', {
+      rs_severity: o.severity,
+      rs_message: cutText(o.message, MAX_MESSAGE_CHARS),
+      rs_stack: cutText(o.stack, MAX_STACK_CHARS),
+    }, o.data);
+    return this.track(o.event || 'error', props, trackOptions);
+  }
+
+  /** Extra data first, then the kind and every given typed key, so reserved keys win. */
+  _typed(kind, fields, extra) {
+    const props = extra && typeof extra === 'object' ? { ...extra } : {};
+    props.rs_kind = kind;
+    for (const key of Object.keys(fields)) {
+      if (fields[key] !== undefined) props[key] = fields[key];
+    }
+    return props;
+  }
+
+  // --- Performance sampling (opt in) --------------------------------------
+
+  _startPerformance() {
+    try {
+      if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+        this._bootMs = Math.round(performance.now());
+      }
+    } catch (_err) {
+      // Boot time is optional.
+    }
+    if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+      this._onHealthHide = () => this._sendHealth();
+      window.addEventListener('pagehide', this._onHealthHide);
+      this._healthBound = true;
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      this._frameHandle = requestAnimationFrame((ts) => this._onFrame(ts));
+    }
+  }
+
+  /** The frame hook: records one frame rate sample per second and schedules the next frame. Never sends. */
+  _onFrame(ts) {
+    if (this._healthSent || this._disposed) return;
+    if (this._lastFrameTs !== null) {
+      const delta = ts - this._lastFrameTs;
+      if (delta > 0 && ts >= this._nextSampleAt) {
+        if (this._fpsSamples.length >= MAX_FPS_SAMPLES) this._fpsSamples.shift();
+        this._fpsSamples.push(1000 / delta);
+        this._nextSampleAt = ts + SAMPLE_INTERVAL_MS;
+      }
+    }
+    this._lastFrameTs = ts;
+    if (typeof requestAnimationFrame === 'function') {
+      this._frameHandle = requestAnimationFrame((next) => this._onFrame(next));
+    }
+  }
+
+  /** The rs_ health properties from the samples so far, or null when there are none. */
+  _healthSummary() {
+    if (this._fpsSamples.length === 0) return null;
+    const sorted = this._fpsSamples.slice().sort((a, b) => a - b);
+    const summary = {
+      rs_kind: 'health',
+      rs_fps_median: round2(quantile(sorted, 0.5)),
+      rs_fps_p10: round2(quantile(sorted, 0.1)),
+    };
+    try {
+      const mem = typeof performance !== 'undefined' && performance && performance.memory;
+      if (mem && Number.isFinite(mem.usedJSHeapSize)) summary.rs_memory_mb = round2(mem.usedJSHeapSize / 1048576);
+    } catch (_err) {
+      // Memory is only exposed by some browsers.
+    }
+    if (this._bootMs !== null) summary.rs_boot_ms = this._bootMs;
+    return summary;
+  }
+
+  /** Sends the one `health` event for this session, on the first pagehide. Nothing when no sample was taken. */
+  _sendHealth() {
+    if (this._healthSent) return;
+    this._healthSent = true;
+    this._stopPerformance();
+    const summary = this._healthSummary();
+    if (!summary) return;
+    if (!this.track('health', summary)) return;
+    this._flushOnHidden(this._inflightSize);
+  }
+
+  _stopPerformance() {
+    if (this._frameHandle !== null && typeof cancelAnimationFrame === 'function') {
+      try {
+        cancelAnimationFrame(this._frameHandle);
+      } catch (_err) {
+        // ignore
+      }
+    }
+    this._frameHandle = null;
+    if (this._healthBound) {
+      try {
+        window.removeEventListener('pagehide', this._onHealthHide);
+      } catch (_err) {
+        // ignore
+      }
+      this._healthBound = false;
+      this._onHealthHide = null;
+    }
   }
 
   /**
@@ -884,7 +1084,7 @@ export class Ravensight {
     const joinToken = entry.joinToken;
     const headers = { 'X-API-Key': this.ingestKey };
     if (this._playtestToken) headers['X-Ravensight-Playtest'] = 'Bearer ' + this._playtestToken;
-    const body = { deviceId, gameVersion: this.gameVersion, platform: this.platform };
+    const body = { deviceId, gameVersion: this.gameVersion, platform: this.platform, sdk: 'js/' + VERSION };
     if (joinToken) body.joinToken = joinToken;
 
     const res = await this._request('POST', '/session', { headers, body });
@@ -1277,6 +1477,7 @@ export class Ravensight {
 
   _unbindLifecycle() {
     this._unbindPageHide();
+    this._stopPerformance();
     if (!this._listenersBound) return;
     try {
       document.removeEventListener('visibilitychange', this._onVisibilityChange);

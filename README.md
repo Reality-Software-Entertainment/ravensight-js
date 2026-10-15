@@ -220,6 +220,7 @@ and hand written canvas games.
 | `enabled` | `true` | Start opted out by passing `false`. |
 | `autoEvents` | `true` | Send `game_started` and `game_exited` for you, in a browser. See [Automatic events](#automatic-events). |
 | `fetch` | global | Inject a custom fetch. |
+| `performance` | `false` | Sample the frame rate and send one `health` event per session on page hide. See [Typed events](#typed-events). |
 | `debug` | `false` | Log SDK activity to the console, and warn about reserved `rs_` keys. |
 
 ### `await rs.init()`
@@ -270,9 +271,54 @@ Leave it out to use the client's own id. See
 
 Property keys starting with `rs_` are reserved for Ravensight. `rs_kind` says
 what an event means for the level funnel and must be one of `RS_KINDS`:
-`level_start`, `level_complete`, `death` or `none`. With `debug: true`, the SDK
+`level_start`, `level_complete`, `death` or `none`, or one of the typed kinds the
+helpers below set (`purchase`, `resource`, `progression`, `error`, `health`). With `debug: true`, the SDK
 warns once per event and key about an `rs_kind` outside that list or an `rs_`
 key Ravensight does not read. It never throws and still queues the event.
+
+### Typed events
+
+Four helpers build the reserved `rs_` properties for you and call `rs.track()`,
+so queueing, batching, retries and opt out behave exactly as before. They
+return what `track()` returns. Each takes an options object, and an optional
+second argument is `track()`'s own `{ deviceId }`. `data` holds extra
+properties, merged first, so the reserved keys always win. `event` overrides
+the default event name. The helpers never throw on bad input: the server
+marks a wrong value `rs_invalid`, and it shows on the Implementation health
+card.
+
+```js
+// Money is whole minor units: 499 is 4.99. An integer or a digit string.
+// Currency is three letters and is upper-cased for you. Event name: purchase.
+rs.trackPurchase({ amount: 499, currency: 'usd', itemType: 'bundle', itemId: 'starter', cart: 'c1', transactionId: 'tx9' });
+
+// flow is 'source' or 'sink'. Amount is a plain number, not money.
+// Event name: resource_source or resource_sink.
+rs.trackResource({ flow: 'source', resource: 'gold', amount: 50, itemType: 'quest', itemId: 'q1' });
+
+// status is 'start', 'complete' or 'fail'. p2, p3 and score are optional.
+// Event name: progression_start, progression_complete or progression_fail.
+rs.trackProgression({ status: 'complete', p1: 'world1', p2: 'level3', score: 1200 });
+
+// severity is 'debug', 'info', 'warning', 'error' or 'critical'.
+// The message is cut to 200 characters and the stack to 2000. Event name: error.
+rs.trackError({ severity: 'error', message: err.message, stack: err.stack });
+```
+
+| Helper | Required | Optional | Default event name |
+| --- | --- | --- | --- |
+| `trackPurchase` | `amount`, `currency`, `itemType`, `itemId` | `cart`, `transactionId` | `purchase` |
+| `trackResource` | `flow`, `resource`, `amount` | `itemType`, `itemId` | `resource_source`, `resource_sink` |
+| `trackProgression` | `status`, `p1` | `p2`, `p3`, `score` | `progression_start`, `progression_complete`, `progression_fail` |
+| `trackError` | `severity`, `message` | `stack` | `error` |
+
+**Health sampling is opt in.** Pass `performance: true` in a browser and the
+SDK samples the frame rate once per second from `requestAnimationFrame`, keeps
+at most 600 samples, and sends exactly one `health` event per session on
+`pagehide`, with the median and 10th percentile frames per second, the JS heap
+in MB where the browser exposes it, and milliseconds from page start to the
+client's construction. If no sample was taken, nothing is sent. The frame hook
+itself never sends. It does nothing in Node.
 
 ### `await rs.flush()`
 
