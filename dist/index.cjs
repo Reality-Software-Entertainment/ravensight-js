@@ -674,17 +674,32 @@ class Ravensight {
   }
 
   async _awaitJoin(deviceId, entry, token) {
+    const replaced = { joined: false, reason: 'replaced' };
     const fail = (reason) => {
       if (entry.joinedWith === token) entry.joinedWith = null;
       return { joined: false, reason };
     };
+    // In backoff: say so at once, with no request and no longer backoff.
+    if (this._clock() < this._nextAttemptAt) return fail('offline');
+    // An open already in flight cannot carry this token (it started before
+    // the join). Let it finish, then open again with the join.
+    if (entry.promise) {
+      try {
+        await entry.promise;
+      } catch (err) {
+        // Its failure is not this join's; the open below reports its own.
+      }
+    }
+    if (entry.joinedWith !== token) return replaced;
+    if (this._clock() < this._nextAttemptAt) return fail('offline');
     try {
       await this.session(deviceId);
     } catch (err) {
+      if (entry.joinedWith !== token) return replaced;
       return fail((err && err.code) || 'session_failed');
     }
     const outcome = entry.joinOutcome;
-    if (!outcome || outcome.token !== token) return fail('replaced');
+    if (entry.joinedWith !== token || !outcome || outcome.token !== token) return replaced;
     if (!outcome.joined) return fail(outcome.reason);
     return { joined: true, synthetic: outcome.synthetic };
   }

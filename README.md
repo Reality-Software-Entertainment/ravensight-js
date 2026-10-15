@@ -182,8 +182,8 @@ request timeout, and resolves `{ joined: true, synthetic }`. `synthetic` is
 it did not say (an older server). It never rejects: a refused token or a
 failed open resolves `{ joined: false, reason }`. After the join,
 `rs.isSynthetic(player.id)` gives the same answer, or `null` if none has
-settled. The SDK forgets it if that id's session is evicted past
-`maxSessions`.
+settled. If that id's session is evicted past `maxSessions` the SDK forgets the join
+and the answer, so the same token joins again on the next call.
 
 ## itch.io and HTML5 exports
 

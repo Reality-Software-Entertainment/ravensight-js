@@ -190,6 +190,20 @@ export declare class Ravensight {
 
 export type JoinResult =
   | { joined: true; synthetic: boolean | null }
-  | { joined: false; reason: string };
+  | {
+      joined: false;
+      reason:
+        | 'already_joined'
+        | 'replaced'
+        | 'invalid_join_token'
+        | 'invalid_key'
+        | 'tracking_disabled'
+        | 'offline'
+        | 'rate_limited'
+        | 'session_failed'
+        | 'disabled'
+        | 'disposed'
+        | 'playtest_job_closed';
+    };
 
 export default Ravensight;

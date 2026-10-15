@@ -1266,6 +1266,77 @@ test('a repeat joinSession while the first is opening shares its pending answer'
   await rs.dispose();
 });
 
+test('a join after a plain open in flight waits, then really joins', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_s'], joinSynthetic: false, sessionDelayMs: 40 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000, deviceId: 'host' });
+  const plain = rs.session('p7');
+  const join = rs.joinSession('join_s', { deviceId: 'p7' });
+  await plain.catch(() => {});
+  assert.deepEqual(await join, { joined: true, synthetic: false });
+  const bodies = server.requestsTo('/api/v1/session').map((r) => r.body.joinToken);
+  assert.deepEqual(bodies, [undefined, 'join_s']);
+  await rs.dispose();
+});
+
+test('a join displaced by a newer token for the same id resolves replaced', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_a', 'join_b'], joinSynthetic: true, sessionDelayMs: 40 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000, deviceId: 'host' });
+  const a = rs.joinSession('join_a', { deviceId: 'p7' });
+  const b = rs.joinSession('join_b', { deviceId: 'p7' });
+  assert.deepEqual(await a, { joined: false, reason: 'replaced' });
+  assert.deepEqual(await b, { joined: true, synthetic: true });
+  assert.ok(rs.sessionTokenFor('p7'));
+  await rs.dispose();
+});
+
+test('a join during backoff resolves offline at once, sending nothing', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_s'] });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000, deviceId: 'host' });
+  rs._scheduleBackoff();
+  const until = rs._nextAttemptAt;
+  assert.deepEqual(await rs.joinSession('join_s', { deviceId: 'p7' }), { joined: false, reason: 'offline' });
+  assert.equal(server.requestsTo('/api/v1/session').length, 0);
+  assert.equal(rs._nextAttemptAt, until, 'backoff not extended');
+  await rs.dispose();
+});
+
+test('join then an immediate track makes one session request; a replacement drains the queue', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_a', 'join_b'], sessionDelayMs: 30 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000, deviceId: 'host' });
+  const a = rs.joinSession('join_a', { deviceId: 'p7' });
+  rs.track('e1', {}, { deviceId: 'p7' });
+  await rs.flush();
+  assert.equal((await a).joined, true);
+  assert.equal(server.requestsTo('/api/v1/session').length, 1);
+
+  rs.track('e2', {}, { deviceId: 'p7' });
+  rs.track('e3', {}, { deviceId: 'p7' });
+  const b = rs.joinSession('join_b', { deviceId: 'p7' });
+  await rs.flush();
+  assert.equal((await b).joined, true);
+  assert.equal(rs.stats.dropped, 0);
+  const sent = server.state.batches.flatMap((x) => (x.events || x.body?.events || []).map((e) => e.name || e.event));
+  assert.deepEqual(sent.filter((n) => /^e\d$/.test(n)).sort(), ['e1', 'e2', 'e3']);
+  const lastBatch = server.requestsTo('/api/v1/track/batch').at(-1);
+  assert.equal(lastBatch.headers['x-session-token'], rs.sessionTokenFor('p7'));
+  await rs.dispose();
+});
+
+test('after LRU eviction the same token joins again', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_s'] });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000, deviceId: 'host', maxSessions: 1 });
+  assert.equal((await rs.joinSession('join_s', { deviceId: 'p7' })).joined, true);
+  assert.equal((await rs.joinSession('join_s', { deviceId: 'p8' })).joined, true);
+  assert.equal(rs._sessions.has('p7'), false, 'p7 was evicted');
+  assert.equal((await rs.joinSession('join_s', { deviceId: 'p7' })).joined, true);
+  await rs.dispose();
+});
+
 test('joinSession resolves the synthetic answer and isSynthetic reads it', async (t) => {
   for (const flag of [true, false]) {
     const server = await startMockServer({ joinTokens: ['join_s'], joinSynthetic: flag });
