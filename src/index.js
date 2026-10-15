@@ -657,6 +657,8 @@ export class Ravensight {
     }
     const entry = this._sessionEntry(deviceId);
     if (entry.joinedWith === token) {
+      // Still opening: share the pending answer. Settled: nothing to do.
+      if (entry.joinPending) return entry.joinPending;
       return Promise.resolve({ joined: false, reason: 'already_joined' });
     }
     entry.joinedWith = token;
@@ -664,7 +666,11 @@ export class Ravensight {
     entry.synthetic = null;
     entry.token = null;
     entry.expiresAt = 0;
-    return this._awaitJoin(deviceId, entry, token);
+    const pending = this._awaitJoin(deviceId, entry, token).finally(() => {
+      if (entry.joinPending === pending) entry.joinPending = null;
+    });
+    entry.joinPending = pending;
+    return pending;
   }
 
   async _awaitJoin(deviceId, entry, token) {
@@ -821,6 +827,7 @@ export class Ravensight {
         joinToken: null,
         joinedWith: null,
         joinOutcome: null,
+        joinPending: null,
         synthetic: null,
       };
       this._sessions.set(deviceId, entry);

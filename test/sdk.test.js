@@ -1252,6 +1252,20 @@ test('joinSession is idempotent per device id and a different token replaces the
   await rs.dispose();
 });
 
+test('a repeat joinSession while the first is opening shares its pending answer', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_s'], joinSynthetic: true, sessionDelayMs: 50 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000, deviceId: 'host' });
+  const a = rs.joinSession('join_s');
+  const b = rs.joinSession('join_s');
+  assert.equal(a, b, 'the same pending promise');
+  assert.deepEqual(await a, { joined: true, synthetic: true });
+  assert.equal(server.requestsTo('/api/v1/session').length, 1);
+  assert.equal(rs.isSynthetic(), true, 'no argument reads the current device id');
+  assert.deepEqual(await rs.joinSession('join_s'), { joined: false, reason: 'already_joined' });
+  await rs.dispose();
+});
+
 test('joinSession resolves the synthetic answer and isSynthetic reads it', async (t) => {
   for (const flag of [true, false]) {
     const server = await startMockServer({ joinTokens: ['join_s'], joinSynthetic: flag });
