@@ -175,12 +175,21 @@ export declare class Ravensight {
   /**
    * Joins a session opened elsewhere (the browser's rs.sessionToken), so this device id's next
    * session shares its analytics session. Used once; a refused token falls back to a plain session.
+   * Idempotent per device id: the same token again resolves { joined: false, reason: 'already_joined' };
+   * a different token replaces the join. Opens the session now and resolves { joined: true, synthetic }
+   * (synthetic is null when the server did not say), or { joined: false, reason } and never rejects.
    * Throws TypeError on a bad token or deviceId, RavensightError code disposed after dispose().
    */
-  joinSession(token: string, options?: TrackOptions): void;
+  joinSession(token: string, options?: TrackOptions): Promise<JoinResult>;
+  /** The server's synthetic (persona account) answer for the session joined for this id, or null. */
+  isSynthetic(deviceId?: string): boolean | null;
   /** Switches to a fresh random device id. Same semantics as setDeviceId. Resolves with the new id. */
   resetDeviceId(): Promise<string>;
   dispose(options?: DisposeOptions): Promise<DisposeResult>;
 }
+
+export type JoinResult =
+  | { joined: true; synthetic: boolean | null }
+  | { joined: false; reason: string };
 
 export default Ravensight;

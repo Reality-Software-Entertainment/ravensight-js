@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2
+
+### Changed
+
+* `rs.joinSession(token, { deviceId }?)` is idempotent per device id. Joining
+  the same token again for the same id does nothing and resolves
+  `{ joined: false, reason: 'already_joined' }`, so a game server no longer
+  needs its own list of joined tokens. A different token for the same id
+  replaces the join as before.
+* `joinSession` now returns a promise. It opens the session at once, bounded
+  by the request timeout, and resolves `{ joined: true, synthetic }`, where
+  `synthetic` is the server's `true` or `false` for a persona account, or
+  `null` when the server did not say. It never rejects after argument
+  checks: a refused token or a failed open resolves `{ joined: false, reason }`.
+  Code that ignored the old `undefined` return keeps working.
+
+### Added
+
+* `rs.isSynthetic(deviceId?)` answers `true`, `false` or `null` for the
+  session joined for that id, so a game server can read it instead of
+  trusting a flag the client sends.
+
 ## 0.4.1
 
 ### Added

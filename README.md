@@ -153,20 +153,37 @@ await fetch('/api/link-analytics', {
   body: JSON.stringify({ rsToken: token }),
 });
 
-// Server: one call per player, before that player's next event.
-rs.joinSession(body.rsToken, { deviceId: player.id });
+// Server: join, then read what the server says about the account.
+const join = await rs.joinSession(body.rsToken, { deviceId: player.id });
+if (join.joined && join.synthetic === true) {
+  // A persona account: keep it out of your other tools. This comes from the
+  // Ravensight server, not from a flag the browser sent.
+  player.synthetic = true;
+}
 rs.track('purchase_verified', { sku: 'gold_pack' }, { deviceId: player.id });
 ```
 
 `rs.session()` resolves as soon as the session is open, so there is no timer
 to poll `rs.sessionToken`. On the server, `await rs.session(player.id)` opens
 a player's session eagerly if you want it open before their first event;
-`joinSession` itself needs no wait.
+`joinSession` itself needs no wait before `track`.
 
 The next session opened for that id carries the token once, and the server
 copies the browser's device id. The local id is only the key the SDK caches
 the session under. If the server refuses the token, the SDK opens a plain
 session instead and records `invalid_join_token` in `stats.lastError`.
+
+`joinSession` is idempotent per device id, so you do not need your own list of
+joined tokens. Joining the token already joined for an id does nothing and
+resolves `{ joined: false, reason: 'already_joined' }`; a different token for
+the same id replaces the join. The promise opens the session, bounded by the
+request timeout, and resolves `{ joined: true, synthetic }`. `synthetic` is
+`true` or `false` as the Ravensight server judged the account, or `null` when
+it did not say (an older server). It never rejects: a refused token or a
+failed open resolves `{ joined: false, reason }`. After the join,
+`rs.isSynthetic(player.id)` gives the same answer, or `null` if none has
+settled. The SDK forgets it if that id's session is evicted past
+`maxSessions`.
 
 ## itch.io and HTML5 exports
 
@@ -323,7 +340,10 @@ share one request. It rejects with an error whose `code` is the reason
 Joins a session opened elsewhere, normally the browser's `rs.sessionToken`,
 so the next session for `deviceId` (default: the client's own id) shares its
 analytics session. Any session already cached for that id is dropped. The
-token is used once. See
+token is used once. Repeating the same token for the same id is a no-op that
+resolves `{ joined: false, reason: 'already_joined' }`; otherwise it resolves
+`{ joined: true, synthetic }` once the session opens, with `synthetic` `true`,
+`false` or `null` (not said). `rs.isSynthetic(deviceId?)` reads it later. See
 [Joining the browser's session](#joining-the-browsers-session).
 
 ### `await rs.dispose({ flush = true, timeoutMs = 2000 })`

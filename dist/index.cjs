@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.4.1';
+const VERSION = '0.4.2';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -629,6 +629,17 @@ class Ravensight {
    * for that id is dropped. A refused join token falls back to a plain
    * session and is recorded as stats.lastError `invalid_join_token`.
    *
+   * Idempotent per device id: repeating the token already joined for an id
+   * does nothing and resolves `{ joined: false, reason: 'already_joined' }`.
+   * A different token for the same id replaces the join. Otherwise the
+   * session is opened now, bounded by the request timeout, and the promise
+   * resolves `{ joined: true, synthetic }`, where `synthetic` is the server's
+   * `true` or `false` (a persona account or not), or `null` when it did not
+   * say. When the session cannot open, or the token is refused, it resolves
+   * `{ joined: false, reason }` and never rejects. Read the answer later with
+   * isSynthetic(deviceId).
+   *
+   * @returns {Promise<{joined: boolean, synthetic?: boolean|null, reason?: string}>}
    * @throws {TypeError} when `token` or `options.deviceId` is not a non-empty string.
    * @throws {RavensightError} code `disposed` after dispose().
    */
@@ -645,9 +656,41 @@ class Ravensight {
       deviceId = options.deviceId;
     }
     const entry = this._sessionEntry(deviceId);
+    if (entry.joinedWith === token) {
+      return Promise.resolve({ joined: false, reason: 'already_joined' });
+    }
+    entry.joinedWith = token;
     entry.joinToken = token;
+    entry.synthetic = null;
     entry.token = null;
     entry.expiresAt = 0;
+    return this._awaitJoin(deviceId, entry, token);
+  }
+
+  async _awaitJoin(deviceId, entry, token) {
+    const fail = (reason) => {
+      if (entry.joinedWith === token) entry.joinedWith = null;
+      return { joined: false, reason };
+    };
+    try {
+      await this.session(deviceId);
+    } catch (err) {
+      return fail((err && err.code) || 'session_failed');
+    }
+    const outcome = entry.joinOutcome;
+    if (!outcome || outcome.token !== token) return fail('replaced');
+    if (!outcome.joined) return fail(outcome.reason);
+    return { joined: true, synthetic: outcome.synthetic };
+  }
+
+  /**
+   * Whether the server judged the session joined for `deviceId` (default: the
+   * current id) to belong to a synthetic (persona) account: `true`, `false`,
+   * or `null` when no join has settled or the server did not say.
+   */
+  isSynthetic(deviceId = this.deviceId) {
+    const entry = this._sessions.get(deviceId);
+    return entry && typeof entry.synthetic === 'boolean' ? entry.synthetic : null;
   }
 
   /**
@@ -771,7 +814,15 @@ class Ravensight {
       this._sessions.delete(deviceId);
       this._sessions.set(deviceId, entry);
     } else {
-      entry = { token: null, expiresAt: 0, promise: null, joinToken: null };
+      entry = {
+        token: null,
+        expiresAt: 0,
+        promise: null,
+        joinToken: null,
+        joinedWith: null,
+        joinOutcome: null,
+        synthetic: null,
+      };
       this._sessions.set(deviceId, entry);
       // Never the entry being created: the caller is about to use it.
       this._evictSessions(deviceId);
@@ -825,6 +876,11 @@ class Ravensight {
       // joinSession() was called again while this was in flight: the next
       // session for this id must carry the newer join token, so keep none.
       if (entry.joinToken !== joinToken) return token;
+      if (joinToken) {
+        const synthetic = typeof res.body.synthetic === 'boolean' ? res.body.synthetic : null;
+        entry.joinOutcome = { token: joinToken, joined: res.body.joined !== false, synthetic };
+        entry.synthetic = synthetic;
+      }
       entry.joinToken = null;
       entry.token = token;
       entry.expiresAt = this._resolveExpiry(res.body);
@@ -845,7 +901,10 @@ class Ravensight {
 
     // A stale or foreign join token. Forget it and open a plain session.
     if (res.status === 401 && joinToken && code === 'invalid_join_token') {
-      if (entry.joinToken === joinToken) entry.joinToken = null;
+      if (entry.joinToken === joinToken) {
+        entry.joinToken = null;
+        entry.joinOutcome = { token: joinToken, joined: false, reason: 'invalid_join_token' };
+      }
       this._recordError('invalid_join_token', 401);
       this._log('join token refused, opening a plain session');
       return this._createSession(deviceId, entry);

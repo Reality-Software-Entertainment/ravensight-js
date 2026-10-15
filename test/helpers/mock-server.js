@@ -63,6 +63,8 @@ export async function startMockServer(config = {}) {
     batchDelayMs: config.batchDelayMs == null ? 0 : config.batchDelayMs,
     /** Delay before answering POST /session, to hold a session open in flight. */
     sessionDelayMs: config.sessionDelayMs == null ? 0 : config.sessionDelayMs,
+    /** When set, a session opened with a join token answers `synthetic` (true|false) and joined: true. */
+    joinSynthetic: config.joinSynthetic == null ? null : config.joinSynthetic,
     seq: 0,
   };
 
@@ -116,11 +118,16 @@ export async function startMockServer(config = {}) {
       state.validTokens.add(token);
       state.tokenDevices.set(token, device);
       state.sessionDevices.push(device);
-      return send(res, 201, {
+      const created = {
         token,
         expiresIn: state.sessionExpiresIn,
         expiresAt: Math.floor(Date.now() / 1000) + state.sessionExpiresIn,
-      });
+      };
+      if (body && body.joinToken != null && state.joinSynthetic != null) {
+        created.joined = true;
+        created.synthetic = state.joinSynthetic;
+      }
+      return send(res, 201, created);
     }
 
     if (req.method === 'POST' && path === '/api/v1/track/batch') {

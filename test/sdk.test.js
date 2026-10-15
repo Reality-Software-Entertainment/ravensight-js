@@ -1226,6 +1226,74 @@ test('joinSession validates its arguments and refuses after dispose', async (t) 
   assert.throws(() => rs.joinSession('tok'), (err) => err instanceof RavensightError && err.code === 'disposed');
 });
 
+test('joinSession is idempotent per device id and a different token replaces the join', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_a', 'join_b'] });
+  t.after(() => server.close());
+
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  const first = await rs.joinSession('join_a', { deviceId: 'p7' });
+  assert.equal(first.joined, true);
+  const before = server.requestsTo('/api/v1/session').length;
+  const tokenBefore = rs.sessionTokenFor('p7');
+
+  const repeat = await rs.joinSession('join_a', { deviceId: 'p7' });
+  assert.deepEqual(repeat, { joined: false, reason: 'already_joined' });
+  assert.equal(server.requestsTo('/api/v1/session').length, before, 'no new session');
+  assert.equal(rs.sessionTokenFor('p7'), tokenBefore, 'the session was not dropped');
+
+  const other = await rs.joinSession('join_a', { deviceId: 'p8' });
+  assert.equal(other.joined, true, 'another id may join the same token');
+
+  const replaced = await rs.joinSession('join_b', { deviceId: 'p7' });
+  assert.equal(replaced.joined, true);
+  const bodies = server.requestsTo('/api/v1/session').map((r) => r.body.joinToken);
+  assert.deepEqual(bodies, ['join_a', 'join_a', 'join_b']);
+  assert.notEqual(rs.sessionTokenFor('p7'), tokenBefore);
+  await rs.dispose();
+});
+
+test('joinSession resolves the synthetic answer and isSynthetic reads it', async (t) => {
+  for (const flag of [true, false]) {
+    const server = await startMockServer({ joinTokens: ['join_s'], joinSynthetic: flag });
+    t.after(() => server.close());
+    const rs = makeClient(server, { autoFlushMs: 60000 });
+    assert.equal(rs.isSynthetic('p7'), null, 'unknown before a join');
+    const result = await rs.joinSession('join_s', { deviceId: 'p7' });
+    assert.deepEqual(result, { joined: true, synthetic: flag });
+    assert.equal(rs.isSynthetic('p7'), flag);
+    assert.equal(rs.isSynthetic('other'), null);
+    await rs.dispose();
+  }
+});
+
+test('joinSession resolves synthetic null when the server did not say', async (t) => {
+  const server = await startMockServer({ joinTokens: ['join_s'] });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  assert.deepEqual(await rs.joinSession('join_s', { deviceId: 'p7' }), { joined: true, synthetic: null });
+  assert.equal(rs.isSynthetic('p7'), null);
+  await rs.dispose();
+});
+
+test('joinSession resolves a reason, never rejects, when the token is refused or the open fails', async (t) => {
+  const server = await startMockServer({ joinTokens: ['good'], joinSynthetic: true });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  assert.deepEqual(await rs.joinSession('stale', { deviceId: 'p7' }), {
+    joined: false,
+    reason: 'invalid_join_token',
+  });
+  assert.equal(rs.isSynthetic('p7'), null);
+  assert.ok(rs.sessionTokenFor('p7'), 'the plain fallback session is open');
+  // A refused join may be tried again.
+  assert.equal((await rs.joinSession('good', { deviceId: 'p7' })).joined, true);
+
+  server.state.sessionStatus = 500;
+  const failed = await rs.joinSession('good2', { deviceId: 'p9' });
+  assert.deepEqual(failed, { joined: false, reason: 'session_failed' });
+  await rs.dispose();
+});
+
 // --- Playtest token -------------------------------------------------------
 
 function withWindow(t, value) {
