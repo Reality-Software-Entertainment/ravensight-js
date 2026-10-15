@@ -347,6 +347,7 @@ export class Ravensight {
     this._healthSent = false;
     this._healthBound = false;
     this._onHealthHide = null;
+    this._onHealthShow = null;
     this._frameHandle = null;
     this._lastFrameTs = null;
     this._nextSampleAt = 0;
@@ -560,17 +561,51 @@ export class Ravensight {
     }
     if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
       this._onHealthHide = () => this._sendHealth();
+      this._onHealthShow = (event) => {
+        // A page restored from the back-forward cache is a new session.
+        if (event && event.persisted) this._rearmHealth();
+      };
       window.addEventListener('pagehide', this._onHealthHide);
+      window.addEventListener('pageshow', this._onHealthShow);
       this._healthBound = true;
     }
-    if (typeof requestAnimationFrame === 'function') {
-      this._frameHandle = requestAnimationFrame((ts) => this._onFrame(ts));
+    this._startFrameLoop();
+  }
+
+  /** Starts sampling frames, only while tracking is on and nothing was sent yet this session. */
+  _startFrameLoop() {
+    if (this._frameHandle !== null || this._healthSent || this._disposed) return;
+    if (!this.isActive || typeof requestAnimationFrame !== 'function') return;
+    this._lastFrameTs = null;
+    this._frameHandle = requestAnimationFrame((ts) => this._onFrame(ts));
+  }
+
+  _stopFrameLoop() {
+    if (this._frameHandle !== null && typeof cancelAnimationFrame === 'function') {
+      try {
+        cancelAnimationFrame(this._frameHandle);
+      } catch (_err) {
+        // ignore
+      }
     }
+    this._frameHandle = null;
+  }
+
+  /** A new session: forget the old samples and sample again. */
+  _rearmHealth() {
+    if (!this.performance || this._disposed) return;
+    this._healthSent = false;
+    this._fpsSamples = [];
+    this._nextSampleAt = 0;
+    this._startFrameLoop();
   }
 
   /** The frame hook: records one frame rate sample per second and schedules the next frame. Never sends. */
   _onFrame(ts) {
+    this._frameHandle = null;
     if (this._healthSent || this._disposed) return;
+    // Opted out: stop spending frames. setEnabled(true) starts the loop again.
+    if (!this.isActive) return;
     if (this._lastFrameTs !== null) {
       const delta = ts - this._lastFrameTs;
       if (delta > 0 && ts >= this._nextSampleAt) {
@@ -606,9 +641,9 @@ export class Ravensight {
 
   /** Sends the one `health` event for this session, on the first pagehide. Nothing when no sample was taken. */
   _sendHealth() {
-    if (this._healthSent) return;
+    if (this._healthSent || !this.isActive) return;
     this._healthSent = true;
-    this._stopPerformance();
+    this._stopFrameLoop();
     const summary = this._healthSummary();
     if (!summary) return;
     if (!this.track('health', summary)) return;
@@ -616,22 +651,17 @@ export class Ravensight {
   }
 
   _stopPerformance() {
-    if (this._frameHandle !== null && typeof cancelAnimationFrame === 'function') {
-      try {
-        cancelAnimationFrame(this._frameHandle);
-      } catch (_err) {
-        // ignore
-      }
-    }
-    this._frameHandle = null;
+    this._stopFrameLoop();
     if (this._healthBound) {
       try {
         window.removeEventListener('pagehide', this._onHealthHide);
+        window.removeEventListener('pageshow', this._onHealthShow);
       } catch (_err) {
         // ignore
       }
       this._healthBound = false;
       this._onHealthHide = null;
+      this._onHealthShow = null;
     }
   }
 
@@ -779,8 +809,10 @@ export class Ravensight {
       this.stats.dropped += this.queue.length;
       this.queue.length = 0;
       this._stopTimer();
-    } else if (this.initialized && this.trackingEnabled) {
-      this._startTimer();
+      this._stopFrameLoop();
+    } else {
+      if (this.initialized && this.trackingEnabled) this._startTimer();
+      if (this.performance) this._startFrameLoop();
     }
   }
 

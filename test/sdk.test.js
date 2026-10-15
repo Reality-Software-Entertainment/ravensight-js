@@ -1620,7 +1620,7 @@ function withBrowser(t) {
   });
   return {
     count: (type) => (listeners.get(type) ? listeners.get(type).size : 0),
-    fire: (type) => [...(listeners.get(type) || [])].forEach((fn) => fn({ type })),
+    fire: (type, extra) => [...(listeners.get(type) || [])].forEach((fn) => fn(Object.assign({ type }, extra))),
   };
 }
 
@@ -2096,4 +2096,69 @@ test('dispose removes the health pagehide listener and stops the loop', async (t
   await rs.dispose({ flush: false });
   assert.equal(b.count('pagehide'), 0);
   assert.ok(frames.cancelled >= 1);
+});
+
+test('with tracking disabled, every typed helper queues nothing and no request is made', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server, { enabled: false });
+  assert.equal(rs.trackPurchase({ amount: 1, currency: 'usd', itemType: 'a', itemId: 'b' }), false);
+  assert.equal(rs.trackResource({ flow: 'sink', resource: 'g', amount: 1 }), false);
+  assert.equal(rs.trackProgression({ status: 'start', p1: 'a' }), false);
+  assert.equal(rs.trackError({ severity: 'error', message: 'm' }), false);
+  assert.equal(rs.queue.length, 0);
+  await rs.flush();
+  assert.equal(server.state.requests.length, 0, 'the server saw nothing');
+  await rs.dispose({ flush: false });
+});
+
+test('performance with tracking disabled: no frames spent, no health queued or sent', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false, enabled: false });
+  assert.equal(frames.cb, null, 'no frame loop while opted out');
+  b.fire('pagehide');
+  assert.equal(rs.queue.length, 0);
+  await rs.flush();
+  assert.equal(server.state.requests.length, 0);
+
+  // Opting in starts sampling; opting out again stops it.
+  rs.setEnabled(true);
+  assert.equal(typeof frames.cb, 'function');
+  frames.cb(1000);
+  frames.cb(1016);
+  assert.equal(rs._fpsSamples.length, 1);
+  rs.setEnabled(false);
+  assert.ok(frames.cancelled >= 1, 'the loop stops on opt out');
+  frames.cb(2000);
+  frames.cb(2016);
+  assert.equal(rs._fpsSamples.length, 1, 'no sample is taken while opted out');
+  b.fire('pagehide');
+  assert.equal(rs.queue.length, 0);
+  await rs.dispose({ flush: false });
+});
+
+test('health re-arms on a restored page, so it is once per session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false });
+  frames.cb(1000);
+  frames.cb(1016);
+  b.fire('pagehide');
+  b.fire('pagehide');
+  assert.equal(healthEvents(rs).length, 1);
+  b.fire('pageshow', { persisted: false });
+  b.fire('pagehide');
+  assert.equal(healthEvents(rs).length, 1, 'a plain pageshow is not a new session');
+  b.fire('pageshow', { persisted: true });
+  assert.deepEqual(rs._fpsSamples, [], 'old samples are forgotten');
+  frames.cb(5000);
+  frames.cb(5033);
+  b.fire('pagehide');
+  assert.equal(healthEvents(rs).length, 2, 'the restored session sends its own');
+  await rs.dispose({ flush: false });
 });
