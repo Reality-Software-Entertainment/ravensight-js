@@ -523,7 +523,7 @@ test('exact key sets: settings, session, batch, feedback, keepalive and beacon b
   assert.equal(settings.headers['content-type'], undefined);
 
   const session = server.requestsTo('/api/v1/session')[0].body;
-  assert.deepEqual(keys(session), ['deviceId', 'gameVersion', 'platform']);
+  assert.deepEqual(keys(session), ['deviceId', 'gameVersion', 'platform', 'sdk']);
 
   rs.track('a', { level: 1 });
   rs.track('b');
@@ -559,7 +559,7 @@ test('exact key sets: settings, session, batch, feedback, keepalive and beacon b
   const full = makeClient(server, { distribution: 'native-release', deviceId: 'joined' });
   await full.joinSession('jt');
   const joinedSession = server.requestsTo('/api/v1/session').at(-1).body;
-  assert.deepEqual(keys(joinedSession), ['deviceId', 'distribution', 'gameVersion', 'joinToken', 'platform']);
+  assert.deepEqual(keys(joinedSession), ['deviceId', 'distribution', 'gameVersion', 'joinToken', 'platform', 'sdk']);
   await full.dispose();
 });
 

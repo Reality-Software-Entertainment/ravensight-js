@@ -91,6 +91,25 @@ See "Public builds" in the README.
   closes are lost, as before, so `rs_event_id` protects resends within a
   page's life.
 
+### Added
+
+* Typed event helpers `rs.trackPurchase`, `rs.trackResource`,
+  `rs.trackProgression` and `rs.trackError`. Each builds the reserved `rs_`
+  properties and calls `rs.track()`, so delivery is unchanged. Reserved keys
+  win over `data`, `event` overrides the default event name, and bad input is
+  passed through for the server to flag. TypeScript declarations included.
+* Opt-in performance sampling, `performance: true`. In a browser the SDK
+  samples the frame rate once per second, keeps at most 600 samples and sends
+  one `health` event per session on `pagehide`. Nothing is sent without a
+  sample.
+* The session request now carries `sdk: "js/<version>"`.
+
+### Changed
+
+* `RS_KINDS` also lists `purchase`, `resource`, `progression`, `error` and
+  `health`, and the debug reserved-key check knows every typed key. It still
+  warns on `rs_invalid`, which only the server writes.
+
 ## 0.4.2
 
 ### Changed

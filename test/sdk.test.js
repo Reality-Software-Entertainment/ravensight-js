@@ -651,7 +651,7 @@ test('the generated CommonJS build exposes the same surface', () => {
   assert.equal(typeof cjs.Ravensight.prototype.setDeviceId, 'function');
   assert.equal(typeof cjs.Ravensight.prototype.resetDeviceId, 'function');
   assert.equal(cjs.MAX_BATCH_SIZE, 50);
-  assert.deepEqual(cjs.RS_KINDS, ['level_start', 'level_complete', 'death', 'none']);
+  assert.deepEqual(cjs.RS_KINDS, ['level_start', 'level_complete', 'death', 'none', 'purchase', 'resource', 'progression', 'error', 'health']);
   assert.equal(typeof cjs.Ravensight.prototype.joinSession, 'function');
   assert.equal(typeof cjs.MemoryStorage, 'function');
   assert.equal(typeof cjs.RavensightError, 'function');
@@ -1214,6 +1214,7 @@ test('joinSession sends the join token on that device id\'s next session, once',
     deviceId: 'p7',
     gameVersion: '1.2.3',
     platform: 'test',
+    sdk: 'js/' + VERSION,
     joinToken: 'join_abc',
   });
   assert.equal(sessions[0].body.joinToken, undefined, 'the host session never carried it');
@@ -1532,8 +1533,8 @@ test('a 403 playtest_job_closed is fatal: tracking stops and the timer with it',
 
 // --- Reserved rs_ keys ----------------------------------------------------
 
-test('RS_KINDS is the four rs_kind values, frozen', () => {
-  assert.deepEqual(RS_KINDS, ['level_start', 'level_complete', 'death', 'none']);
+test('RS_KINDS is every rs_kind value, frozen', () => {
+  assert.deepEqual(RS_KINDS, ['level_start', 'level_complete', 'death', 'none', 'purchase', 'resource', 'progression', 'error', 'health']);
   assert.ok(Object.isFrozen(RS_KINDS));
 });
 
@@ -1673,7 +1674,7 @@ function withBrowser(t) {
   });
   return {
     count: (type) => (listeners.get(type) ? listeners.get(type).size : 0),
-    fire: (type) => [...(listeners.get(type) || [])].forEach((fn) => fn({ type })),
+    fire: (type, extra) => [...(listeners.get(type) || [])].forEach((fn) => fn(Object.assign({ type }, extra))),
   };
 }
 
@@ -1881,4 +1882,361 @@ test('session() rejects with offline and with tracking_disabled', async (t) => {
   await assert.rejects(rs.session(), (e) => e.code === 'tracking_disabled');
   await assert.rejects(rs.session(), (e) => e.code === 'tracking_disabled');
   await rs.dispose({ flush: false });
+});
+
+// --- Typed events -----------------------------------------------------------
+
+const lastEvent = (rs) => {
+  const event = rs.queue[rs.queue.length - 1];
+  const { rs_event_id, ...data } = event.data;
+  assert.match(rs_event_id, /^[A-Za-z0-9_-]{1,64}$/);
+  return { ...event, data };
+};
+
+test('RS_KINDS holds the level kinds and the five typed kinds, frozen', () => {
+  assert.deepEqual(RS_KINDS, [
+    'level_start', 'level_complete', 'death', 'none',
+    'purchase', 'resource', 'progression', 'error', 'health',
+  ]);
+  assert.ok(Object.isFrozen(RS_KINDS));
+});
+
+test('trackPurchase builds the exact property set and upper-cases the currency', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  const result = rs.trackPurchase({
+    amount: 499, currency: 'usd', itemType: 'bundle', itemId: 'starter', cart: 'c1', transactionId: 'tx9',
+  });
+  assert.equal(result, true, 'returns what track returns');
+  const e = lastEvent(rs);
+  assert.equal(e.event, 'purchase');
+  assert.deepEqual(e.data, {
+    rs_kind: 'purchase', rs_amount: 499, rs_currency: 'USD', rs_item_type: 'bundle', rs_item_id: 'starter',
+    rs_cart: 'c1', rs_transaction_id: 'tx9',
+  });
+  rs.trackPurchase({ amount: '1299', currency: 'EUR', itemType: 'coin', itemId: 'p' });
+  assert.deepEqual(lastEvent(rs).data, {
+    rs_kind: 'purchase', rs_amount: '1299', rs_currency: 'EUR', rs_item_type: 'coin', rs_item_id: 'p',
+  });
+  await rs.dispose({ flush: false });
+});
+
+test('trackResource builds the property set and names the event by flow', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  rs.trackResource({ flow: 'source', resource: 'gold', amount: 50, itemType: 'quest', itemId: 'q1' });
+  assert.equal(lastEvent(rs).event, 'resource_source');
+  assert.deepEqual(lastEvent(rs).data, {
+    rs_kind: 'resource', rs_flow: 'source', rs_resource: 'gold', rs_amount: 50, rs_item_type: 'quest', rs_item_id: 'q1',
+  });
+  rs.trackResource({ flow: 'sink', resource: 'gold', amount: 5 });
+  assert.equal(lastEvent(rs).event, 'resource_sink');
+  assert.deepEqual(lastEvent(rs).data, { rs_kind: 'resource', rs_flow: 'sink', rs_resource: 'gold', rs_amount: 5 });
+  await rs.dispose({ flush: false });
+});
+
+test('trackProgression builds the property set and names the event by status', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  rs.trackProgression({ status: 'start', p1: 'world1' });
+  assert.equal(lastEvent(rs).event, 'progression_start');
+  assert.deepEqual(lastEvent(rs).data, { rs_kind: 'progression', rs_status: 'start', rs_p1: 'world1' });
+  rs.trackProgression({ status: 'complete', p1: 'w', p2: 'l', p3: 'boss', score: 1200 });
+  assert.equal(lastEvent(rs).event, 'progression_complete');
+  assert.deepEqual(lastEvent(rs).data, {
+    rs_kind: 'progression', rs_status: 'complete', rs_p1: 'w', rs_p2: 'l', rs_p3: 'boss', rs_score: 1200,
+  });
+  rs.trackProgression({ status: 'fail', p1: 'w', score: 0 });
+  assert.equal(lastEvent(rs).event, 'progression_fail');
+  assert.equal(lastEvent(rs).data.rs_score, 0, 'a zero score is kept');
+  await rs.dispose({ flush: false });
+});
+
+test('trackError builds the property set and cuts message and stack', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  rs.trackError({ severity: 'warning', message: 'boom' });
+  assert.equal(lastEvent(rs).event, 'error');
+  assert.deepEqual(lastEvent(rs).data, { rs_kind: 'error', rs_severity: 'warning', rs_message: 'boom' });
+  rs.trackError({ severity: 'critical', message: 'm'.repeat(300), stack: 's'.repeat(2500) });
+  assert.equal(lastEvent(rs).data.rs_message.length, 200);
+  assert.equal(lastEvent(rs).data.rs_stack.length, 2000);
+  rs.trackError({ severity: 'error', message: '\u{1F600}'.repeat(250) });
+  assert.equal(Array.from(lastEvent(rs).data.rs_message).length, 200, 'cut by code point');
+  await rs.dispose({ flush: false });
+});
+
+test('reserved keys win over caller data, the event name can be overridden, bad input passes through', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  rs.trackPurchase({
+    amount: 100, currency: 'usd', itemType: 'a', itemId: 'b', event: 'iap',
+    data: { level: 3, rs_amount: 1, rs_kind: 'none' },
+  });
+  const e = lastEvent(rs);
+  assert.equal(e.event, 'iap');
+  assert.equal(e.data.level, 3, 'caller keys are kept');
+  assert.equal(e.data.rs_amount, 100);
+  assert.equal(e.data.rs_kind, 'purchase');
+  assert.doesNotThrow(() => rs.trackPurchase({ amount: 4.99, currency: 7 }));
+  assert.equal(lastEvent(rs).data.rs_amount, 4.99, 'passed through for the server to flag');
+  assert.doesNotThrow(() => rs.trackError());
+  assert.doesNotThrow(() => rs.trackResource(null));
+  rs.trackProgression({ status: 'weird', p1: 'x' });
+  assert.equal(lastEvent(rs).event, 'progression_weird');
+  rs.trackResource({ event: 'loot', flow: 'source', resource: 'g', amount: 1 });
+  assert.equal(lastEvent(rs).event, 'loot');
+  await rs.dispose({ flush: false });
+});
+
+test('helpers go through track: deviceId option and opt out', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  rs.trackError({ severity: 'info', message: 'x' }, { deviceId: 'p1' });
+  assert.equal(lastEvent(rs).deviceId, 'p1');
+  rs.setEnabled(false);
+  assert.equal(rs.trackError({ severity: 'info', message: 'y' }), false);
+  await rs.dispose({ flush: false });
+});
+
+test('debug reserved-key check accepts every typed key and kind, still warns on rs_invalid', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const warnings = captureConsole(t, 'warn');
+  const rs = makeClient(server, { debug: true });
+  rs.trackPurchase({ amount: 1, currency: 'usd', itemType: 'a', itemId: 'b', cart: 'c', transactionId: 't' });
+  rs.trackResource({ flow: 'sink', resource: 'g', amount: 1, itemType: 'a', itemId: 'b' });
+  rs.trackProgression({ status: 'start', p1: 'a', p2: 'b', p3: 'c', score: 1 });
+  rs.trackError({ severity: 'error', message: 'm', stack: 's' });
+  rs.track('health', { rs_kind: 'health', rs_fps_median: 60, rs_fps_p10: 50, rs_memory_mb: 10, rs_boot_ms: 5 });
+  assert.deepEqual(warnings, []);
+  rs.track('x', { rs_kind: 'purchase', rs_invalid: 'purchase_amount' });
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('rs_invalid'));
+  await rs.dispose({ flush: false });
+});
+
+test('the session request names the SDK', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  assert.equal(server.requestsTo('/api/v1/session')[0].body.sdk, 'js/' + VERSION);
+  await rs.dispose({ flush: false });
+});
+
+function withFrames(t) {
+  const saved = [globalThis.requestAnimationFrame, globalThis.cancelAnimationFrame];
+  const state = { cb: null, cancelled: 0 };
+  globalThis.requestAnimationFrame = (cb) => {
+    state.cb = cb;
+    return 1;
+  };
+  globalThis.cancelAnimationFrame = () => {
+    state.cancelled += 1;
+  };
+  t.after(() => {
+    globalThis.requestAnimationFrame = saved[0];
+    globalThis.cancelAnimationFrame = saved[1];
+    if (saved[0] === undefined) delete globalThis.requestAnimationFrame;
+    if (saved[1] === undefined) delete globalThis.cancelAnimationFrame;
+  });
+  return state;
+}
+
+const healthEvents = (rs) => rs.queue.filter((e) => e.event === 'health');
+
+test('performance is off by default: no frame loop, nothing sent on pagehide', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server);
+  assert.equal(frames.cb, null);
+  b.fire('pagehide');
+  assert.deepEqual(healthEvents(rs), []);
+  await rs.dispose({ flush: false });
+});
+
+test('health summary: percentiles from known samples, one send per session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false });
+  assert.equal(b.count('pagehide'), 1, 'performance binds pagehide even with autoEvents off');
+  assert.equal(rs._healthSummary(), null, 'no samples, no summary');
+  rs._fpsSamples = [];
+  for (let i = 1; i <= 11; i += 1) rs._fpsSamples.push(i * 10); // 10..110
+  const s = rs._healthSummary();
+  assert.equal(s.rs_fps_median, 60);
+  assert.equal(s.rs_fps_p10, 20);
+  rs._fpsSamples = [30, 60];
+  assert.equal(rs._healthSummary().rs_fps_median, 45, 'even count averages the middle two');
+  rs._fpsSamples = [30, 60, 90, 120, 150];
+  b.fire('pagehide');
+  b.fire('pagehide');
+  const sent = healthEvents(rs);
+  assert.equal(sent.length, 1, 'exactly one health event');
+  assert.equal(sent[0].data.rs_kind, 'health');
+  assert.equal(sent[0].data.rs_fps_median, 90);
+  assert.equal(sent[0].data.rs_fps_p10, 42);
+  assert.ok(frames.cancelled >= 1, 'the frame loop stops');
+  await rs.dispose({ flush: false });
+});
+
+test('the frame hook samples once per second and never sends', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false });
+  assert.equal(typeof frames.cb, 'function');
+  let ts = 1000;
+  for (let i = 0; i < 130; i += 1) {
+    ts += 16.6667;
+    frames.cb(ts);
+  }
+  const n = rs._fpsSamples.length;
+  assert.ok(n >= 1 && n <= 3, 'about one sample per second, got ' + n);
+  assert.ok(Math.abs(rs._fpsSamples[0] - 60) < 1);
+  assert.deepEqual(healthEvents(rs), [], 'nothing sent from the frame hook');
+  b.fire('pagehide');
+  assert.equal(healthEvents(rs).length, 1);
+  assert.equal(healthEvents(rs)[0].data.rs_fps_median > 0, true);
+  await rs.dispose({ flush: false });
+});
+
+test('the reservoir keeps at most 600 samples', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false });
+  let ts = 0;
+  for (let i = 0; i < 700; i += 1) {
+    ts += 1000;
+    frames.cb(ts);
+  }
+  assert.equal(rs._fpsSamples.length, 600);
+  await rs.dispose({ flush: false });
+});
+
+test('no samples, no health event; no requestAnimationFrame, no loop', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false });
+  b.fire('pagehide');
+  assert.deepEqual(healthEvents(rs), []);
+  await rs.dispose({ flush: false });
+
+  delete globalThis.requestAnimationFrame;
+  const rs2 = makeClient(server, { performance: true, autoEvents: false });
+  b.fire('pagehide');
+  assert.deepEqual(healthEvents(rs2), []);
+  await rs2.dispose({ flush: false });
+});
+
+test('dispose removes the health pagehide listener and stops the loop', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false });
+  assert.equal(b.count('pagehide'), 1);
+  await rs.dispose({ flush: false });
+  assert.equal(b.count('pagehide'), 0);
+  assert.ok(frames.cancelled >= 1);
+});
+
+test('with tracking disabled, every typed helper queues nothing and no request is made', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server, { enabled: false });
+  assert.equal(rs.trackPurchase({ amount: 1, currency: 'usd', itemType: 'a', itemId: 'b' }), false);
+  assert.equal(rs.trackResource({ flow: 'sink', resource: 'g', amount: 1 }), false);
+  assert.equal(rs.trackProgression({ status: 'start', p1: 'a' }), false);
+  assert.equal(rs.trackError({ severity: 'error', message: 'm' }), false);
+  assert.equal(rs.queue.length, 0);
+  await rs.flush();
+  assert.equal(server.state.requests.length, 0, 'the server saw nothing');
+  await rs.dispose({ flush: false });
+});
+
+test('performance with tracking disabled: no frames spent, no health queued or sent', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false, enabled: false });
+  assert.equal(frames.cb, null, 'no frame loop while opted out');
+  b.fire('pagehide');
+  assert.equal(rs.queue.length, 0);
+  await rs.flush();
+  assert.equal(server.state.requests.length, 0);
+
+  // Opting in starts sampling; opting out again stops it.
+  rs.setEnabled(true);
+  assert.equal(typeof frames.cb, 'function');
+  frames.cb(1000);
+  frames.cb(1016);
+  assert.equal(rs._fpsSamples.length, 1);
+  rs.setEnabled(false);
+  assert.ok(frames.cancelled >= 1, 'the loop stops on opt out');
+  frames.cb(2000);
+  frames.cb(2016);
+  assert.equal(rs._fpsSamples.length, 1, 'no sample is taken while opted out');
+  b.fire('pagehide');
+  assert.equal(rs.queue.length, 0);
+  await rs.dispose({ flush: false });
+});
+
+test('health re-arms on a restored page, so it is once per session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const frames = withFrames(t);
+  const b = withBrowser(t);
+  const rs = makeClient(server, { performance: true, autoEvents: false });
+  frames.cb(1000);
+  frames.cb(1016);
+  b.fire('pagehide');
+  b.fire('pagehide');
+  assert.equal(healthEvents(rs).length, 1);
+  b.fire('pageshow', { persisted: false });
+  b.fire('pagehide');
+  assert.equal(healthEvents(rs).length, 1, 'a plain pageshow is not a new session');
+  b.fire('pageshow', { persisted: true });
+  assert.deepEqual(rs._fpsSamples, [], 'old samples are forgotten');
+  frames.cb(5000);
+  frames.cb(5033);
+  b.fire('pagehide');
+  assert.equal(healthEvents(rs).length, 2, 'the restored session sends its own');
+  await rs.dispose({ flush: false });
+});
+
+
+test('performance remains inert without a key or before opt-in consent', async (t) => {
+  const frames = withFrames(t);
+  withBrowser(t);
+  const noKey = new Ravensight({ performance: true, optional: true });
+  assert.equal(noKey._healthBound, false);
+  assert.equal(frames.cb, null);
+  noKey.setEnabled(true);
+  assert.equal(noKey._healthBound, false);
+  const waiting = new Ravensight({ ingestKey: 'gt_pub_test', performance: true, consent: 'opt_in' });
+  assert.equal(waiting._healthBound, false);
+  assert.equal(frames.cb, null);
+  waiting.setEnabled(true);
+  assert.equal(waiting._healthBound, true);
+  assert.equal(typeof frames.cb, 'function');
+  await waiting.dispose({ flush: false });
+  await noKey.dispose({ flush: false });
 });

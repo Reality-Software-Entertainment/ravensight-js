@@ -11,7 +11,9 @@ export type FeedbackCategory = 'bug' | 'suggestion' | 'complaint' | 'praise' | '
 /** The six feedback categories the API accepts, frozen. */
 export declare const FEEDBACK_CATEGORIES: readonly FeedbackCategory[];
 
-export type RsKind = 'level_start' | 'level_complete' | 'death' | 'none';
+export type RsKind =
+  | 'level_start' | 'level_complete' | 'death' | 'none'
+  | 'purchase' | 'resource' | 'progression' | 'error' | 'health';
 /** The values the reserved rs_kind property accepts, frozen. Keys starting with rs_ are reserved. */
 export declare const RS_KINDS: readonly RsKind[];
 
@@ -58,6 +60,56 @@ export interface RavensightOptions {
   random?: () => number;
   /** Log SDK activity, and warn once per event and key about an unknown rs_kind or rs_ key. */
   debug?: boolean;
+  /**
+   * Sample the frame rate once per second (browser, needs requestAnimationFrame), keep at most 600
+   * samples, and send one `health` event on the first `pagehide`. Nothing is sent if no sample was
+   * taken. Default false.
+   */
+  performance?: boolean;
+}
+
+/** Fields shared by every typed helper. Reserved rs_ keys win over `data`. */
+export interface TypedEventBase {
+  /** Overrides the default event name. */
+  event?: string;
+  /** Extra properties, merged first. */
+  data?: Record<string, unknown>;
+}
+
+export interface PurchaseOptions extends TypedEventBase {
+  /** Whole minor units of the currency (499 is 4.99), an integer or a digit string. */
+  amount: number | string;
+  /** Three letters, upper-cased by the helper. */
+  currency: string;
+  itemType: string;
+  itemId: string;
+  cart?: string;
+  transactionId?: string;
+}
+
+export interface ResourceOptions extends TypedEventBase {
+  flow: 'source' | 'sink';
+  resource: string;
+  /** A plain number, not money. */
+  amount: number;
+  itemType?: string;
+  itemId?: string;
+}
+
+export interface ProgressionOptions extends TypedEventBase {
+  status: 'start' | 'complete' | 'fail';
+  p1: string;
+  p2?: string;
+  p3?: string;
+  score?: number;
+}
+
+export interface ErrorOptions extends TypedEventBase {
+  severity: 'debug' | 'info' | 'warning' | 'error' | 'critical';
+  /** Cut to 200 characters. */
+  message: string;
+  /** Cut to 2000 characters. */
+  stack?: string;
 }
 
 export interface TrackedEvent {
@@ -180,6 +232,8 @@ export declare class Ravensight {
 
   enabled: boolean;
   readonly autoEvents: boolean;
+  /** True when opt-in performance sampling was requested. */
+  readonly performance: boolean;
   trackingEnabled: boolean;
   initialized: boolean;
 
@@ -193,6 +247,14 @@ export declare class Ravensight {
    * is given and is not a non-empty string.
    */
   track(event: string, data?: Record<string, unknown>, options?: TrackOptions): boolean;
+  /** Typed event helpers over track(). Default event name `purchase`. Never throws on bad input; the server flags it. */
+  trackPurchase(options: PurchaseOptions, trackOptions?: TrackOptions): boolean;
+  /** Default event name `resource_source` or `resource_sink` by flow. */
+  trackResource(options: ResourceOptions, trackOptions?: TrackOptions): boolean;
+  /** Default event name `progression_start`, `progression_complete` or `progression_fail`. */
+  trackProgression(options: ProgressionOptions, trackOptions?: TrackOptions): boolean;
+  /** Default event name `error`. */
+  trackError(options: ErrorOptions, trackOptions?: TrackOptions): boolean;
   flush(options?: { force?: boolean }): Promise<FlushResult>;
   /** null, undefined and '' mean not given. Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
   submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null): Promise<{ ok: true }>;
