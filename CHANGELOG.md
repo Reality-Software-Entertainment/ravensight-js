@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 (held)
+
+- Add session-start config fetching, scoped persistent/offline caching, ETags, typed fallback getters and an optional readiness callback.
+- Add automatic experiment exposure properties to tracked events, scoped to their device and build.
+- Respect consent and discard late config responses after shutdown or opt-out.
+
 ## 0.5.0
 
 For games whose builds or source anyone can download: a public repository,

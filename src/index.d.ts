@@ -25,6 +25,8 @@ export interface RavensightStorage {
 }
 
 export interface RavensightOptions {
+  /** Called after a config fetch, including cached/default fallback. */
+  onConfigReady?: (result: ConfigResult) => void;
   /**
    * Publishable ingest key (gt_live_... or gt_pub_...). Missing, null or blank, the client is inert:
    * no storage writes, no requests, no timers, no listeners, and one console warning.
@@ -209,7 +211,16 @@ export declare function chooseUnloadTransport(env: {
   hasBeacon?: boolean;
 }): 'fetch-keepalive' | 'beacon' | 'none';
 
+export interface ConfigResult {
+  source: 'network' | 'cache' | 'default';
+  values: Record<string, unknown>;
+}
+
 export declare class Ravensight {
+  onConfigReady: ((result: ConfigResult) => void) | null;
+  fetchConfig(deviceId?: string): Promise<ConfigResult>;
+  /** Returns fallback on a missing key or mismatched type; no coercion. */
+  getConfig<T>(key: string, fallback: T, deviceId?: string): T;
   constructor(options?: RavensightOptions);
 
   readonly apiUrl: string;

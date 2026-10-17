@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-export const VERSION = '0.5.0';
+export const VERSION = '0.5.1';
 
 export const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -422,6 +422,10 @@ export class Ravensight {
      * deviceId -> { token, expiresAt, promise, joinToken }.
      */
     this._sessions = new Map();
+    this._configs = new Map();
+    this._configRequests = new Map();
+    this._configGeneration = 0;
+    this.onConfigReady = typeof opts.onConfigReady === 'function' ? opts.onConfigReady : null;
 
     this.queue = [];
     this.stats = {
@@ -648,6 +652,9 @@ export class Ravensight {
     let bytes = Infinity;
     try {
       payload = Object.assign({}, data && typeof data === 'object' ? data : {});
+      for (const assignment of this._cachedConfig(deviceId)?.experiments || []) {
+        payload['rs_exp_' + assignment.key] = assignment.variant;
+      }
       payload.rs_event_id = this._nextEventId(deviceId);
       bytes = utf8Length(JSON.stringify(payload));
     } catch (_err) {
@@ -1049,6 +1056,8 @@ export class Ravensight {
     if (next === this.enabled) return;
     this.enabled = next;
     if (!next) {
+      this._configGeneration += 1;
+      this._configs.clear();
       this.stats.dropped += this.queue.length;
       this.queue.length = 0;
       this._stopTimer();
@@ -1274,6 +1283,8 @@ export class Ravensight {
     this.queue.length = 0;
     this._disposed = true;
     this._sessions.clear();
+    this._configGeneration += 1;
+    this._configs.clear();
     return { sent, dropped };
   }
 
@@ -1422,6 +1433,7 @@ export class Ravensight {
       this._resetBackoff();
       this._evictSessions(deviceId);
       this._log('session ready');
+      await this.fetchConfig(deviceId);
       return token;
     }
 
@@ -1833,6 +1845,111 @@ export class Ravensight {
     this._timer = null;
   }
 
+  // Config documents are public game settings, never credentials. A cache
+  // is valid only for the exact endpoint, key, device, platform and build.
+  _configScope(deviceId) {
+    return JSON.stringify([this.apiUrl, this.ingestKey, deviceId, this.platform, this.gameVersion]);
+  }
+
+  _validConfig(input) {
+    try {
+      if (!input || typeof input !== 'object' || !input.values || Array.isArray(input.values) ||
+          typeof input.values !== 'object' || !Array.isArray(input.experiments) || input.experiments.length > 10 ||
+          Object.keys(input.values).length > 50 || typeof input.etag !== 'string' || !/^"[a-f0-9]{64}"$/.test(input.etag)) return null;
+      const inspect = (value, depth = 0) => {
+        if (depth > 20 || typeof value === 'number' && !Number.isFinite(value) ||
+            ['undefined', 'function', 'symbol', 'bigint'].includes(typeof value)) throw new Error('invalid config');
+        if (value && typeof value === 'object') for (const [key, child] of Object.entries(value)) {
+          if (['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error('reserved property');
+          inspect(child, depth + 1);
+        }
+      };
+      for (const [key, value] of Object.entries(input.values)) {
+        if (!/^[a-z][a-z0-9_]{0,63}$/.test(key)) return null;
+        inspect(value);
+        if (utf8Length(JSON.stringify(value)) > 8192) return null;
+      }
+      const seen = new Set();
+      for (const row of input.experiments) {
+        if (!row || !/^[a-z][a-z0-9_]{0,63}$/.test(row.key) ||
+            !/^[a-z][a-z0-9_-]{0,39}$/.test(row.variant) || seen.has(row.key)) return null;
+        seen.add(row.key);
+      }
+      return JSON.parse(JSON.stringify({ values: input.values, experiments: input.experiments, etag: input.etag }));
+    } catch { return null; }
+  }
+
+  _cachedConfig(deviceId) {
+    if (!this.isActive) return null;
+    const scope = this._configScope(deviceId);
+    if (this._configs.has(scope)) return this._configs.get(scope);
+    if (!this._playtestToken) try {
+      const stored = JSON.parse(this._storage.getItem('ravensight_config_v1'));
+      const doc = stored?.scope === scope ? this._validConfig(stored.document) : null;
+      if (doc) { this._rememberConfig(scope, doc); return doc; }
+    } catch { /* Storage is optional, including corrupt or unavailable storage. */ }
+    return null;
+  }
+
+  _rememberConfig(scope, document) {
+    this._configs.delete(scope);
+    this._configs.set(scope, document);
+    while (this._configs.size > this.maxSessions) this._configs.delete(this._configs.keys().next().value);
+  }
+
+  /** Fresh values cost one event; an unchanged ETag is free. Failures keep cached values. */
+  fetchConfig(deviceId = this.deviceId) {
+    if (!this.isActive || !isNonEmptyString(deviceId)) return Promise.resolve({ source: 'default', values: {} });
+    const scope = this._configScope(deviceId);
+    if (this._configRequests.has(scope)) return this._configRequests.get(scope);
+    const generation = this._configGeneration;
+    const pending = this._fetchConfig(deviceId, scope, generation).finally(() => this._configRequests.delete(scope));
+    this._configRequests.set(scope, pending);
+    return pending;
+  }
+
+  async _fetchConfig(deviceId, scope, generation) {
+    let document = this._cachedConfig(deviceId);
+    let source = document ? 'cache' : 'default';
+    const headers = { 'X-API-Key': this.ingestKey };
+    if (document) headers['If-None-Match'] = document.etag;
+    const query = new URLSearchParams({ deviceId, platform: this.platform, gameVersion: this.gameVersion });
+    // Do not let a slow config service delay starting the game indefinitely.
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timer;
+    const timeout = new Promise(resolve => { timer = setTimeout(() => {
+      controller?.abort(); resolve({ status: 0 });
+    }, 5000); });
+    const response = await Promise.race([
+      this._request('GET', '/ingest/config?' + query, { headers, signal: controller?.signal }), timeout,
+    ]).finally(() => clearTimeout(timer));
+    if (!this.isActive || generation !== this._configGeneration || scope !== this._configScope(deviceId)) {
+      return { source: 'default', values: {} };
+    }
+    if (response.status === 200) {
+      const fresh = this._validConfig(response.body);
+      if (fresh) {
+        document = fresh; source = 'network'; this._rememberConfig(scope, fresh);
+        if (!this._playtestToken) try {
+          // One persisted entry bounds storage and avoids a trail of old player IDs.
+          this._storage.setItem('ravensight_config_v1', JSON.stringify({ scope, document: fresh }));
+        } catch { /* In-memory cache still works. */ }
+      }
+    }
+    const result = { source, values: JSON.parse(JSON.stringify(document?.values || {})) };
+    if (deviceId === this.deviceId && this.onConfigReady) try { this.onConfigReady(result); } catch { /* Game callbacks cannot break tracking. */ }
+    return result;
+  }
+
+  /** No coercion. Objects are copied so a caller cannot mutate cached settings. */
+  getConfig(key, fallback, deviceId = this.deviceId) {
+    const values = this._cachedConfig(deviceId)?.values;
+    if (!values || !Object.prototype.hasOwnProperty.call(values, key)) return fallback;
+    const value = values[key];
+    if (value === null ? fallback !== null : typeof value !== typeof fallback || Array.isArray(value) !== Array.isArray(fallback)) return fallback;
+    return value && typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : value;
+  }
+
   // --- HTTP ---------------------------------------------------------------
 
   /**
@@ -1843,6 +1960,7 @@ export class Ravensight {
   async _request(method, path, options = {}) {
     const headers = Object.assign({ Accept: 'application/json' }, options.headers || {});
     const init = { method, headers };
+    if (options.signal) init.signal = options.signal;
 
     if (options.body !== undefined) {
       headers['Content-Type'] = 'application/json';

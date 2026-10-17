@@ -705,3 +705,38 @@ footer to produce `dist/index.cjs`.
 ## License
 
 MIT. Copyright 2026 Reality Software Entertainment.
+
+## Remote configuration and experiments
+
+Held release: deploy the platform config endpoint before using these methods.
+After opening a session, the SDK fetches config using your existing ingest key.
+Config is public game data. Never store secrets in it.
+
+```js
+const rs = new Ravensight({
+  ingestKey: 'YOUR_PUBLISHABLE_INGEST_KEY',
+  onConfigReady: ({ source }) => console.log('Config ready:', source),
+});
+await rs.init();
+const speed = rs.getConfig('movement_speed', 4.0);
+const hints = rs.getConfig('show_hints', true);
+await rs.fetchConfig(); // Explicit refresh, including the last ETag.
+```
+
+`getConfig(key, fallback, deviceId?)` never coerces types. Missing or mismatched
+values return your fallback; arrays and objects return copies. `fetchConfig(deviceId?)`
+resolves with `{ source: 'network' | 'cache' | 'default', values }` and shares
+concurrent requests for the same context. Requests time out after five seconds.
+Offline, rejected or malformed responses keep the last valid cache. Cache scope
+includes endpoint, ingest key, device, platform and build. One persisted document
+bounds browser storage; multi-player servers also have a bounded in-memory cache.
+No config requests happen before opt-in consent or while tracking is disabled.
+Playtest runs do not read or write the persistent cache.
+
+Active experiment assignments add `rs_exp_<key>` properties to events tracked
+after that config is available, including typed helpers. Already queued events
+keep their original properties. For multi-player servers, call
+`await rs.fetchConfig(playerId)` before tracking that player's experiment events.
+Changing devices or builds never borrows another context's assignments. An
+unchanged ETag response is free; a fresh config response uses one ordinary event
+from the shared event allowance. Keep safe defaults in the game.
