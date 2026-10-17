@@ -24,7 +24,7 @@ const FEEDBACK_CATEGORIES = Object.freeze(['bug', 'suggestion', 'complaint', 'pr
 const RS_KINDS = Object.freeze(['level_start', 'level_complete', 'death', 'none']);
 
 /** The reserved keys Ravensight reads. Any other `rs_` key is a typo or a clash. */
-const KNOWN_RS_KEYS = Object.freeze(['rs_kind', 'rs_doctor']);
+const KNOWN_RS_KEYS = Object.freeze(['rs_kind', 'rs_doctor', 'rs_event_id']);
 
 const DEFAULT_QUEUE_CAP = 500;
 const DEFAULT_RETRY_MS = 10000;
@@ -38,6 +38,19 @@ const PLAYTEST_STORAGE_KEY = 'ravensight.playtest';
 const PLAYTEST_GLOBAL = '__RAVENSIGHT_PLAYTEST__';
 /** Clock skew allowance so we refresh slightly before the server expires us. */
 const EXPIRY_SKEW_MS = 5000;
+
+/**
+ * The largest event the API accepts, measured as the server measures it: the
+ * UTF-8 bytes of the JSON of the event's data. Bigger events are dropped by
+ * track() and never sent.
+ */
+const MAX_EVENT_BYTES = 8192;
+/** Written only with consent 'opt_in', once the player has said yes. */
+const OPTIN_KEY = 'ravensight_optin';
+const CONSENT_MODES = Object.freeze(['opt_out', 'opt_in']);
+const MAX_DISTRIBUTION_LENGTH = 40;
+/** Retry waits vary by plus or minus this fraction, so clients that failed together do not retry together. */
+const BACKOFF_JITTER = 0.2;
 
 /**
  * Error thrown by the explicit request helpers (submitFeedback,
@@ -65,6 +78,10 @@ class MemoryStorage {
 
   setItem(key, value) {
     this._map.set(key, String(value));
+  }
+
+  removeItem(key) {
+    this._map.delete(key);
   }
 }
 
@@ -103,10 +120,16 @@ function chooseUnloadTransport(env) {
   return 'none';
 }
 
-function detectStorage(injected) {
+function detectStorage(injected, probe = true) {
   if (injected) return injected;
   try {
     if (typeof localStorage !== 'undefined' && localStorage) {
+      // Read only detection where a write is not allowed yet (opt-in before
+      // the player's yes). Every later write is wrapped in try/catch anyway.
+      if (!probe) {
+        localStorage.getItem(DEVICE_ID_KEY);
+        return localStorage;
+      }
       const probe = '__ravensight_probe__';
       localStorage.setItem(probe, '1');
       localStorage.removeItem(probe);
@@ -133,6 +156,63 @@ function randomId() {
     // Fall through to Math.random.
   }
   return 'x' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+
+/** `count` random bytes as hex, from a secure source where one exists. */
+function randomHex(count) {
+  try {
+    if (typeof crypto !== 'undefined' && crypto && typeof crypto.getRandomValues === 'function') {
+      const bytes = crypto.getRandomValues(new Uint8Array(count));
+      let out = '';
+      for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0');
+      return out;
+    }
+  } catch (_err) {
+    // Fall through to Math.random.
+  }
+  let out = '';
+  for (let i = 0; i < count; i++) out += Math.floor(Math.random() * 256).toString(16).padStart(2, '0');
+  return out;
+}
+
+/** UTF-8 byte length of a string, without TextEncoder where it is missing. */
+function utf8Length(text) {
+  if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).length;
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/** The first 16 characters of a device id, limited to the characters an rs_event_id may hold. */
+function eventIdPrefix(deviceId) {
+  const prefix = String(deviceId == null ? '' : deviceId)
+    .slice(0, 16)
+    .replace(/[^A-Za-z0-9_-]/g, '_');
+  return prefix || 'x';
+}
+
+/** Validates the `distribution` option: null when not set, else the label. */
+function readDistribution(value) {
+  if (value == null || value === '') return null;
+  if (
+    typeof value !== 'string' ||
+    value.length > MAX_DISTRIBUTION_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new TypeError(
+      'Ravensight: `distribution` must be a string of at most ' + MAX_DISTRIBUTION_LENGTH +
+        ' characters with no control characters',
+    );
+  }
+  return value;
 }
 
 function detectPlatform() {
@@ -226,11 +306,26 @@ class Ravensight {
   constructor(options = {}) {
     const opts = options || {};
 
-    if (typeof opts.ingestKey !== 'string' || opts.ingestKey.trim() === '') {
-      throw new TypeError('Ravensight: `ingestKey` is required (your gt_live_... publishable key)');
+    const rawKey = opts.ingestKey;
+    if (rawKey != null && typeof rawKey !== 'string') {
+      throw new TypeError('Ravensight: `ingestKey` must be a string (your publishable key)');
     }
+    this.ingestKey = rawKey == null ? '' : rawKey.trim();
+    /**
+     * False with no key: the client is inert. It writes no storage, makes no
+     * request, starts no timer and adds no listener, and every call is a no-op.
+     */
+    this._hasKey = this.ingestKey !== '';
+    this.optional = Boolean(opts.optional);
 
-    this.ingestKey = opts.ingestKey.trim();
+    if (opts.consent != null && !CONSENT_MODES.includes(opts.consent)) {
+      throw new TypeError("Ravensight: `consent` must be 'opt_out' or 'opt_in'");
+    }
+    /** 'opt_out' (default): on until the player opts out. 'opt_in': off until setEnabled(true). */
+    this.consent = opts.consent == null ? 'opt_out' : opts.consent;
+    /** A short label sent on POST /session, or null. */
+    this.distribution = readDistribution(opts.distribution);
+
     this.apiUrl = normalizeApiUrl(opts.apiUrl);
     this.gameVersion = opts.gameVersion == null ? '1.0.0' : String(opts.gameVersion);
     this.platform = opts.platform == null ? detectPlatform() : String(opts.platform);
@@ -241,25 +336,57 @@ class Ravensight {
     this.debug = Boolean(opts.debug);
 
     this._fetch = opts.fetch || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
-    if (!this._fetch) {
+    if (!this._fetch && this._hasKey) {
       throw new TypeError('Ravensight: no global fetch found. Use Node 18+ or pass `fetch`.');
     }
 
     this._clock = typeof opts.now === 'function' ? opts.now : () => Date.now();
-    this._storage = detectStorage(opts.storage);
+    this._random = typeof opts.random === 'function' ? opts.random : Math.random;
     this._env = opts.env || null;
+    this._startedAt = this._clock();
+    /** rs_event_id parts: a per-launch nonce (made on the first event) and a counter. */
+    this._eventNonce = null;
+    this._eventCounter = 0;
+    this._tooLargeWarned = false;
 
-    // Under a playtest the server decides the device id from the token, so
-    // nothing is read from or written to the player's own storage.
-    this._playtestToken = readPlaytestToken(this._storage);
+    if (this._hasKey) {
+      // Opt-in before the yes: detect storage without the probe write.
+      const optIn = this.consent === 'opt_in';
+      this._storage = detectStorage(opts.storage, !optIn);
+      // Under a playtest the server decides the device id from the token, so
+      // nothing is read from or written to the player's own storage.
+      this._playtestToken = readPlaytestToken(this._storage);
+      /**
+       * Whether the player has agreed. Always true with 'opt_out'. With
+       * 'opt_in', true once `ravensight_optin` is stored (or under a
+       * playtest, where the player is a persona and nothing is stored).
+       */
+      this._consented = !optIn || Boolean(this._playtestToken) || this._readOptIn(this._storage);
+    } else {
+      this._storage = opts.storage || new MemoryStorage();
+      this._playtestToken = null;
+      this._consented = false;
+      if (!this.optional && typeof console !== 'undefined') {
+        console.warn(
+          '[ravensight] no ingestKey, so analytics is off for this client (pass optional: true to silence this line)',
+        );
+      }
+    }
+    /** Set by setDeviceId before the opt-in yes: stored once the player agrees. */
+    this._deviceIdUnsaved = false;
+
     if (opts.deviceId) this.deviceId = String(opts.deviceId);
+    else if (!this._hasKey || !this._consented) this.deviceId = null;
     else this.deviceId = this._playtestToken ? 'dev_' + randomId() : this._loadOrCreateDeviceId();
 
     /** Local opt out. Combined with the server kill switch by `isActive`. */
-    this.enabled = opts.enabled === undefined ? true : Boolean(opts.enabled);
+    this.enabled = this._consented && (opts.enabled === undefined ? true : Boolean(opts.enabled));
     /** Server kill switch from GET /settings. Assumed on until told otherwise. */
     this.trackingEnabled = true;
     this.initialized = false;
+    /** init() was called while waiting for the opt-in yes: the yes runs it. */
+    this._initRequested = false;
+    this._initPromise = null;
 
     /**
      * One cached session per device id, least recently used first:
@@ -295,7 +422,7 @@ class Ravensight {
     this._pageHideBound = false;
     this._exitSent = false;
     this._startSent = false;
-    /** Set when POST /session refuses the key. Stops the timer until a session opens. */
+    /** Set when the settings check or POST /session refuses the key. Ends the run. */
     this._invalidKey = false;
     this._invalidKeyWarned = false;
     /** event + key pairs already warned about in debug mode. */
@@ -304,12 +431,18 @@ class Ravensight {
     this._playtestClosed = false;
 
     // Automatic lifecycle events, in a browser only: a Node client serves many
-    // players and has no single game to start or exit.
+    // players and has no single game to start or exit. Never while inert or
+    // before the opt-in yes.
     this.autoEvents = opts.autoEvents === undefined ? true : Boolean(opts.autoEvents);
-    if (this.autoEvents && isBrowser()) {
+    if (this.autoEvents && isBrowser() && this._hasKey && this._consented) {
       this._bindPageHide();
       if (this.enabled) this._startSent = this.track('game_started');
     }
+  }
+
+  /** True only while the client is running and collecting: a key, consent, not opted out, not switched off by the server, the key not refused, not disposed. */
+  isEnabled() {
+    return this.isActive;
   }
 
   /** True when events may actually be sent. */
@@ -319,7 +452,15 @@ class Ravensight {
 
   /** Like isActive, but still true while dispose() delivers the last events. */
   get _canSend() {
-    return this.enabled && this.trackingEnabled && !this._playtestClosed && !this._disposed;
+    return (
+      this._hasKey &&
+      this._consented &&
+      this.enabled &&
+      this.trackingEnabled &&
+      !this._invalidKey &&
+      !this._playtestClosed &&
+      !this._disposed
+    );
   }
 
   /** True when a Ravensight Playtest token was found at construction. */
@@ -348,13 +489,37 @@ class Ravensight {
    * Reads the server kill switch, opens a session, and starts the flush timer.
    * Never throws on network failure: the SDK degrades to queue and retry.
    *
-   * `reason` says why the session is not ready: `invalid_key`,
-   * `tracking_disabled`, `offline`, `rate_limited`, `session_failed`, or null.
+   * `reason` says why the session is not ready: `no_key` (inert),
+   * `no_consent` (opt-in, no yes yet), `disabled`, `invalid_key` (the run has
+   * ended), `tracking_disabled`, `offline`, `rate_limited`, `session_failed`,
+   * or null. Concurrent calls share one promise.
    *
    * @returns {Promise<{trackingEnabled: boolean, sessionReady: boolean, reason: string|null}>}
    */
-  async init() {
-    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+  init() {
+    if (this._disposed || this._disposing) {
+      return Promise.reject(new RavensightError('client disposed', 'disposed'));
+    }
+    // Concurrent calls (a game and a bridge, or the opt-in yes) share one run.
+    if (this._initPromise) return this._initPromise;
+    this._initPromise = this._init().finally(() => {
+      this._initPromise = null;
+    });
+    return this._initPromise;
+  }
+
+  async _init() {
+    // No key: inert. Nothing on the network, nothing stored.
+    if (!this._hasKey) {
+      return { trackingEnabled: false, sessionReady: false, reason: 'no_key' };
+    }
+
+    // Opt-in and no yes yet: the yes (setEnabled(true)) runs init itself.
+    if (!this._consented) {
+      this._initRequested = true;
+      this._log('waiting for the player to opt in, init() does nothing yet');
+      return { trackingEnabled: false, sessionReady: false, reason: 'no_consent' };
+    }
 
     // Opted out: no settings check, no session, nothing on the network.
     if (!this.enabled) {
@@ -362,9 +527,18 @@ class Ravensight {
       return { trackingEnabled: false, sessionReady: false, reason: 'disabled' };
     }
 
+    // The key was refused earlier in this run: the run has ended.
+    if (this._invalidKey) {
+      return { trackingEnabled: false, sessionReady: false, reason: 'invalid_key' };
+    }
+
     await this._checkSettings();
     this.initialized = true;
     if (this._playtestClosed) this.trackingEnabled = false;
+
+    if (this._invalidKey) {
+      return { trackingEnabled: false, sessionReady: false, reason: 'invalid_key' };
+    }
 
     if (!this.trackingEnabled) {
       this._log('tracking disabled by server kill switch');
@@ -380,6 +554,10 @@ class Ravensight {
     } catch (err) {
       reason = (err && err.reason) || 'session_failed';
       this._log('session not ready yet: ' + (err && err.message));
+    }
+
+    if (this._invalidKey) {
+      return { trackingEnabled: false, sessionReady: false, reason: 'invalid_key' };
     }
 
     if (!this.trackingEnabled) {
@@ -398,7 +576,10 @@ class Ravensight {
 
   /**
    * Queues an event. Safe to call before init(): events are held and sent once
-   * a session exists. Returns false when tracking is off.
+   * a session exists. Returns false when tracking is off, and when the event
+   * is dropped for data over MAX_EVENT_BYTES (one console warning per client,
+   * stats.dropped and stats.lastError `event_too_large`). The queued data is
+   * a copy of `data` carrying `rs_event_id`.
    *
    * `options.deviceId` sends this one event as another device, so one Node
    * client can serve many players. Each device gets its own session.
@@ -417,6 +598,32 @@ class Ravensight {
     if (!this.isActive) return false;
     if (this.debug && data && typeof data === 'object') this._checkReservedKeys(event, data);
 
+    // A copy, never the caller's own object, carrying the id the server
+    // dedupes on. It lives inside the data, so a resend carries the same id.
+    // A throwing getter or a cycle cannot be sent either: dropped the same way.
+    let payload = null;
+    let bytes = Infinity;
+    try {
+      payload = Object.assign({}, data && typeof data === 'object' ? data : {});
+      payload.rs_event_id = this._nextEventId(deviceId);
+      bytes = utf8Length(JSON.stringify(payload));
+    } catch (_err) {
+      payload = null;
+    }
+    if (!payload || !(bytes <= MAX_EVENT_BYTES)) {
+      const code = payload ? 'event_too_large' : 'event_not_serializable';
+      this.stats.dropped += 1;
+      this._recordError(code, 0);
+      if (!this._tooLargeWarned && typeof console !== 'undefined') {
+        this._tooLargeWarned = true;
+        console.warn(
+          '[ravensight] dropped event "' + event + '" (' + code + '): its data must serialize to at most ' +
+            MAX_EVENT_BYTES + ' bytes of JSON (further drops are not logged)',
+        );
+      }
+      return false;
+    }
+
     if (this.queue.length >= this.maxQueueSize) {
       this.queue.shift();
       this.stats.dropped += 1;
@@ -424,15 +631,30 @@ class Ravensight {
 
     this.queue.push({
       event,
-      data: data && typeof data === 'object' ? data : {},
+      data: payload,
       timestamp: Math.floor(this._clock() / 1000),
       deviceId,
     });
     this.stats.queued += 1;
 
-    // While the key is refused only an explicit flush() or init() retries.
-    if (this.queue.length >= MAX_BATCH_SIZE && !this._invalidKey) this.flush().catch(noop);
+    if (this.queue.length >= MAX_BATCH_SIZE) this.flush().catch(noop);
     return true;
+  }
+
+  /**
+   * The next rs_event_id: the first 16 characters of the device id, the
+   * client's start time in hex, an 8 hex character per-launch nonce and a
+   * counter. Matches ^[A-Za-z0-9_-]{1,64}$.
+   */
+  _nextEventId(deviceId) {
+    if (!this._eventNonce) this._eventNonce = randomHex(4);
+    this._eventCounter += 1;
+    return (
+      eventIdPrefix(deviceId) + '-' +
+      Math.max(0, Math.floor(this._startedAt / 1000)).toString(16) + '-' +
+      this._eventNonce + '-' +
+      this._eventCounter
+    );
   }
 
   /**
@@ -515,6 +737,7 @@ class Ravensight {
     if (hasRating && !(Number.isInteger(rating) && rating >= 1 && rating <= 5)) {
       throw new RavensightError('feedback rating must be an integer from 1 to 5', 'invalid_rating');
     }
+    if (!this._hasKey) throw new RavensightError('no ingest key', 'no_key');
     if (!this.isActive) {
       throw new RavensightError('tracking is disabled', 'tracking_disabled');
     }
@@ -553,6 +776,7 @@ class Ravensight {
    * @throws {RavensightError}
    */
   async fetchSuggestions() {
+    if (!this._hasKey) throw new RavensightError('no ingest key', 'no_key');
     const res = await this._request('GET', '/agent/suggestions', {
       headers: { 'X-API-Key': this.ingestKey },
     });
@@ -570,9 +794,27 @@ class Ravensight {
   /**
    * Local opt in/out. Disabling discards anything still queued so an opt out
    * does not leave player data sitting in memory.
+   *
+   * With consent 'opt_in', `true` is the player's yes: it is stored as
+   * `ravensight_optin`, the device id is made, and an init() called before
+   * the yes runs now. `false` removes the stored yes and keeps the device id
+   * (resetDeviceId() forgets it). With 'opt_out' nothing is stored. Inert
+   * (no key), only the flag changes and nothing is stored.
    */
   setEnabled(value) {
     const next = Boolean(value);
+    if (this._hasKey && this.consent === 'opt_in' && !this._playtestToken) {
+      if (next && !this._consented) {
+        this._consented = true;
+        this._writeOptIn(true);
+        if (this.deviceId == null) this.deviceId = this._loadOrCreateDeviceId();
+        else if (this._deviceIdUnsaved) this._persistDeviceId(this.deviceId);
+        this._deviceIdUnsaved = false;
+      } else if (!next && this._consented) {
+        this._consented = false;
+        this._writeOptIn(false);
+      }
+    }
     if (next === this.enabled) return;
     this.enabled = next;
     if (!next) {
@@ -581,6 +823,32 @@ class Ravensight {
       this._stopTimer();
     } else if (this.initialized && this.trackingEnabled) {
       this._startTimer();
+    } else if (this._initRequested && !this.initialized && !this._disposed && !this._disposing) {
+      this._initRequested = false;
+      this.init().catch(noop);
+    }
+  }
+
+  /** The same as setEnabled, under the name the LÖVE SDK uses. */
+  setTrackingEnabled(value) {
+    this.setEnabled(value);
+  }
+
+  _readOptIn(storage) {
+    try {
+      return Boolean(storage) && storage.getItem(OPTIN_KEY) === '1';
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  _writeOptIn(yes) {
+    try {
+      if (yes) this._storage.setItem(OPTIN_KEY, '1');
+      else if (typeof this._storage.removeItem === 'function') this._storage.removeItem(OPTIN_KEY);
+      else this._storage.setItem(OPTIN_KEY, '0');
+    } catch (_err) {
+      // Blocked storage: the choice holds for this client only.
     }
   }
 
@@ -655,6 +923,7 @@ class Ravensight {
       }
       deviceId = options.deviceId;
     }
+    if (!this._hasKey) return Promise.resolve({ joined: false, reason: 'no_key' });
     const entry = this._sessionEntry(deviceId);
     if (entry.joinedWith === token) {
       // Still opening: share the pending answer. Settled: nothing to do.
@@ -788,16 +1057,19 @@ class Ravensight {
    * Resolves with `{ token, expiresAt }` once `deviceId` (default: the current
    * id) has an open session, opening one if needed through the same path the
    * flush uses, so concurrent calls share one request. Rejects, never throws,
-   * with a RavensightError whose `code` is the init reason: `invalid_key`,
-   * `tracking_disabled`, `offline`, `rate_limited`, `session_failed`,
-   * `disabled` or `disposed` (also when dispose() runs mid-open), or
+   * with a RavensightError whose `code` is the init reason: `no_key`,
+   * `no_consent`, `invalid_key`, `tracking_disabled`, `offline`,
+   * `rate_limited`, `session_failed`, `disabled` or `disposed` (also when dispose() runs mid-open), or
    * `session_failed` when a joinSession() race replaced the session mid-open.
    *
    * @returns {Promise<{token: string, expiresAt: number}>}
    */
   async session(deviceId = this.deviceId) {
     if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+    if (!this._hasKey) throw new RavensightError('no ingest key', 'no_key');
+    if (!this._consented) throw new RavensightError('the player has not opted in', 'no_consent');
     if (!this.enabled) throw new RavensightError('client is disabled', 'disabled');
+    if (this._invalidKey) throw new RavensightError('the ingest key was refused', 'invalid_key');
     if (!this.trackingEnabled || this._playtestClosed) {
       throw new RavensightError('tracking is disabled', 'tracking_disabled');
     }
@@ -886,6 +1158,7 @@ class Ravensight {
     if (this._playtestToken) headers['X-Ravensight-Playtest'] = 'Bearer ' + this._playtestToken;
     const body = { deviceId, gameVersion: this.gameVersion, platform: this.platform };
     if (joinToken) body.joinToken = joinToken;
+    if (this.distribution) body.distribution = this.distribution;
 
     const res = await this._request('POST', '/session', { headers, body });
 
@@ -911,10 +1184,6 @@ class Ravensight {
       this.stats.sessions += 1;
       this._resetBackoff();
       this._evictSessions(deviceId);
-      if (this._invalidKey) {
-        this._invalidKey = false;
-        if (this.initialized && this.isActive) this._startTimer();
-      }
       this._log('session ready');
       return token;
     }
@@ -987,17 +1256,20 @@ class Ravensight {
   }
 
   /**
-   * The key was refused. Retrying on a timer cannot fix that, so the timer
-   * stops; track() still queues, and flush() or init() try again.
+   * The key was refused by the settings check or POST /session. Retrying
+   * cannot fix that, so the run ends: the queue is cleared, the timer stops,
+   * nothing is retried and track() returns false. A new client starts over.
    */
   _refuseKey() {
     this._invalidKey = true;
+    this.stats.dropped += this.queue.length;
+    this.queue.length = 0;
     this._stopTimer();
-    if (this.debug && !this._invalidKeyWarned && typeof console !== 'undefined') {
+    if (!this._invalidKeyWarned && typeof console !== 'undefined') {
       this._invalidKeyWarned = true;
       console.warn(
-        '[ravensight] the ingest key was refused (invalid_key). Automatic flushing is stopped ' +
-          'until a session opens; check your gt_live_ key. Events keep queueing.',
+        '[ravensight] the ingest key was refused (invalid_key), so analytics is off for the rest of ' +
+          'this run. Check your publishable key.',
       );
     }
   }
@@ -1138,8 +1410,13 @@ class Ravensight {
     this._nextAttemptAt = 0;
   }
 
+  /** The backoff wait with plus or minus 20 percent jitter, never past the 5 minute ceiling. */
   _scheduleBackoff() {
-    this._nextAttemptAt = this._clock() + this._backoffMs;
+    let r = Number(this._random());
+    if (!(r >= 0 && r < 1)) r = 0.5;
+    const factor = 1 - BACKOFF_JITTER + 2 * BACKOFF_JITTER * r;
+    const wait = Math.min(Math.round(this._backoffMs * factor), MAX_BACKOFF_MS);
+    this._nextAttemptAt = this._clock() + wait;
     this._backoffMs = Math.min(this._backoffMs * 2, MAX_BACKOFF_MS);
   }
 
@@ -1199,6 +1476,20 @@ class Ravensight {
       };
     }
     return { transport: 'none', url, body, headers: null };
+  }
+
+  /**
+   * Best effort flush of one batch now, for a page that is going away: the
+   * run of events sharing one device id, under that id's cached session, by
+   * fetch keepalive or sendBeacon. Events in a batch request still awaiting
+   * an answer are skipped, so nothing is sent twice. `offset` is accepted for
+   * callers that track the in-flight count themselves (the LÖVE bridge); the
+   * larger of it and the SDK's own count is used. Returns true when a
+   * request was handed to the browser.
+   */
+  flushOnHidden(offset) {
+    const given = Number.isInteger(offset) && offset > 0 ? offset : 0;
+    return this._flushOnHidden(Math.max(given, this._inflightSize));
   }
 
   /**
@@ -1347,6 +1638,18 @@ class Ravensight {
       this.trackingEnabled = res.body.trackingEnabled;
       return;
     }
+    const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
+    if (res.status === 403 && code === 'tracking_disabled') {
+      this._recordError('tracking_disabled', 403);
+      this._disableTracking();
+      return;
+    }
+    // A refused key ends the run, the same as on POST /session.
+    if (res.status === 401 || res.status === 403) {
+      this._recordError('invalid_key', res.status);
+      this._refuseKey();
+      return;
+    }
     // Unreachable or malformed: assume tracking is on, same as the Godot SDK.
     this.trackingEnabled = true;
     this._recordError(this._failureCode(res, 'settings_failed'), res.status);
@@ -1374,6 +1677,11 @@ class Ravensight {
 
   _persistDeviceId(id) {
     if (this._playtestToken) return;
+    // Inert, or opt-in before the yes: nothing is stored. The yes stores it.
+    if (!this._hasKey || !this._consented) {
+      this._deviceIdUnsaved = this._hasKey;
+      return;
+    }
     try {
       this._storage.setItem(DEVICE_ID_KEY, id);
     } catch (_err) {
@@ -1396,6 +1704,7 @@ module.exports.DEFAULT_API_URL = DEFAULT_API_URL;
 module.exports.MAX_BATCH_SIZE = MAX_BATCH_SIZE;
 module.exports.FEEDBACK_CATEGORIES = FEEDBACK_CATEGORIES;
 module.exports.RS_KINDS = RS_KINDS;
+module.exports.MAX_EVENT_BYTES = MAX_EVENT_BYTES;
 module.exports.RavensightError = RavensightError;
 module.exports.MemoryStorage = MemoryStorage;
 module.exports.Ravensight = Ravensight;

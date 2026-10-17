@@ -31,6 +31,8 @@ function makeClient(server, overrides = {}) {
         platform: 'test',
         autoFlushMs: 0,
         storage: new MemoryStorage(),
+        // A fixed random keeps backoff exact: 0.5 is a jitter factor of 1.
+        random: () => 0.5,
       },
       overrides,
     ),
@@ -64,9 +66,9 @@ test('parseRetryAfterMs reads delta seconds and ignores junk', () => {
   assert.equal(parseRetryAfterMs('Wed, 21 Oct 2026 07:28:00 GMT'), 0);
 });
 
-test('constructor rejects a missing ingest key', () => {
-  assert.throws(() => new Ravensight({}), TypeError);
-  assert.throws(() => new Ravensight({ ingestKey: '   ' }), TypeError);
+test('constructor rejects an ingest key that is not a string', () => {
+  assert.throws(() => new Ravensight({ ingestKey: 42 }), TypeError);
+  assert.throws(() => new Ravensight({ ingestKey: {} }), TypeError);
 });
 
 // --- Init and the server kill switch --------------------------------------
@@ -122,36 +124,86 @@ function captureConsole(t, method) {
   return calls;
 }
 
-test('an invalid key stops the timer, warns once, and a later success restarts it', async (t) => {
+test('an invalid key on POST /session ends the run: queue cleared, no retry, one warning', async (t) => {
   const refused = { status: 401, body: { error: 'invalid_api_key' } };
   const server = await startMockServer({ sessionOverrides: [refused, refused] });
   t.after(() => server.close());
   const warnings = captureConsole(t, 'warn');
-  captureConsole(t, 'log');
 
-  const rs = makeClient(server, { autoFlushMs: 60000, debug: true });
+  const rs = makeClient(server, { autoFlushMs: 60000 });
+  rs.track('before', { i: 0 });
   const result = await rs.init();
-  assert.deepEqual(result, { trackingEnabled: true, sessionReady: false, reason: 'invalid_key' });
+  assert.deepEqual(result, { trackingEnabled: false, sessionReady: false, reason: 'invalid_key' });
   assert.equal(rs._timer, null, 'the flush timer is stopped');
-  assert.equal(rs.retryInMs, 0, 'no backoff: an explicit flush retries at once');
+  assert.equal(rs.retryInMs, 0, 'no backoff is scheduled');
   assert.equal(rs.stats.lastError.code, 'invalid_key');
   assert.equal(rs.stats.lastError.status, 401);
   assert.equal(typeof rs.stats.lastError.at, 'number');
-  assert.equal(warnings.filter((w) => w.includes('invalid')).length, 1);
+  assert.equal(rs.queue.length, 0, 'the queue is cleared');
+  assert.equal(rs.stats.dropped, 1);
+  assert.equal(rs.isEnabled(), false);
+  assert.equal(warnings.filter((w) => w.includes('invalid_key')).length, 1, 'warns once, without debug');
 
-  for (let i = 0; i < 60; i++) rs.track('e', { i });
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(rs.queue.length, 60, 'track keeps queueing');
-  assert.equal(server.requestsTo('/api/v1/session').length, 1, 'the 50 event auto flush is suppressed');
+  for (let i = 0; i < 60; i++) assert.equal(rs.track('e', { i }), false, 'track is a no-op');
+  assert.equal(rs.queue.length, 0);
+  const flushed = await rs.flush();
+  assert.equal(flushed.skipped, 'inactive');
+  const again = await rs.init();
+  assert.equal(again.reason, 'invalid_key');
+  await assert.rejects(rs.session(), (e) => e.code === 'invalid_key');
+  assert.equal(server.requestsTo('/api/v1/session').length, 1, 'nothing retries the refused key');
+  assert.equal(server.requestsTo('/api/v1/settings').length, 1);
+  assert.equal(warnings.filter((w) => w.includes('invalid_key')).length, 1, 'the warning fires once');
+  const disposed = await rs.dispose();
+  assert.deepEqual(disposed, { sent: 0, dropped: 0 }, 'nothing is left to send at the end');
+});
 
-  const second = await rs.flush();
-  assert.equal(second.sent, 0);
-  assert.equal(server.requestsTo('/api/v1/session').length, 2, 'flush() retries');
-  assert.equal(warnings.filter((w) => w.includes('invalid')).length, 1, 'the warning fires once');
+test('a 401 or 403 on the settings check ends the run before any session', async (t) => {
+  for (const status of [401, 403]) {
+    const server = await startMockServer({ settingsStatus: status });
+    t.after(() => server.close());
+    captureConsole(t, 'warn');
+    const rs = makeClient(server, { autoFlushMs: 60000 });
+    rs.track('before');
+    const result = await rs.init();
+    assert.deepEqual(result, { trackingEnabled: false, sessionReady: false, reason: 'invalid_key' });
+    assert.equal(server.requestsTo('/api/v1/session').length, 0, 'no session is opened');
+    assert.equal(rs.queue.length, 0);
+    assert.equal(rs._timer, null);
+    assert.deepEqual(rs.stats.lastError.code, 'invalid_key');
+    assert.equal(rs.stats.lastError.status, status);
+    assert.equal(rs.track('after'), false);
+    await rs.dispose();
+  }
+});
 
-  const third = await rs.flush();
-  assert.equal(third.sent, 60, 'the key works again and everything goes out');
-  assert.notEqual(rs._timer, null, 'the timer is running again');
+test('a 403 tracking_disabled on the settings check is the kill switch, not a refused key', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('/settings')) {
+      return new Response(JSON.stringify({ error: 'tracking_disabled' }), { status: 403 });
+    }
+    return fetch(url, init);
+  };
+  const rs = makeClient(server, { fetch: fetchImpl });
+  const result = await rs.init();
+  assert.equal(result.reason, 'tracking_disabled');
+  assert.equal(rs._invalidKey, false);
+  await rs.dispose();
+});
+
+test('a batch 401 still refreshes the session and does not end the run', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  rs.track('a');
+  server.expireSession();
+  const res = await rs.flush();
+  assert.equal(res.sent, 1);
+  assert.equal(server.requestsTo('/api/v1/session').length, 2);
+  assert.equal(rs.isEnabled(), true);
   await rs.dispose();
 });
 
@@ -1517,10 +1569,12 @@ test('debug mode warns once per event and key about reserved rs_ keys, and never
     },
   });
   assert.doesNotThrow(() => rs.track('hostile', hostile));
+  assert.equal(rs.stats.lastError.code, 'event_not_serializable', 'data that cannot be copied is dropped');
+  assert.equal(warnings.length, 4, 'with its one drop warning');
 
   const quiet = makeClient(server);
   quiet.track('lvl', { rs_kind: 'nope', rs_other: 1 });
-  assert.equal(warnings.length, 3, 'nothing without debug');
+  assert.equal(warnings.length, 4, 'nothing without debug');
   await rs.dispose({ flush: false });
   await quiet.dispose({ flush: false });
 });

@@ -23,6 +23,7 @@ const NAMED_EXPORTS = [
   'MAX_BATCH_SIZE',
   'FEEDBACK_CATEGORIES',
   'RS_KINDS',
+  'MAX_EVENT_BYTES',
   'RavensightError',
   'MemoryStorage',
   'Ravensight',
