@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.5.0
+
+For games whose builds or source anyone can download: a public repository,
+a demo, a game jam entry, a web build. A game that passes a key and none of
+the new options behaves as on 0.4.2, except for the changes listed first.
+See "Public builds" in the README.
+
+### Changes for 0.4.2 games
+
+* A `401` or `403` answer to `GET /settings` or `POST /session` (other than
+  `403 tracking_disabled`, the kill switch, and `403 playtest_job_closed`)
+  now ends the run instead of stopping only the timer. The queue is
+  cleared and counted in `stats.dropped`, nothing is retried, `track()`
+  returns `false`, and `init()`, `flush()` and `session()` do not try the
+  key again; a new client does. `init()` resolves
+  `{ trackingEnabled: false, sessionReady: false, reason: 'invalid_key' }`
+  (it said `trackingEnabled: true` before). One console warning is printed,
+  with or without `debug`. A batch `401` still means "open a new session"
+  and is retried as before.
+* Retry waits carry plus or minus 20 percent jitter, so copies of a game
+  that lost the network together do not come back together. `Retry-After`
+  is still honored exactly, and the 5 minute ceiling holds. A new `random`
+  option (default `Math.random`) makes the wait exact in tests: `() => 0.5`
+  is the unjittered wait.
+* Every event's data gains an `rs_event_id` key, and the queued data is a
+  copy of yours: changing your object after `track()` no longer changes the
+  queued event. An `rs_event_id` of your own is replaced.
+* An event whose data is over 8,192 bytes as JSON (UTF-8, the size the
+  server checks; the event name and timestamp are not counted), or that
+  cannot be serialized at all, is dropped by `track()`, which returns
+  `false`. It counts in `stats.dropped`, sets `stats.lastError` to
+  `event_too_large` or `event_not_serializable`, and the first one per
+  client prints one console warning. Before, an oversize event was sent and
+  split out by the server's `400`, and unserializable data broke the flush.
+* `new Ravensight()` with no `ingestKey`, or a blank one, no longer throws.
+  It makes an inert client (below). A key that is not a string still throws
+  a `TypeError`.
+
+### Added
+
+* **Inert without a key.** No storage writes (not even the `localStorage`
+  probe), no request, no timer, no listener and no automatic events.
+  `isEnabled()` is `false`, `deviceId` is `null`, every call is a no-op:
+  `init()` resolves reason `no_key`, `session()`, `submitFeedback()` and
+  `fetchSuggestions()` reject with code `no_key`, `joinSession()` resolves
+  `{ joined: false, reason: 'no_key' }`. One console warning, which
+  `optional: true` silences.
+* **`rs.isEnabled()`**, `true` only while the client is collecting: a key,
+  consent, not opted out, not switched off by the server, the key not
+  refused, not disposed.
+* **`consent: 'opt_in'`** (default `'opt_out'`, the 0.4.2 behavior). Nothing
+  happens before the player's yes: no device id, no storage write, no
+  settings check, no session, no automatic events, no listeners; events
+  tracked before the yes are dropped. `setEnabled(true)` is the yes: it is
+  stored as `ravensight_optin` in the same storage the device id uses, the
+  device id is made, and an `init()` called before the yes runs then;
+  events tracked right after it are queued while the settings check runs.
+  `setEnabled(false)` removes the stored yes and keeps the device id
+  (`resetDeviceId()` forgets it). `init()` before the yes resolves reason
+  `no_consent`. Under a Ravensight Playtest no yes is needed and nothing is
+  stored. An unknown `consent` value throws a `TypeError`.
+* **`rs.setTrackingEnabled(value)`**, an alias of `setEnabled`, the name the
+  LÖVE SDK uses.
+* **`distribution`** option: a label of up to 40 characters with no control
+  characters, such as `'web-itch'`, sent on `POST /session` as
+  `distribution` when set. Anything else throws a `TypeError`.
+* **`rs_event_id`** on every event, inside its data: the first 16
+  characters of the device id the event is tracked under (characters
+  outside `A-Z a-z 0-9 _ -` become `_`), the client's start time in hex, an
+  8 hex character nonce made once per client from `crypto.getRandomValues`,
+  and a counter. It matches `^[A-Za-z0-9_-]{1,64}$`. A resend after a
+  failure, a session refresh, a `400` split or the page hide flush carries
+  the same id, and so do events sent under a joined session.
+* **`rs.flushOnHidden(offset?)`**, the public form of `_flushOnHidden`. It
+  sends one batch by keepalive or beacon for a page going away and never
+  resends the batch in flight: it uses the larger of `offset` and the SDK's
+  own in-flight count. `_flushOnHidden(offset)` is kept.
+* `MAX_EVENT_BYTES` (8192) is exported. `MemoryStorage` gains `removeItem`.
+* `init()` calls made while one is running share its promise.
+
+### Compatibility
+
+* TypeScript: `ingestKey` is optional, `deviceId` and
+  `SetDeviceIdResult.previousId` are `string | null`, and `InitReason`,
+  `JoinResult` and the `session()` codes gain `no_key` and `no_consent`.
+* The LÖVE bridge's `rs.flushOnHidden(inflight)` call is now served by the
+  public method; older SDKs fall back to `_flushOnHidden`.
+* There is still no saved queue in this SDK: events not sent before a page
+  closes are lost, as before, so `rs_event_id` protects resends within a
+  page's life.
+
 ## 0.4.2
 
 ### Changed

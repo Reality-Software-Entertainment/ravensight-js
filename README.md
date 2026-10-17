@@ -8,7 +8,8 @@ server side kill switch for you.
 
 * API base: `https://api.ravensight.io/api/v1`
 * Docs: https://ravensight.io/docs/
-* Privacy: a random per-install device id, no advertising identifier, a local opt-out (`rs.setEnabled(false)`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
+* Privacy: a random per-install device id, no advertising identifier, a local opt-out (`rs.setEnabled(false)`) or an opt-in mode (`consent: 'opt_in'`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
+* Public builds: with no key the client is inert, so a public repository or a fork sends nothing. See [Public builds](#public-builds).
 
 ## Install
 
@@ -208,7 +209,10 @@ and hand written canvas games.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `ingestKey` | required | Your publishable `gt_live_...` key. Safe to ship in a client build. |
+| `ingestKey` | none | Your publishable `gt_live_...` key, or a public `gt_pub_...` key. Safe to ship in a client build. Missing or blank, the client is inert (see [Public builds](#public-builds)). |
+| `optional` | `false` | `true` silences the one warning an inert client prints. |
+| `consent` | `'opt_out'` | `'opt_in'` makes no device id and sends nothing until `setEnabled(true)`. See [Public builds](#public-builds). |
+| `distribution` | none | A short label sent on the session, such as `'web-itch'`. At most 40 characters, no control characters. |
 | `apiUrl` | `https://api.ravensight.io/api/v1` | Base URL. `/api/v1` is appended if you leave it off. |
 | `gameVersion` | `'1.0.0'` | Reported with the session. |
 | `platform` | auto | `'web'` in a browser, `node-<platform>` in Node. |
@@ -220,6 +224,7 @@ and hand written canvas games.
 | `enabled` | `true` | Start opted out by passing `false`. |
 | `autoEvents` | `true` | Send `game_started` and `game_exited` for you, in a browser. See [Automatic events](#automatic-events). |
 | `fetch` | global | Inject a custom fetch. |
+| `random` | `Math.random` | Source for the backoff jitter. `() => 0.5` gives the exact, unjittered wait in tests. |
 | `debug` | `false` | Log SDK activity to the console, and warn about reserved `rs_` keys. |
 
 ### `await rs.init()`
@@ -234,18 +239,23 @@ retry succeeds.
 
 | Reason | Meaning |
 | --- | --- |
-| `invalid_key` | The key was refused (`401`, or a `403` other than the kill switch). The flush timer stops; see below. |
+| `no_key` | No `ingestKey`: the client is inert. |
+| `no_consent` | `consent: 'opt_in'` and no yes yet. `setEnabled(true)` runs this `init()` for you. |
+| `invalid_key` | The key was refused (`401`, or a `403` other than the kill switch) by the settings check or `POST /session`. The run has ended; see below. |
 | `tracking_disabled` | Tracking is switched off for this game. Nothing is sent. |
 | `disabled` | The client is opted out (`enabled: false` or `setEnabled(false)`). `init()` makes no network call. Call `setEnabled(true)` and then `init()` to start. |
 | `offline` | No answer from the network. Retried with backoff. |
 | `rate_limited` | `429`. Retried after `Retry-After`. |
 | `session_failed` | Any other answer. Retried with backoff. |
 
-With `invalid_key` the SDK stops its flush timer and the automatic flush at
-50 queued events, because retrying on a timer cannot fix a wrong key.
-`track()` keeps queueing up to `maxQueueSize`. `flush()` and `init()` still
-try again, and the first session that opens restarts the timer. With
-`debug: true` it warns once.
+With `invalid_key` the run ends, because a retry cannot fix a revoked,
+rotated or wrong key: the queue is cleared (counted in `stats.dropped`), the
+timer stops, `track()` returns `false`, and `init()`, `flush()` and
+`session()` do not try the key again. It warns once on the console. A new
+client, normally the next launch, tries the key again. A batch `401` is
+different: it means the session expired, and the SDK opens a new one.
+
+Concurrent `init()` calls share one promise.
 
 If the server has tracking switched off for your game, the queue is cleared,
 `track()` becomes a no op and nothing further is sent.
@@ -267,6 +277,13 @@ delayed flush still reports when the thing actually happened.
 session. It must be a non-empty string or `track()` throws a `TypeError`.
 Leave it out to use the client's own id. See
 [Node servers with many players](#node-servers-with-many-players).
+
+The queued data is a copy of yours carrying an `rs_event_id` (see
+[Public builds](#public-builds)), so changing your object afterwards does not
+change the event. Data over `MAX_EVENT_BYTES` (8,192 bytes as JSON), or data
+that cannot be serialized, is dropped: `track()` returns `false`, the drop
+counts in `stats.dropped` and `stats.lastError` (`event_too_large` or
+`event_not_serializable`), and the first one prints one console warning.
 
 Property keys starting with `rs_` are reserved for Ravensight. `rs_kind` says
 what an event means for the level funnel and must be one of `RS_KINDS`:
@@ -303,11 +320,31 @@ EXPERIMENTAL. Returns the AI generated design suggestions for your game as an
 array. Empty until your game has enough data for a weekly digest. The shape of
 each suggestion may change, so do not build game logic on it.
 
-### `rs.setEnabled(bool)`
+### `rs.setEnabled(bool)` and `rs.setTrackingEnabled(bool)`
 
 Local opt in and opt out, for a privacy toggle in your settings menu. Disabling
 clears anything still queued, so an opt out does not leave player data sitting
-in memory.
+in memory. `setTrackingEnabled` is the same method under the LÖVE SDK's name.
+
+With `consent: 'opt_in'`, `true` is the player's yes and is stored as
+`ravensight_optin`; `false` removes it. With the default `'opt_out'` nothing
+is stored. See [Public builds](#public-builds).
+
+### `rs.isEnabled()`
+
+`true` only while the client is collecting: it has a key and consent, and
+nobody switched it off (`enabled: false`, the player, the server's kill
+switch, a refused key or `dispose()`). Use it to skip work that only feeds
+analytics.
+
+### `rs.flushOnHidden(offset?)`
+
+Sends one batch now by `fetch` keepalive or `sendBeacon`, for a page that is
+going away, and returns `true` when a request was handed to the browser. The
+SDK already does this on `visibilitychange` and `pagehide`; call it from your
+own exit path (the LÖVE bridge does). It never resends the batch still in
+flight: it uses the larger of `offset` and the SDK's own in-flight count.
+Always `false` in Node.
 
 ### `await rs.setDeviceId(id)` and `await rs.resetDeviceId()`
 
@@ -392,6 +429,84 @@ same two names the LÖVE SDK sends, so a dashboard covering both platforms
 counts sessions the same way. Playtest sessions run in a browser, so they send
 them too.
 
+## Public builds
+
+For a game anyone can download, fork or play in a browser: a demo, a game
+jam entry, an open source project, a web build. Nothing here changes a game
+that passes a key and none of these options.
+
+* **The key.** Use a public `gt_pub_...` key or your `gt_live_...` key.
+  Inject it at build time, from an environment variable or your CI's
+  secrets, into release builds only, and never commit it to the repository.
+* **No key, no analytics.** With no `ingestKey`, or a blank one, the client
+  is inert: no storage writes (not even the `localStorage` probe), no
+  request, no timer, no listener and no automatic events. `isEnabled()` is
+  `false`, `deviceId` is `null` and every call is a quiet no-op: `init()`
+  resolves `{ trackingEnabled: false, sessionReady: false, reason: 'no_key' }`,
+  `track()` returns `false`, and `session()`, `submitFeedback()` and
+  `fetchSuggestions()` reject with code `no_key`. It prints one console
+  warning; `optional: true` silences it. So a clone or a development build
+  sends nothing.
+
+  ```js
+  // RAVENSIGHT_KEY is defined by your build step for release builds only.
+  const rs = new Ravensight({
+    ingestKey: typeof RAVENSIGHT_KEY === 'string' ? RAVENSIGHT_KEY : undefined,
+    optional: true,
+    distribution: 'web-itch',
+  });
+  await rs.init();
+  ```
+
+* **`consent: 'opt_in'`** sends nothing until the player says yes: no device
+  id is made, nothing is stored, and not even the settings check is sent
+  before `setEnabled(true)` (or its alias `setTrackingEnabled(true)`). The
+  yes is stored as `ravensight_optin` in the same storage the device id uses
+  (`localStorage`, or the `storage` you pass), so the next launch starts
+  with it. An `init()` called before the yes resolves reason `no_consent`
+  and runs by itself at the yes. Events tracked before the yes are dropped,
+  not held for later; events tracked right after it are queued while the
+  settings check runs. Saying no again (`setEnabled(false)`) removes the
+  stored yes and keeps the device id; to forget it too, call
+  `resetDeviceId()`. The default, `'opt_out'`, keeps the 0.4 behavior.
+  Under a Ravensight Playtest no yes is needed and nothing is stored.
+
+  ```js
+  const rs = new Ravensight({ ingestKey: KEY, consent: 'opt_in' });
+  await rs.init(); // sends nothing until the yes
+
+  function onAnalyticsChoice(yes) {
+    rs.setEnabled(yes); // the yes is stored and starts everything
+  }
+  ```
+
+* **`distribution`** is a short label of your own, such as
+  `'native-release'`, `'web-pages'` or `'web-itch'`, sent on `POST /session`
+  so you can tell builds apart. At most 40 characters with no control
+  characters; it is not sent when unset.
+* **`rs_event_id`** is added to every event's data: the first 16 characters
+  of the device id, the client's start time in hex, an 8 hex character value
+  made once per client from a secure random source, and a counter, matching
+  `^[A-Za-z0-9_-]{1,64}$`. A resend after a failure carries the same id, so
+  the server can recognise it as the same event. Events sent under a joined
+  session carry one too. There is no saved queue in this SDK, so this
+  covers resends within one page's life.
+* **A refused key ends the run.** A `401` or `403` answer to the settings
+  check or to `POST /session` (other than the kill switch and a closed
+  playtest job) means the key was revoked, rotated or is wrong, so the SDK
+  stops for the rest of the run: queue cleared, nothing retried, one
+  warning. The next launch tries the key again.
+* **Jitter.** Retry waits vary by plus or minus 20 percent, never past 5
+  minutes. A server's `Retry-After` is obeyed exactly.
+* **Events whose data is over 8,192 bytes** as JSON are dropped by `track()`
+  with one warning and never sent.
+
+What a request carries, exactly: the settings check is a `GET` with no body;
+the session sends `deviceId`, `gameVersion`, `platform` and, when set,
+`joinToken` and `distribution`; a batch sends `events`, each with `event`,
+`data` and `timestamp` (a beacon adds `sessionToken`); feedback sends
+`message` and, when given, `category` and `rating`.
+
 ## Device id and privacy
 
 The SDK generates a random device id on first run (`crypto.randomUUID`
@@ -403,9 +518,10 @@ events you choose to send leave the browser.
 `rs.setEnabled(false)` stops all sending and discards anything still
 queued, so an opt out does not leave player data sitting in memory.
 
-The opt-out is not stored by the SDK: keep the player's choice in your own
-settings and call `rs.setEnabled(false)` before the first event on every
-launch. To forget this install's analytics identity, call
+With the default consent the opt-out is not stored by the SDK: keep the
+player's choice in your own settings and call `rs.setEnabled(false)` before
+the first event on every launch. With `consent: 'opt_in'` the SDK stores the
+yes itself (see [Public builds](#public-builds)). To forget this install's analytics identity, call
 `await rs.resetDeviceId()`, or remove `ravensight_device_id` from
 `localStorage`. Later events go out under a fresh id and nothing links the old
 one back.
@@ -424,8 +540,9 @@ show in your settings or first launch screen:
 > who you are) to Ravensight so we can improve it. You can turn this off in
 > Settings at any time.
 
-The SDK does not remember the player's choice, so store it in your own settings
-and apply it on every launch:
+With the default consent the SDK does not remember the player's choice, so
+store it in your own settings and apply it on every launch (or use
+`consent: 'opt_in'`, where the SDK stores the yes):
 
 ```js
 const settings = JSON.parse(localStorage.getItem('my_game_settings') || '{}');
@@ -453,9 +570,19 @@ function onAnalyticsToggled(checked) {
 | `apiUrl` | with or without `/api/v1` | with or without `/api/v1` |
 | `maxQueueSize` default | 500 | 500 |
 | `enabled` option | yes | yes |
-| Opt-out | `setEnabled` | `setTrackingEnabled` |
+| Opt-out | `setEnabled` (alias `setTrackingEnabled`) | `setTrackingEnabled` |
+| Running and collecting | `isEnabled()` | `enabled()` |
+| No key | inert, reason `no_key` (0.5.0) | inert, reason `no_key` (0.3.0) |
+| `optional` | yes | yes |
+| `consent: 'opt_in'` | yes, yes stored as `ravensight_optin` in the storage the device id uses | yes, `ravensight_optin` in the save folder |
+| `distribution` | yes | yes (desktop; on the web the page's SDK sends it) |
+| Refused key | ends the run | ends the run |
+| Retry jitter | plus or minus 20 percent | plus or minus 20 percent |
+| `rs_event_id` | yes | yes |
+| 8,192 byte event cap | dropped at `track()`, `stats.lastError` | dropped, `flush_failed` |
+| Saved queue | no, in memory | yes, sent on the next launch |
 | Batching | timer (`autoFlushMs`, 15 s) | 2 s |
-| Web | native | bridge |
+| Web | native | bridge (`rs.flushOnHidden(inflight)` on exit) |
 
 ## How delivery works
 
@@ -469,11 +596,14 @@ function onAnalyticsToggled(checked) {
   events that share one device id, under that id's session.
 * **Session expiry.** A `401` clears that device's session only, opens a new
   one and re sends the same batch.
-* **Invalid key.** A refused key stops the flush timer instead of retrying
-  forever. Events keep queueing; `flush()` or `init()` try again.
-* **Rate limits.** A `429` honors `Retry-After` in seconds. With no such header
-  the SDK backs off exponentially from 10 seconds up to a 5 minute ceiling. The
-  queue is held, never discarded.
+* **Invalid key.** A key refused by the settings check or `POST /session`
+  ends the run: the queue is cleared and nothing is retried.
+* **Rate limits.** A `429` honors `Retry-After` in seconds, exactly. With no such
+  header, and after any other failure, the SDK backs off exponentially from 10
+  seconds up to a 5 minute ceiling, each wait varied by plus or minus 20
+  percent. The queue is held, never discarded.
+* **Oversize events.** An event whose data is over 8,192 bytes as JSON is
+  dropped by `track()` and never sent.
 * **Oversize batches.** A `400` halves the batch and retries, down to a single
   event. An event that is still rejected on its own is dropped so it cannot
   block everything behind it.
@@ -481,7 +611,8 @@ function onAnalyticsToggled(checked) {
   is still in flight, so a batch aborted by a real unload can be lost rather
   than duplicated. A batch whose response is lost, from a network error or a
   `5xx` after the server already stored it, stays queued and can be sent again
-  on the next flush; ingest does not remove duplicates.
+  on the next flush. It carries the same `rs_event_id` as the first attempt,
+  so the server can recognise it as the same event.
 
 ## Flush on page hide
 
