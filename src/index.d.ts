@@ -1,6 +1,11 @@
 export declare const VERSION: string;
 export declare const DEFAULT_API_URL: string;
 export declare const MAX_BATCH_SIZE: number;
+/** The largest event data the API accepts, in UTF-8 bytes of JSON (8192). Bigger events are dropped by track(). */
+export declare const MAX_EVENT_BYTES: number;
+
+/** 'opt_out' (default): on until the player opts out. 'opt_in': nothing until setEnabled(true). */
+export type ConsentMode = 'opt_out' | 'opt_in';
 
 export type FeedbackCategory = 'bug' | 'suggestion' | 'complaint' | 'praise' | 'playtest' | 'other';
 /** The six feedback categories the API accepts, frozen. */
@@ -13,11 +18,22 @@ export declare const RS_KINDS: readonly RsKind[];
 export interface RavensightStorage {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  /** Optional. Used to remove the opt-in yes; without it the no is stored as '0'. */
+  removeItem?(key: string): void;
 }
 
 export interface RavensightOptions {
-  /** Publishable ingest key, format gt_live_... */
-  ingestKey: string;
+  /**
+   * Publishable ingest key (gt_live_... or gt_pub_...). Missing, null or blank, the client is inert:
+   * no storage writes, no requests, no timers, no listeners, and one console warning.
+   */
+  ingestKey?: string | null;
+  /** true silences the one warning an inert (keyless) client prints. Default false. */
+  optional?: boolean;
+  /** Default 'opt_out'. 'opt_in' makes no device id and sends nothing until setEnabled(true), stored as ravensight_optin. */
+  consent?: ConsentMode;
+  /** A short label sent on POST /session, such as 'web-itch'. At most 40 characters, no control characters. */
+  distribution?: string | null;
   /** Base URL. "/api/v1" is appended when omitted. */
   apiUrl?: string;
   gameVersion?: string;
@@ -38,6 +54,8 @@ export interface RavensightOptions {
   autoEvents?: boolean;
   fetch?: typeof fetch;
   now?: () => number;
+  /** 0 <= x < 1, for backoff jitter. Default Math.random. A fixed 0.5 gives the unjittered wait. */
+  random?: () => number;
   /** Log SDK activity, and warn once per event and key about an unknown rs_kind or rs_ key. */
   debug?: boolean;
 }
@@ -57,13 +75,21 @@ export interface TrackOptions {
 }
 
 export interface SetDeviceIdResult {
-  previousId: string;
+  previousId: string | null;
   /** Events still queued under the previous id. They drain under its own session. */
   queuedUnderPreviousId: number;
 }
 
-/** Why init() could not open a session. */
-export type InitReason = 'invalid_key' | 'tracking_disabled' | 'disabled' | 'offline' | 'rate_limited' | 'session_failed';
+/** Why init() could not open a session. invalid_key ends the run. */
+export type InitReason =
+  | 'no_key'
+  | 'no_consent'
+  | 'invalid_key'
+  | 'tracking_disabled'
+  | 'disabled'
+  | 'offline'
+  | 'rate_limited'
+  | 'session_failed';
 
 export interface InitResult {
   trackingEnabled: boolean;
@@ -73,7 +99,7 @@ export interface InitResult {
 }
 
 export interface RavensightLastError {
-  /** An InitReason for POST /session, invalid_join_token, offline, rate_limited, or the server's error code. */
+  /** An InitReason, invalid_join_token, event_too_large, event_not_serializable, offline, rate_limited, or the server's error code. */
   code: string;
   /** HTTP status, 0 for a network failure. */
   status: number;
@@ -121,6 +147,7 @@ export declare class RavensightError extends Error {
 export declare class MemoryStorage implements RavensightStorage {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem(key: string): void;
 }
 
 export declare function normalizeApiUrl(url?: string): string;
@@ -131,10 +158,14 @@ export declare function chooseUnloadTransport(env: {
 }): 'fetch-keepalive' | 'beacon' | 'none';
 
 export declare class Ravensight {
-  constructor(options: RavensightOptions);
+  constructor(options?: RavensightOptions);
 
   readonly apiUrl: string;
-  readonly deviceId: string;
+  /** null while inert, and with consent 'opt_in' before the first yes. */
+  readonly deviceId: string | null;
+  readonly consent: ConsentMode;
+  readonly distribution: string | null;
+  readonly optional: boolean;
   readonly queue: TrackedEvent[];
   readonly stats: RavensightStats;
   readonly isActive: boolean;
@@ -152,22 +183,37 @@ export declare class Ravensight {
   trackingEnabled: boolean;
   initialized: boolean;
 
+  /** Concurrent calls share one promise. */
   init(): Promise<InitResult>;
-  /** Throws TypeError when options.deviceId is given and is not a non-empty string. */
+  /** True only while the client is running and collecting: a key, consent, not opted out, not switched off, the key not refused, not disposed. */
+  isEnabled(): boolean;
+  /**
+   * Queues an event; its data is a copy carrying rs_event_id. Returns false when tracking is off or the
+   * data is over MAX_EVENT_BYTES as JSON (dropped, warned once). Throws TypeError when options.deviceId
+   * is given and is not a non-empty string.
+   */
   track(event: string, data?: Record<string, unknown>, options?: TrackOptions): boolean;
   flush(options?: { force?: boolean }): Promise<FlushResult>;
   /** null, undefined and '' mean not given. Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
   submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null): Promise<{ ok: true }>;
   fetchSuggestions(): Promise<unknown[]>;
+  /** With consent 'opt_in', true is the player's yes (stored as ravensight_optin) and false removes it. */
   setEnabled(value: boolean): void;
+  /** Alias of setEnabled, the LÖVE SDK's name. */
+  setTrackingEnabled(value: boolean): void;
+  /**
+   * Best effort keepalive or beacon flush of one batch for a page going away. Never resends the batch in
+   * flight: uses the larger of `offset` and the SDK's own in-flight count. False in Node.
+   */
+  flushOnHidden(offset?: number): boolean;
   /** For deviceId, default the current id. */
   isSessionValid(deviceId?: string): boolean;
   /** The cached session token for deviceId (default: the current id) while valid, else null. Synchronous. */
   sessionTokenFor(deviceId?: string): string | null;
   /**
    * Resolves once deviceId (default: the current id) has an open session, opening one if needed.
-   * Concurrent calls share one request. Rejects with a RavensightError whose code is invalid_key,
-   * tracking_disabled, offline, rate_limited, session_failed, disabled or disposed.
+   * Concurrent calls share one request. Rejects with a RavensightError whose code is no_key, no_consent,
+   * invalid_key, tracking_disabled, offline, rate_limited, session_failed, disabled or disposed.
    */
   session(deviceId?: string): Promise<{ token: string; expiresAt: number }>;
   /** Switches at once and stores the id; nothing is flushed. Queued events keep their id and its session. Rejects with code disposed after dispose(). */
@@ -194,6 +240,8 @@ export type JoinResult =
       joined: false;
       reason:
         | 'already_joined'
+        | 'no_key'
+        | 'no_consent'
         | 'replaced'
         | 'invalid_join_token'
         | 'invalid_key'
