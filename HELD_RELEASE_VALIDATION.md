@@ -21,3 +21,5 @@ Config identifier compatibility audit: 9 focused Node config tests passed; the C
 Config property keys reject constructor/prototype, including nested JSON properties.
 Experiment keys and variant labels may use those words as string values, matching
 the server contract. Regression coverage distinguishes those cases. Publishing remains held.
+
+Player Reports follow-up: full Node suite rerun during local release preparation passes 153 tests. Includes immutable prepared images, stable retries, session changes, upload credentials and bounded screenshot capture. The earlier connected SDK/API/worker and real-browser capture checks are separate recorded evidence; live storage and device integration remain unverified. Version 0.5.1 remains held.

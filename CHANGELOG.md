@@ -284,3 +284,9 @@ First release on npm: `npm install ravensight`.
 ## 0.1.0
 
 Initial release, installable from git.
+
+## Unreleased (held)
+
+- Add opt-in game-canvas screenshot capture and prepared Player Reports with
+  bounded image upload, explicit processing status, cancellation, and stable
+  retry identity. Submitted screenshots appear in the Player reports inbox.

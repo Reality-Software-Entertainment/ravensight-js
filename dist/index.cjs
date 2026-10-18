@@ -955,6 +955,136 @@ class Ravensight {
     return this.flush({ force: true });
   }
 
+  /** Prepare once, then reuse this object for retries. Never captures the screen automatically. */
+  async createReport(input = {}) {
+    const bad = message => { throw new RavensightError(message, 'invalid_report'); };
+    const payload = { clientId: input.clientId || randomId(), capturedAt: input.capturedAt ?? Math.floor(Date.now() / 1000),
+      category: input.category || 'other', source: input.source || 'player', context: { ...(input.context || {}) } };
+    if (!/^[a-zA-Z0-9_-]{8,80}$/.test(payload.clientId)) bad('Use a stable report clientId of 8–80 letters, digits, underscores or hyphens.');
+    if (!FEEDBACK_CATEGORIES.includes(payload.category)) bad('Unknown report category.');
+    if (!['player', 'tester'].includes(payload.source)) bad('Report source must be player or tester.');
+    if (!Number.isSafeInteger(payload.capturedAt) || payload.capturedAt < Date.now() / 1000 - 86400 || payload.capturedAt > Date.now() / 1000 + 60) bad('Capture time must be within the last day.');
+    for (const [key, max] of Object.entries({ message: 500, level: 100, expected: 500, steps: 1000, frequency: 80 })) {
+      const value = input[key] ?? '';
+      if (typeof value !== 'string' || value.length > max || (key === 'message' && !value.trim())) bad(`Invalid report ${key} (maximum ${max} characters).`);
+      payload[key] = value.trim();
+    }
+    if (input.context != null && (typeof input.context !== 'object' || Array.isArray(input.context))) bad('Context must be a scalar object.');
+    for (const [key, value] of Object.entries(payload.context)) {
+      if (!/^[a-zA-Z][a-zA-Z0-9_]{0,39}$/.test(key) || !['string', 'boolean', 'number'].includes(typeof value) || (typeof value === 'number' && !Number.isFinite(value)) || String(value).length > 500) bad('Context must contain short scalar fields.');
+    }
+    if (new TextEncoder().encode(JSON.stringify(payload.context)).length > 8000) bad('Context exceeds 8 KB.');
+    let image = null;
+    if (input.screenshot != null) {
+      const source = input.screenshot;
+      const size = source instanceof Blob ? source.size : source.byteLength;
+      if (!(source instanceof Blob || source instanceof Uint8Array || source instanceof ArrayBuffer) || !size || size > 1000000) bad('Screenshot must be a Blob, Uint8Array or ArrayBuffer of at most 1 MB.');
+      const bytes = new Uint8Array(source instanceof Blob ? await source.arrayBuffer() : source instanceof ArrayBuffer ? source.slice(0) : source.slice());
+      const png = bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71;
+      const jpeg = bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+      const webp = String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP';
+      if (!png && !jpeg && !webp) bad('Screenshot must be PNG, JPEG or WebP.');
+      const subtle = globalThis.crypto?.subtle || (typeof process !== 'undefined' && process.versions?.node ? (await import('node:crypto')).webcrypto.subtle : null);
+      if (!subtle) throw new RavensightError('Screenshot hashing needs Web Crypto (HTTPS or localhost in a browser).', 'crypto_unavailable');
+      payload.sha256 = Array.from(new Uint8Array(await subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join('');
+      payload.image = true; payload.bytes = bytes.length;
+      image = new Blob([bytes], { type: 'application/octet-stream' });
+    }
+    Object.freeze(payload.context);
+    const report = Object.freeze({ clientId: payload.clientId, capturedAt: payload.capturedAt, hasScreenshot: !!image });
+    this._reports ||= new WeakMap();
+    this._reports.set(report, { payload: Object.freeze(payload), image, token: null, id: null, uploaded: false, pending: null });
+    return report;
+  }
+
+  /** Captures only the supplied game canvas; call after the player's consent and preview before sending. */
+  async captureScreenshot(canvas) {
+    if (!canvas || !canvas.width || !canvas.height || typeof document === 'undefined') throw new RavensightError('Provide a nonempty game canvas in a browser.', 'invalid_canvas');
+    const scale = Math.min(1, 1600 / canvas.width, 1600 / canvas.height);
+    const output = document.createElement('canvas');
+    output.width = Math.max(1, Math.round(canvas.width * scale));
+    output.height = Math.max(1, Math.round(canvas.height * scale));
+    const ctx = output.getContext('2d');
+    if (!ctx) throw new RavensightError('Canvas capture is unavailable.', 'capture_failed');
+    try {
+      ctx.drawImage(canvas, 0, 0, output.width, output.height);
+      for (const quality of [0.85, 0.7, 0.5]) {
+        const blob = await new Promise(resolve => output.toBlob(resolve, 'image/jpeg', quality));
+        if (blob?.size && blob.size <= 1000000) return blob;
+      }
+    } catch (_) { throw new RavensightError('The game canvas could not be captured. Cross-origin images may prevent capture.', 'capture_failed'); }
+    throw new RavensightError('Screenshot exceeds 1 MB after encoding.', 'image_too_large');
+  }
+
+  _reportState(report) {
+    const state = this._reports?.get(report);
+    if (!state) throw new RavensightError('Prepare this report with createReport on the same SDK instance.', 'invalid_report');
+    if (state.token && state.token !== this.sessionToken) throw new RavensightError('The original report session is no longer active.', 'report_session_changed');
+    if (state.deviceId && state.deviceId !== this.deviceId) throw new RavensightError('The report belongs to a different player session.', 'report_session_changed');
+    if (!this._hasKey) throw new RavensightError('No ingest key.', 'no_key');
+    if (!this.isActive) throw new RavensightError('Tracking is disabled.', 'tracking_disabled');
+    return state;
+  }
+
+  async _reportRequest(state, method, path, body) {
+    this._reportState(state.report);
+    const response = await this._request(method, path, { headers: { 'X-Session-Token': state.token }, body, signal: AbortSignal.timeout(30000) });
+    if (response.status < 200 || response.status >= 300) throw new RavensightError(response.body?.message || 'Player report request failed.', this._errorCode(response, 'report_failed'), response.status);
+    return response.body;
+  }
+
+  /** Returns complete or processing; processing is accepted, not yet visible in the inbox. No automatic retries or new session. */
+  async submitReport(report) {
+    const state = this._reportState(report);
+    if (state.pending) return state.pending;
+    state.report = report;
+    state.pending = this._submitPreparedReport(state).finally(() => { state.pending = null; });
+    return state.pending;
+  }
+
+  async _submitPreparedReport(state) {
+    state.deviceId ||= this.deviceId;
+    state.token ||= await this._ensureSession();
+    const current = state.id
+      ? await this._reportRequest(state, 'GET', `/reports/${encodeURIComponent(state.id)}`)
+      : await this._reportRequest(state, 'POST', '/reports', state.payload);
+    if (!current?.id || !['pending', 'processing', 'complete', 'canceled'].includes(current.status)) throw new RavensightError('Invalid report response.', 'invalid_response');
+    state.id = current.id;
+    if (!state.image || current.status !== 'pending') return current;
+    if (!state.uploaded) {
+      const grant = await this._reportRequest(state, 'POST', `/reports/${encodeURIComponent(state.id)}/upload`, {});
+      let url;
+      try { url = new URL(grant.url); } catch (_) { throw new RavensightError('Invalid upload URL.', 'invalid_upload'); }
+      if (url.protocol !== 'https:' || url.username || url.password || !grant.fields || typeof grant.fields !== 'object') throw new RavensightError('Invalid upload authorization.', 'invalid_upload');
+      const form = new FormData();
+      for (const [key, value] of Object.entries(grant.fields)) form.append(key, value);
+      form.append('file', state.image, 'screenshot');
+      this._reportState(state.report);
+      let response;
+      try { response = await this._fetch(url.href, { method: 'POST', body: form, credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(30000) }); }
+      catch (_) { throw new RavensightError('Screenshot upload failed. Retry the same prepared report.', 'upload_failed'); }
+      if (response.status < 200 || response.status >= 300) throw new RavensightError('Screenshot upload failed. Retry the same prepared report.', 'upload_failed', response.status);
+      state.uploaded = true;
+    }
+    return this._reportRequest(state, 'POST', `/reports/${encodeURIComponent(state.id)}/finalize`, {});
+  }
+
+  /** Poll explicitly while processing; keep using the same prepared report. */
+  async getReportStatus(report) {
+    const state = this._reportState(report);
+    if (!state.id) throw new RavensightError('Submit the report first.', 'report_not_submitted');
+    state.report = report;
+    return this._reportRequest(state, 'GET', `/reports/${encodeURIComponent(state.id)}`);
+  }
+
+  async cancelReport(report) {
+    const state = this._reportState(report);
+    if (state.pending) throw new RavensightError('Wait for the current submission request.', 'report_busy');
+    if (!state.id) return { canceled: false };
+    state.report = report;
+    return this._reportRequest(state, 'DELETE', `/reports/${encodeURIComponent(state.id)}`);
+  }
+
   /**
    * Submits player feedback. Requires an active session.
    * @throws {RavensightError}

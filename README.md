@@ -740,3 +740,57 @@ keep their original properties. For multi-player servers, call
 Changing devices or builds never borrows another context's assignments. An
 unchanged ETag response is free; a fresh config response uses one ordinary event
 from the shared event allowance. Keep safe defaults in the game.
+
+### Player Reports with screenshots
+
+The held release adds `createReport`, `submitReport`, `getReportStatus` and
+`cancelReport`. Reports appear under **Player reports** in the dashboard for the
+same game/environment. Open the report or its thumbnail to read the message and
+see the screenshot. They are separate from AI Playtest screenshot artifacts.
+
+```js
+// Run only after the player chooses to attach a screenshot. Preview it and
+// let the player hide private content in your game's UI before submission.
+const screenshot = await rs.captureScreenshot(gameCanvas);
+const report = await rs.createReport({
+  message: 'The cave door stays locked after collecting all three keys.',
+  category: 'bug',
+  level: 'cave',
+  context: { keys: 3 },
+  screenshot, // omit for a text-only report
+});
+const receipt = await rs.submitReport(report);
+// 'processing' means accepted for image validation, not yet in the inbox.
+// Query later from your UI; do not poll in a tight loop.
+const status = await rs.getReportStatus(report);
+if (status.status === 'complete') console.log(status.reportId);
+```
+
+`captureScreenshot` captures only the supplied game canvas and returns a JPEG
+Blob, scaled within 1600×1600 and at most 1 MB. It never requests desktop capture
+or captures automatically. Tainted canvases cannot be captured. In Node, or when
+your engine captures its own image, pass a Blob, Uint8Array or ArrayBuffer to
+`createReport`. Input must be a still PNG, JPEG or WebP under 1,000,000 bytes;
+the server also validates a maximum of 4,000,000 pixels and strips metadata.
+Browser screenshot hashing requires a secure context (HTTPS or localhost).
+
+Prepare the report **once** and keep that object on the same SDK instance for a
+retry. Its content, client ID, capture time and screenshot bytes are fixed.
+Concurrent sends share one request. Retries retain the original session token;
+an expired session fails instead of silently creating a second paid report.
+Do not reconstruct the report with a new ID after a timeout. After changing the
+player identity the SDK refuses that prepared report. A `processing` result is
+not a failure; use `getReportStatus`. To abandon an incomplete upload explicitly,
+call `cancelReport`. Unfinished uploads expire after 15 minutes. The server allows
+two upload authorizations per submission. There is no persistent offline report
+queue or automatic retry/text fallback.
+
+Text counts as one usage event; attaching an image adds 20,000 events, reserved
+before upload. Failed/canceled image processing releases the reservation. These
+are the existing Player Reports rates, not Playtest-run pricing. Capture and
+preview alone make no network request and reserve no usage.
+
+The server must enable Player Reports and billing v2, configure private report
+storage and run the image-processing worker. Public ingest keys must explicitly
+allow `allow_reports`. Studio credentials never belong in the game. See the
+platform's held-release checklist before enabling this in production.

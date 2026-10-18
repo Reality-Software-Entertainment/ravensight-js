@@ -11,6 +11,19 @@ export type FeedbackCategory = 'bug' | 'suggestion' | 'complaint' | 'praise' | '
 /** The six feedback categories the API accepts, frozen. */
 export declare const FEEDBACK_CATEGORIES: readonly FeedbackCategory[];
 
+/** A report prepared once on its SDK instance; reuse it for retries. */
+export interface PreparedReport { readonly clientId: string; readonly capturedAt: number; readonly hasScreenshot: boolean }
+export interface PlayerReportInput {
+  message: string; category?: FeedbackCategory; clientId?: string; capturedAt?: number;
+  source?: 'player' | 'tester'; level?: string; expected?: string; steps?: string; frequency?: string;
+  context?: Record<string, string | number | boolean>;
+  screenshot?: Blob | Uint8Array | ArrayBuffer;
+}
+export interface PlayerReportResult {
+  id: string; status: 'pending' | 'processing' | 'complete' | 'canceled';
+  reportId?: string | null; usageEvents?: number; expiresAt?: string;
+}
+
 export type RsKind =
   | 'level_start' | 'level_complete' | 'death' | 'none'
   | 'purchase' | 'resource' | 'progression' | 'error' | 'health';
@@ -268,6 +281,11 @@ export declare class Ravensight {
   trackError(options: ErrorOptions, trackOptions?: TrackOptions): boolean;
   flush(options?: { force?: boolean }): Promise<FlushResult>;
   /** null, undefined and '' mean not given. Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
+  createReport(input: PlayerReportInput): Promise<PreparedReport>;
+  captureScreenshot(canvas: HTMLCanvasElement): Promise<Blob>;
+  submitReport(report: PreparedReport): Promise<PlayerReportResult>;
+  getReportStatus(report: PreparedReport): Promise<PlayerReportResult>;
+  cancelReport(report: PreparedReport): Promise<{ canceled: boolean }>;
   submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null): Promise<{ ok: true }>;
   fetchSuggestions(): Promise<unknown[]>;
   /** With consent 'opt_in', true is the player's yes (stored as ravensight_optin) and false removes it. */
