@@ -1865,7 +1865,7 @@ class Ravensight {
         }
       };
       for (const [key, value] of Object.entries(input.values)) {
-        if (!/^[a-z][a-z0-9_]{0,63}$/.test(key)) return null;
+        if (!/^[a-z][a-z0-9_]{0,63}$/.test(key) || ["constructor", "prototype"].includes(key)) return null;
         inspect(value);
         if (utf8Length(JSON.stringify(value)) > 8192) return null;
       }

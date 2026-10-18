@@ -16,3 +16,8 @@ owner approval. Older README test counts describe their earlier branch runs;
 this file records the combined candidate.
 
 Remote config wave: 140 JavaScript tests passed, including eight config lifecycle/cache/multi-player/consent cases. ESM and regenerated CommonJS are both covered by the suite. Version 0.5.1 is a held local candidate, not published.
+
+Config identifier compatibility audit: 9 focused Node config tests passed; the CommonJS distribution was rebuilt.
+Config property keys reject constructor/prototype, including nested JSON properties.
+Experiment keys and variant labels may use those words as string values, matching
+the server contract. Regression coverage distinguishes those cases. Publishing remains held.

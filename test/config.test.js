@@ -105,3 +105,13 @@ test('corrupt cache and reserved nested object properties are ignored', async ()
   assert.equal(rs.getConfig('settings', null), null); assert.equal({}.polluted, undefined);
   await rs.dispose({ flush: false });
 });
+
+test('reserved words are valid experiment labels but never config property keys', async () => {
+  const { rs } = make();
+  for (const key of ['constructor', 'prototype']) {
+    assert.equal(rs._validConfig(doc({ [key]: 1 })), null);
+    assert.equal(rs._validConfig(doc({ nested: { [key]: 1 } })), null);
+    assert.ok(rs._validConfig(doc({}, [{ key, variant: key }])));
+  }
+  await rs.dispose({ flush: false });
+});
