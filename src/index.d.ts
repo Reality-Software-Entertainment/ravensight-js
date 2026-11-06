@@ -88,11 +88,6 @@ export interface RavensightOptions {
   persistQueue?: boolean;
   /** Node only: the directory for the queue file. Default `~/.ravensight`. */
   queueDir?: string;
-  /**
-   * Capture uncaught errors automatically: window `error` and `unhandledrejection` in a browser,
-   * `uncaughtExceptionMonitor` in Node (exit behaviour unchanged). Default true.
-   */
-  captureErrors?: boolean;
   /** Device fields to send on POST /session in place of what the SDK finds. Each at most 128 printable characters. */
   device?: DeviceFields;
 }
@@ -291,8 +286,7 @@ export declare function microsFromDecimalString(text: string | number): string |
 /** A mediation callback's double in major units as micros. */
 export declare function microsFromRevenue(value: number): string | null;
 export declare function adFormatFrom(name: string): AdFormat;
-/** An engine stack as contract frames: no message line, 30 frames, paths stripped. */
-export declare function stackFrames(stack: string, options?: { root?: string }): string;
+
 export declare function parseRetryAfterMs(value: string | null | undefined): number;
 export declare function chooseUnloadTransport(env: {
   hasFetchKeepalive?: boolean;
@@ -360,8 +354,6 @@ export declare class Ravensight {
   trackAdRevenue(network: string, format: AdFormat, placement: string | null | undefined, revenueMicros: string | number, currency: string, trackOptions?: TrackOptions): boolean;
   /** Where this install came from. Sent once per device id, across restarts. */
   setAttribution(options: AttributionOptions): boolean;
-  /** Turns automatic error capture on or off. Off keeps what is already queued. */
-  setCaptureErrors(on: boolean): void;
   /** An explicit flush cuts a backoff wait short, never a server Retry-After. */
   flush(): Promise<FlushResult>;
   /** null, undefined and '' mean not given. Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */

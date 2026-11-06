@@ -41,7 +41,6 @@ const NAMED_EXPORTS = [
   'microsFromDecimalString',
   'microsFromRevenue',
   'adFormatFrom',
-  'stackFrames',
 ];
 
 for (const name of NAMED_EXPORTS) {

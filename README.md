@@ -477,37 +477,6 @@ same two names the LÖVE SDK sends, so a dashboard covering both platforms
 counts sessions the same way. Playtest sessions run in a browser, so they send
 them too.
 
-## Automatic error capture
-
-On by default; `captureErrors: false` (or `rs.setCaptureErrors(false)` at run
-time) turns it off. Turning it off stops capture; events already queued stay
-queued. Nothing is captured while the client is inert, before an opt-in yes,
-or after an opt-out.
-
-| Where | Event | `rs_severity` |
-|---|---|---|
-| Browser: window `error` | `game_crashed` | `critical` |
-| Browser: `unhandledrejection` | `game_error` | `error` |
-| Node: an uncaught exception, or an unhandled rejection in Node's default mode | `game_crashed` | `critical` |
-
-Each is a typed error event (`rs_kind: 'error'`) with `rs_message` (the error
-type and message) and `rs_stack` (frames only, innermost first). It is written
-to the persisted queue the moment it is captured, so a crash that ends the
-process is sent on the next launch, stamped with the session, build and
-platform of the run that crashed. At most 10 per distinct message and 50 per
-session are captured, so an error raised every frame cannot spend your event
-meter.
-
-In Node the SDK observes `uncaughtExceptionMonitor`, which does not change what
-happens next: the process still prints the error and exits as it would without
-the SDK. One listener serves every client and goes away with the last one.
-
-Limits, stated plainly: a browser cannot report a crash of the tab or the GPU
-process, only script errors; a cross-origin script without CORS reports only
-`Script error.` with no stack. Node native crashes (a segfault in an addon) end
-the process before any JavaScript runs, so they are not captured. There is no
-symbolication: a minified bundle's frames arrive as minified names.
-
 ## Ads and attribution
 
 ```js
@@ -637,11 +606,6 @@ events you send, the SDK sends:
   none is a hardware identifier. Pass `device: { model, osVersion, gpu }` to
   send your own values instead. The server derives the country itself; the SDK
   never sends one.
-* **Crash data**, when automatic capture is on (the default): for each
-  uncaught error, its type and message (cut to 200 characters) and up to 30
-  stack frames (cut to 2,000 characters), with URL hosts, the working
-  directory and home directory names stripped from paths. No variables,
-  memory, environment or command line. See [Automatic error capture](#automatic-error-capture).
 * **Attribution**, once per install: the `utm_source`, `utm_campaign`,
   `utm_term` and `utm_content` values of the landing URL when any is present,
   and nothing else from the URL.

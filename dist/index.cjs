@@ -281,100 +281,6 @@ const textIn = (value, min, max) => typeof value === 'string' && value.length >=
 const EXPERIMENT_KEY = /^[a-z][a-z0-9_]{0,63}$/;
 const VARIANT_NAME = /^[a-z][a-z0-9_-]{0,39}$/;
 
-// --- Crash capture (docs/sdk/CRASH_CONTRACT.md) -----------------------------
-
-const MAX_CAPTURED_PER_SESSION = 50;
-const MAX_CAPTURED_PER_MESSAGE = 10;
-const MAX_STACK_FRAMES = 30;
-
-/** Every client capturing errors in this Node process. One process listener serves them all. */
-const nodeCaptureClients = new Set();
-let nodeCaptureInstalled = false;
-
-function onNodeUncaught(error, origin) {
-  for (const client of nodeCaptureClients) {
-    try {
-      client._captureError('game_crashed', 'critical', error, origin === 'unhandledRejection');
-    } catch (_err) {
-      // Capture must never add a second failure to a dying process.
-    }
-  }
-}
-
-/**
- * Observes Node's uncaught exceptions without changing what happens next:
- * `uncaughtExceptionMonitor` runs before the default handler, so the process
- * still prints the error and exits with code 1 as it would without the SDK.
- * An unhandled rejection reaches it too (Node's default `throw` mode).
- */
-function installNodeCapture(client) {
-  nodeCaptureClients.add(client);
-  if (nodeCaptureInstalled) return;
-  try {
-    if (typeof process !== 'undefined' && process && typeof process.on === 'function') {
-      process.on('uncaughtExceptionMonitor', onNodeUncaught);
-      nodeCaptureInstalled = true;
-    }
-  } catch (_err) {
-    // No process events: nothing to observe.
-  }
-}
-
-function removeNodeCapture(client) {
-  nodeCaptureClients.delete(client);
-  if (!nodeCaptureInstalled || nodeCaptureClients.size > 0) return;
-  try {
-    process.removeListener('uncaughtExceptionMonitor', onNodeUncaught);
-  } catch (_err) {
-    // ignore
-  }
-  nodeCaptureInstalled = false;
-}
-
-/** `Type: message` for anything thrown or rejected, never empty. */
-function errorMessage(error) {
-  try {
-    if (error && typeof error === 'object') {
-      const name = typeof error.name === 'string' && error.name ? error.name : 'Error';
-      const message = typeof error.message === 'string' ? error.message : '';
-      return message ? name + ': ' + message : name;
-    }
-    const text = String(error);
-    return text ? 'Error: ' + text : 'Error';
-  } catch (_err) {
-    return 'Error';
-  }
-}
-
-/** Home directory prefixes of every common OS, so a user name never reaches a stack. */
-const HOME_PATH = /(?:\/Users\/|\/home\/|[A-Za-z]:\\Users\\|[A-Za-z]:\/Users\/)[^/\\\s:)]+[/\\]/g;
-
-/**
- * An engine stack as the contract's frames: no message line, innermost first,
- * at most 30 frames, scheme and host stripped from URLs, the working
- * directory removed and any home directory replaced by `~/`.
- */
-function stackFrames(stack, options = {}) {
-  if (typeof stack !== 'string' || !stack) return '';
-  const roots = [];
-  if (options.root) roots.push(String(options.root));
-  const frames = [];
-  for (const rawLine of stack.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    // V8 frames start "at "; Firefox and Safari frames are "fn@url:line:col".
-    if (!/^at\s/.test(line) && !/@.*:\d+(?::\d+)?$/.test(line) && !/^(?:https?|file):\/\//.test(line)) continue;
-    let frame = line.replace(/file:\/\/\/?/g, '/').replace(/\b(?:https?|blob):\/\/[^/\s)]+\//g, '');
-    for (const root of roots) {
-      if (root) frame = frame.split(root.replace(/[/\\]+$/, '') + '/').join('').split(root.replace(/[/\\]+$/, '') + '\\').join('');
-    }
-    frame = frame.replace(HOME_PATH, '~/');
-    frames.push(frame);
-    if (frames.length >= MAX_STACK_FRAMES) break;
-  }
-  return cutText(frames.join('\n'), MAX_STACK_CHARS);
-}
-
 // --- Device fields -----------------------------------------------------------
 
 const MAX_DEVICE_FIELD = 128;
@@ -815,8 +721,6 @@ class Ravensight {
     this.persistQueue = opts.persistQueue === undefined ? true : Boolean(opts.persistQueue);
     this._queueDir = opts.queueDir == null ? null : String(opts.queueDir);
     this._injectedStorage = Boolean(opts.storage);
-    /** Automatic error and crash capture, on by default. `captureErrors: false` turns it off. */
-    this.captureErrors = opts.captureErrors === undefined ? true : Boolean(opts.captureErrors);
     /** Device fields the game supplies itself: { model, osVersion, gpu }. Merged over what the SDK finds. */
     this._deviceOverride = opts.device && typeof opts.device === 'object' ? opts.device : null;
     this._device = null;
@@ -908,11 +812,6 @@ class Ravensight {
     this._exposures = new Map();
     /** deviceId -> how many sessions have replaced the first one this launch. */
     this._sessionGenerations = new Map();
-    this._captureCounts = { key: null, total: 0, byMessage: new Map() };
-    this._capturing = false;
-    this._errorListenersBound = false;
-    this._onWindowError = null;
-    this._onRejection = null;
     this.stats = {
       queued: 0,
       sent: 0,
@@ -979,7 +878,6 @@ class Ravensight {
     this._bootMs = null;
     if (this.performance && isBrowser()) this._startPerformance();
 
-    this._bindErrorCapture();
     if (this._deviceIdCreated) this._captureUtm();
   }
 
@@ -1378,94 +1276,6 @@ class Ravensight {
   _refuseTyped(kind, why) {
     this._log(kind + ' event not sent: ' + why);
     return false;
-  }
-
-  // --- Crash capture --------------------------------------------------------
-
-  /** Hooks the page's `error` and `unhandledrejection`, or Node's uncaught exceptions. Never while inert, before consent or under `captureErrors: false`. */
-  _bindErrorCapture() {
-    if (!this.captureErrors || !this._hasKey || !this._consented || this._errorListenersBound || this._disposed || this._disposing) return;
-    if (isBrowser()) {
-      if (typeof window.addEventListener !== 'function') return;
-      this._onWindowError = (event) => {
-        const error = event && event.error != null
-          ? event.error
-          : { name: 'Error', message: event && event.message ? String(event.message) : 'Script error' };
-        this._captureError('game_crashed', 'critical', error);
-      };
-      this._onRejection = (event) => this._captureError('game_error', 'error', event ? event.reason : undefined);
-      window.addEventListener('error', this._onWindowError);
-      window.addEventListener('unhandledrejection', this._onRejection);
-    } else {
-      installNodeCapture(this);
-    }
-    this._errorListenersBound = true;
-  }
-
-  _unbindErrorCapture() {
-    if (!this._errorListenersBound) return;
-    if (this._onWindowError) {
-      try {
-        window.removeEventListener('error', this._onWindowError);
-        window.removeEventListener('unhandledrejection', this._onRejection);
-      } catch (_err) {
-        // ignore
-      }
-    }
-    removeNodeCapture(this);
-    this._onWindowError = null;
-    this._onRejection = null;
-    this._errorListenersBound = false;
-  }
-
-  /**
-   * Turns automatic capture on or off at run time. Off stops capture only;
-   * events already queued stay queued.
-   */
-  setCaptureErrors(on) {
-    this.captureErrors = Boolean(on);
-    if (this.captureErrors) this._bindErrorCapture();
-    else this._unbindErrorCapture();
-  }
-
-  /**
-   * Queues one captured error as a typed error event and writes the queue
-   * to storage at once, because the process or page may be about to end.
-   * At most 10 per distinct message and 50 per session.
-   */
-  _captureError(name, severity, error) {
-    if (this._capturing || !this.captureErrors || !this.isActive) return false;
-    this._capturing = true;
-    try {
-      const message = cutText(errorMessage(error), MAX_MESSAGE_CHARS);
-      const sessionKey = this.deviceId + '\u0000' + this._generation(this.deviceId);
-      const counts = this._captureCounts;
-      if (counts.key !== sessionKey) {
-        counts.key = sessionKey;
-        counts.total = 0;
-        counts.byMessage = new Map();
-      }
-      const seen = counts.byMessage.get(message) || 0;
-      if (counts.total >= MAX_CAPTURED_PER_SESSION || seen >= MAX_CAPTURED_PER_MESSAGE) return false;
-      counts.total += 1;
-      counts.byMessage.set(message, seen + 1);
-      let root = null;
-      try {
-        if (!isBrowser() && typeof process !== 'undefined' && process && typeof process.cwd === 'function') root = process.cwd();
-      } catch (_err) {
-        root = null;
-      }
-      const stack = error && typeof error === 'object' && typeof error.stack === 'string' ? stackFrames(error.stack, { root }) : '';
-      const data = { rs_kind: 'error', rs_severity: severity, rs_message: message };
-      if (stack) data.rs_stack = stack;
-      const queued = this.track(name, data);
-      if (queued) this._persistNow();
-      return queued;
-    } catch (_err) {
-      return false;
-    } finally {
-      this._capturing = false;
-    }
   }
 
   // --- Experiment exposure --------------------------------------------------
@@ -2085,7 +1895,6 @@ class Ravensight {
         else if (this._deviceIdUnsaved) this._persistDeviceId(this.deviceId);
         this._deviceIdUnsaved = false;
         this._openQueue();
-        this._bindErrorCapture();
       } else if (!next && this._consented) {
         this._consented = false;
         this._writeOptIn(false);
@@ -2288,7 +2097,6 @@ class Ravensight {
     this._disposing = true;
     this._stopTimer();
     this._unbindLifecycle();
-    this._unbindErrorCapture();
 
     this._disposePromise = this._finishDispose(flush, timeoutMs);
     return this._disposePromise;
@@ -3315,4 +3123,3 @@ module.exports.eventDataBytes = eventDataBytes;
 module.exports.microsFromDecimalString = microsFromDecimalString;
 module.exports.microsFromRevenue = microsFromRevenue;
 module.exports.adFormatFrom = adFormatFrom;
-module.exports.stackFrames = stackFrames;

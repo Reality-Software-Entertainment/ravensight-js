@@ -33,7 +33,6 @@ function makeClient(server, overrides = {}) {
     autoFlushMs: 0,
     storage: new MemoryStorage(),
     random: () => 0.5,
-    captureErrors: false,
   }, overrides));
 }
 
@@ -87,7 +86,7 @@ test('every 8 KB event size vector, measured as the server measures it', () => {
 
 test('the 8 KB vectors through track(): a 2,000 character stack of control characters is queued, not dropped', () => {
   for (const vector of VECTORS.anyKeyEventSize.cases) {
-    const rs = new Ravensight({ ingestKey: INGEST_KEY, storage: new MemoryStorage(), autoFlushMs: 0, deviceId: 'd', fetch: async () => { throw new Error('offline'); }, captureErrors: false });
+    const rs = new Ravensight({ ingestKey: INGEST_KEY, storage: new MemoryStorage(), autoFlushMs: 0, deviceId: 'd', fetch: async () => { throw new Error('offline'); } });
     const savedWarn = console.warn;
     console.warn = () => {};
     let queued;
@@ -101,7 +100,7 @@ test('the 8 KB vectors through track(): a 2,000 character stack of control chara
 });
 
 test('typed text vectors: the SDK cuts message to 200 and stack to 2,000, so an over-cap case conforms', () => {
-  const rs = new Ravensight({ ingestKey: INGEST_KEY, storage: new MemoryStorage(), autoFlushMs: 0, deviceId: 'd', fetch: async () => { throw new Error('offline'); }, captureErrors: false });
+  const rs = new Ravensight({ ingestKey: INGEST_KEY, storage: new MemoryStorage(), autoFlushMs: 0, deviceId: 'd', fetch: async () => { throw new Error('offline'); } });
   for (const vector of VECTORS.publicKeyTypedText.cases) {
     const data = expand(vector.data);
     if (data.rs_kind !== 'error') continue;

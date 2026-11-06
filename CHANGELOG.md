@@ -2,8 +2,9 @@
 
 ## 0.6.0 (held)
 
-Follows the server's SDK delivery, crash, ads and attribution, exposure and
-device contracts. The server releases for those contracts ship first; see
+Follows the server's SDK delivery, ads and attribution, exposure and device
+contracts. Automatic error capture is not in this release (it ships from the
+separate error capture branch). The server releases for those contracts ship first; see
 "Server prerequisites" below.
 
 ### Changes for 0.5.x games
@@ -33,7 +34,6 @@ device contracts. The server releases for those contracts ship first; see
   nothing. The first `getConfig` read in a session sends one `rs_exposure`
   event and tags that session's later events. A well formed `rs_exp_<key>` of
   the game's own is no longer overwritten.
-* Uncaught errors are captured by default (see below).
 
 ### Added
 
@@ -47,11 +47,6 @@ device contracts. The server releases for those contracts ship first; see
   and the shared delivery vectors run in `test/delivery.test.js`.
 * The 8,192 byte event check measures as the server does: a typed error's
   message and stack count one byte a character (`eventDataBytes`).
-* Automatic error capture: window `error` as `game_crashed`,
-  `unhandledrejection` as `game_error`, Node's uncaught exceptions as
-  `game_crashed` through `uncaughtExceptionMonitor` (exit behaviour
-  unchanged). At most 10 per message and 50 per session. `captureErrors: false`
-  or `setCaptureErrors(false)` turns it off.
 * `trackAd`, `trackAdRevenue`, `microsFromDecimalString`, `microsFromRevenue`,
   `adFormatFrom` and `setAttribution`, sent once per device. UTM parameters
   are read on the first load of a new device id in a browser.
@@ -63,9 +58,9 @@ device contracts. The server releases for those contracts ship first; see
 
 * `rs_exposure` must be accepted by public keys before this release: add it
   to `SDK_AUTOMATIC_EVENTS` (it is not in the list on any server branch yet).
-* The Phase 2 delivery release (origin, signing, gzip, `index` on a 400), the
-  Phase 4 automatic event names and the Phase 5 `rs_ad_*` and `rs_attr_*` keys
-  must be deployed first: a public key refuses an unknown `rs_` key.
+* The Phase 2 delivery release (origin, signing, gzip, `index` on a 400) and
+  the Phase 5 `rs_ad_*` and `rs_attr_*` keys must be deployed first: a public
+  key refuses an unknown `rs_` key.
 
 ## 0.5.1 (held)
 
