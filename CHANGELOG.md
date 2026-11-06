@@ -29,11 +29,14 @@ prerequisites" below.
   until the next launch (`skipped: 'refused'`). A second `401` in a row waits
   for the backoff. `413` splits, `415` resends once uncompressed, and a `503`
   with `Retry-After` waits exactly that long.
-* Automatically captured errors keep the 0.6.0 full-queue rule in the
-  persisted queue: an incoming captured error is dropped, and otherwise the
-  oldest captured error goes before any gameplay event. The flag is stored
-  with the queue, so the rule still holds after a restart, and a captured
-  error is written to storage at once.
+* The error queue rules every SDK shares: gameplay events go ahead of queued
+  automatic captures (never inside a batch awaiting an answer; 0.6.0 kept
+  arrival order). In a full queue an incoming capture evicts the oldest
+  capture, or is dropped when there is none, and never evicts gameplay.
+  `trackError` is gameplay. The capture flag is stored with the queue,
+  `rs_trail` never is (a restored capture has none), a capture is written to
+  storage at once, and `resetDeviceId()` and an opt-out delete persisted
+  captures.
 * A `413` on a batch halves it as in 0.6.0; only a `400 batch_too_large`
   halves it among the `400` answers.
 * Experiment tags follow the exposure contract: a config fetch alone tags

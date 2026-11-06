@@ -806,11 +806,12 @@ function onAnalyticsToggled(checked) {
 * **Removed only once delivered.** An event leaves the queue, and the removal
   is written to storage, only after a `2xx`, or a `400` that names it by
   `index`. Everything else keeps it.
-* **Errors behind gameplay.** A full queue drops an incoming automatically
-  captured error, and otherwise evicts the oldest captured error before any
-  gameplay event, so a burst of errors never pushes out the game's own
-  events. The flag is kept in storage across restarts, and a captured error
-  is written to storage at once.
+* **Errors behind gameplay.** Gameplay events go ahead of queued automatic
+  captures (never inside a batch awaiting an answer). In a full queue an
+  incoming capture evicts the oldest capture, or is dropped, and never
+  evicts gameplay. A capture is written to storage at once, without its
+  `rs_trail`, which stays in memory only. `resetDeviceId()` and an opt-out
+  delete persisted captures.
 * **One device per batch.** Each request carries the leading run of queued
   events that share one device id, under that id's session.
 * **Answers.** `400` with `index` drops that event and resends the rest;

@@ -959,7 +959,7 @@ test('a full queue drops errors before gameplay events', async (t) => {
   rs.track('a');
   dom.fire('window', 'error', { target: dom.win, error: new Error('one') });
   rs.track('b');
-  assert.deepEqual(rs.queue.map((e) => e.event), ['a', 'error', 'b']);
+  assert.deepEqual(rs.queue.map((e) => e.event), ['a', 'b', 'error'], 'gameplay goes ahead of a queued capture');
   rs.track('c');
   assert.deepEqual(rs.queue.map((e) => e.event), ['a', 'b', 'c'], 'the queued error goes first');
   dom.fire('window', 'error', { target: dom.win, error: new Error('two') });

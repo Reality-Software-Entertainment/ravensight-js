@@ -514,24 +514,81 @@ test('an unload batch stays stored unconfirmed: a keepalive 2xx clears it, other
   await late.dispose({ flush: false });
 });
 
-// --- Captured errors in the persisted queue -----------------------------------
+// --- Error queue rules shared by every SDK ---------------------------------------
 
-test('a captured error keeps its flag across a restart, so a full queue still evicts it first', async (t) => {
+/** Queues one automatic capture the way the capture path does. */
+function capture(rs, message, extra = {}) {
+  rs._internalTrack = true;
+  try {
+    return rs.track('error', Object.assign({ rs_kind: 'error', rs_severity: 'error', rs_message: message, rs_source: 'uncaught' }, extra));
+  } finally {
+    rs._internalTrack = false;
+  }
+}
+
+test('rule 1: gameplay goes ahead of captures, never inside a batch in flight; trackError is gameplay', async (t) => {
+  const server = await startMockServer({ batchDelayMs: 60 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoEvents: false });
+  await rs.init();
+  capture(rs, 'boom');
+  rs.track('play');
+  rs.trackError({ severity: 'error', message: 'own' });
+  assert.deepEqual(rs.queue.map((e) => e.data.rs_message || e.event), ['play', 'own', 'boom']);
+  const flushing = rs.flush();
+  await new Promise((r) => setTimeout(r, 20));
+  rs.track('late');
+  assert.deepEqual(rs.queue.map((e) => e.data.rs_message || e.event), ['play', 'own', 'boom', 'late'], 'the batch in flight is never reordered');
+  await flushing;
+  await rs.dispose({ flush: false });
+});
+
+test('rule 2: a full queue: an incoming capture evicts the oldest capture or is dropped, never gameplay', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoEvents: false, maxQueueSize: 3 });
+  rs.track('a');
+  capture(rs, 'one');
+  rs.track('b');
+  assert.equal(capture(rs, 'two'), true, 'evicts the oldest capture');
+  assert.deepEqual(rs.queue.map((e) => e.data.rs_message || e.event), ['a', 'b', 'two']);
+  rs.track('c');
+  assert.deepEqual(rs.queue.map((e) => e.event), ['a', 'b', 'c'], 'gameplay evicts a capture first');
+  assert.equal(capture(rs, 'three'), false, 'no capture to evict: the incoming one is dropped');
+  assert.deepEqual(rs.queue.map((e) => e.event), ['a', 'b', 'c']);
+  rs.track('d');
+  assert.deepEqual(rs.queue.map((e) => e.event), ['b', 'c', 'd'], 'gameplay as before: the oldest goes');
+  await rs.dispose({ flush: false });
+});
+
+test('rule 3: rs_trail is never written to storage; the flag is; opt-out and id reset delete persisted captures', async (t) => {
   const server = await startMockServer();
   t.after(() => server.close());
   const storage = new MemoryStorage();
-  const first = makeClient(server, { storage, autoEvents: false });
-  first._internalTrack = true;
-  first.track('error', { rs_kind: 'error', rs_severity: 'error', rs_message: 'boom', rs_source: 'uncaught' });
-  first._internalTrack = false;
-  first.trackError({ severity: 'error', message: 'own' });
-  await first.dispose({ flush: false });
-  assert.equal(stored(storage).groups[0].events[0].auto, true, 'the flag is stored');
-  assert.equal(stored(storage).groups[0].events[1].auto, undefined, "a game's own trackError is gameplay");
+  const rs = makeClient(server, { storage, autoEvents: false });
+  capture(rs, 'boom', { rs_trail: '+10 info secret line' });
+  rs.track('play');
+  rs._persistNow();
+  const text = storage.getItem(queueKey);
+  assert.ok(!text.includes('rs_trail') && !text.includes('secret line'), 'no trail on disk');
+  assert.equal(rs.queue.find((e) => e.auto).data.rs_trail, '+10 info secret line', 'kept in memory');
+  assert.ok(stored(storage).groups[0].events.some((e) => e.auto === true), 'the flag is stored');
 
-  const next = makeClient(server, { storage, autoEvents: false, maxQueueSize: 2 });
-  assert.equal(next.queue[0].auto, true);
-  next.track('play');
-  assert.deepEqual(next.queue.map((e) => e.data.rs_message || e.event), ['own', 'play'], 'the captured error went first');
-  await next.dispose({ flush: false });
+  storage.setItem(queueKey, text.replace('"rs_source":"uncaught"', '"rs_source":"uncaught","rs_trail":"old"'));
+  const restored = makeClient(server, { storage, autoEvents: false });
+  assert.equal(restored.queue.find((e) => e.auto).data.rs_trail, undefined, 'dropped from a restored capture');
+
+  await restored.resetDeviceId();
+  assert.equal(restored.queue.some((e) => e.auto), false);
+  assert.ok(!storage.getItem(queueKey).includes('boom'), 'id reset deletes the persisted capture');
+  assert.ok(storage.getItem(queueKey).includes('play'), 'gameplay stays');
+  await restored.dispose({ flush: false });
+
+  const optOut = makeClient(server, { storage, autoEvents: false });
+  capture(optOut, 'again');
+  optOut._persistNow();
+  optOut.setEnabled(false);
+  assert.equal(storage.getItem(queueKey), null, 'opt-out deletes everything persisted');
+  await rs.dispose({ flush: false });
+  await optOut.dispose({ flush: false });
 });

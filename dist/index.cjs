@@ -2225,6 +2225,8 @@ class Ravensight {
         const data = raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : {};
         const item = { event: raw.event, data, timestamp, deviceId, origin };
         if (raw.auto === true) item.auto = true;
+        // A trail never comes back from storage, even from an older file.
+        if ('rs_trail' in data) delete data.rs_trail;
         if (Number.isFinite(unconfirmedAt) && unconfirmedAt > 0) item.unconfirmedAt = unconfirmedAt;
         items.push(item);
       }
@@ -2252,7 +2254,13 @@ class Ravensight {
         byKey.set(key, group);
         groups.push(group);
       }
-      const event = { event: item.event, timestamp: item.timestamp, data: item.data };
+      // A trail is never written to storage: it stays in memory only.
+      let data = item.data;
+      if (data && Object.prototype.hasOwnProperty.call(data, 'rs_trail')) {
+        data = Object.assign({}, data);
+        delete data.rs_trail;
+      }
+      const event = { event: item.event, timestamp: item.timestamp, data };
       if (item.unconfirmedAt) event.unconfirmedAt = item.unconfirmedAt;
       if (item.auto) event.auto = true;
       group.events.push(event);
@@ -2996,6 +3004,12 @@ class Ravensight {
   async resetDeviceId() {
     const next = 'dev_' + randomId();
     await this.setDeviceId(next);
+    // Captured errors belong to the identity being forgotten: they leave the
+    // queue and storage now (never one in a batch awaiting an answer).
+    const keep = Math.min(this._inflightSize, this.queue.length);
+    this.queue = this.queue.slice(0, keep).concat(this.queue.slice(keep).filter((item) => !item.auto));
+    this._unconfirmed = this._unconfirmed.filter((item) => !item.auto);
+    if (this._queueStore) this._persistNow();
     return next;
   }
 
@@ -3654,27 +3668,31 @@ class Ravensight {
   }
 
   /**
-   * Adds one event under the 0.6.0 queue rule, keyed on the automatic error
-   * flag (`auto`): a full queue drops an incoming automatic error, and
-   * otherwise evicts the oldest queued automatic error (never one in a batch
-   * awaiting an answer) before any gameplay event. Returns false when the
-   * incoming event was dropped.
+   * Adds one event under the queue rules every SDK shares, keyed on the
+   * automatic capture flag (`auto`); a game's own trackError is gameplay.
+   * Order: a gameplay event goes ahead of every queued capture, never inside
+   * a batch awaiting an answer. Full queue: an incoming capture evicts the
+   * oldest queued capture, or is dropped when there is none, and never
+   * evicts gameplay; an incoming gameplay event evicts the oldest capture
+   * first, then the oldest event. Returns false when the incoming event was
+   * dropped.
    */
   _enqueue(item) {
+    const start = Math.min(this._inflightSize, this.queue.length);
+    const firstAuto = () => {
+      for (let i = start; i < this.queue.length; i++) if (this.queue[i].auto) return i;
+      return -1;
+    };
     if (this.queue.length >= this.maxQueueSize) {
-      if (item.auto) return false;
-      let at = -1;
-      for (let i = Math.min(this._inflightSize, this.queue.length); i < this.queue.length; i++) {
-        if (this.queue[i].auto) {
-          at = i;
-          break;
-        }
-      }
+      const at = firstAuto();
       if (at >= 0) this.queue.splice(at, 1);
+      else if (item.auto) return false;
       else this.queue.shift();
       this.stats.dropped += 1;
     }
-    this.queue.push(item);
+    const before = item.auto ? -1 : firstAuto();
+    if (before >= 0) this.queue.splice(before, 0, item);
+    else this.queue.push(item);
     return true;
   }
 
