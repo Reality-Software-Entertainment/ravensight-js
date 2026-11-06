@@ -545,7 +545,9 @@ and `await rs.flush()` in its own handler.
 Before anything is queued, the message, stack and trail are scrubbed on the
 device: emails become `[email]`, bearer tokens, JWTs, `gt_` keys and long
 token-like runs become `[token]`, IP addresses become `[ip]`, home folders
-(`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`) become `~`, and a URL
+(`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`,
+`C:\Documents and Settings\<name>`, the whole name, spaces included) become
+`~`, and a URL
 loses any `user:password@`, its query and its fragment. Long text is cut
 before it is scrubbed, so a huge log line costs little. The server scrubs
 again. Messages are cut to

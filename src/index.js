@@ -377,8 +377,10 @@ const SCRUB_RULES = [
   [/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?/g, '[token]'],
   [/\bgt_[A-Za-z0-9_]+/g, '[token]'],
   [/(^|[^A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, '$1[email]'],
-  [/\/(?:Users|home)\/[^/\s:'"()]+/g, '~'],
-  [/\b[A-Za-z]:\\Users\\[^\\\s:'"()]+/gi, '~'],
+  // A home folder is the whole segment up to the next slash, quote, <, >,
+  // ':' or end of line, spaces included (contract 5): a name can be `Jo Ann`.
+  [/\/(?:Users|home)\/[^/\\'"<>:\r\n]+/g, '~'],
+  [/\b[A-Za-z]:\\(?:Users|Documents and Settings)\\[^/\\'"<>:\r\n]+/gi, '~'],
   [/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]'],
   [
     /(^|[^0-9A-Za-z:.])((?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})(?![0-9A-Za-z:])/g,

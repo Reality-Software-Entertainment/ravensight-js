@@ -25,6 +25,8 @@
   addresses, home folders, URL user info, queries and fragments), exported
   as `scrubText`. Text is cut to 4 times the field's limit before the
   scrub. Manual `trackError` text is unchanged.
+* A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
 * Dead clicks are off on a page where a canvas covers more than half the
   window.
 * `rs_trail`: the last 20 track calls, console lines and navigations, sent
