@@ -30,6 +30,18 @@ const NAMED_EXPORTS = [
   'normalizeApiUrl',
   'parseRetryAfterMs',
   'chooseUnloadTransport',
+  'MAX_PERSISTED_EVENTS',
+  'GZIP_MIN_BYTES',
+  'AD_FORMATS',
+  'AD_RESULTS',
+  'queueKeyHash',
+  'signRequest',
+  'signedBeaconBody',
+  'eventDataBytes',
+  'microsFromDecimalString',
+  'microsFromRevenue',
+  'adFormatFrom',
+  'stackFrames',
 ];
 
 for (const name of NAMED_EXPORTS) {

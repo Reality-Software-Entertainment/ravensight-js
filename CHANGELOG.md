@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.6.0 (held)
+
+Follows the server's SDK delivery, crash, ads and attribution, exposure and
+device contracts. The server releases for those contracts ship first; see
+"Server prerequisites" below.
+
+### Changes for 0.5.x games
+
+* The queue is persisted by default: one `localStorage` entry per ingest key in
+  a browser, one file per key in Node (`~/.ravensight`, or `queueDir`),
+  written atomically and read back at start. Events survive a reload, a crash
+  or a lost network. At most 500 events, none older than 89 days.
+  `persistQueue: false` restores the in-memory queue.
+* `dispose()` keeps what it could not send in the persisted queue for the next
+  launch and reports it as `kept`; it is dropped only with
+  `persistQueue: false`.
+* Event timestamps are unix milliseconds (were seconds).
+* Retry waits are multiplied by a random factor between 0.5 and 1 (were plus
+  or minus 20 percent). `random: () => 0.5` now gives three quarters of the
+  step.
+* An explicit `flush()` cuts a backoff wait short. It never cuts a server
+  `Retry-After` short, and reports `skipped: 'retry_after'` inside one. The
+  flush timer and the 50 event threshold still wait out the backoff.
+* A `400` that names an event by `index` drops only that event. Only
+  `400 batch_too_large` halves the batch now; any other `400` drops the
+  request's events. A `403` on a batch keeps the events and stops sending
+  until the next launch (`skipped: 'refused'`). A second `401` in a row waits
+  for the backoff. `413` splits, `415` resends once uncompressed, and a `503`
+  with `Retry-After` waits exactly that long.
+* Experiment tags follow the exposure contract: a config fetch alone tags
+  nothing. The first `getConfig` read in a session sends one `rs_exposure`
+  event and tags that session's later events. A well formed `rs_exp_<key>` of
+  the game's own is no longer overwritten.
+* Uncaught errors are captured by default (see below).
+
+### Added
+
+* Each event remembers the `origin` of the session it was tracked under, and
+  an event sent from a later session carries it, so a replayed event is stored
+  under its own session, build and platform.
+* gzip for request bodies of 1,024 bytes or more.
+* Request signing when `POST /session` answers with `signing`: headers on
+  ordinary and keepalive sends, the signed body envelope on a beacon. The
+  secret is memory only. `signRequest` and `signedBeaconBody` are exported,
+  and the shared delivery vectors run in `test/delivery.test.js`.
+* The 8,192 byte event check measures as the server does: a typed error's
+  message and stack count one byte a character (`eventDataBytes`).
+* Automatic error capture: window `error` as `game_crashed`,
+  `unhandledrejection` as `game_error`, Node's uncaught exceptions as
+  `game_crashed` through `uncaughtExceptionMonitor` (exit behaviour
+  unchanged). At most 10 per message and 50 per session. `captureErrors: false`
+  or `setCaptureErrors(false)` turns it off.
+* `trackAd`, `trackAdRevenue`, `microsFromDecimalString`, `microsFromRevenue`,
+  `adFormatFrom` and `setAttribution`, sent once per device. UTM parameters
+  are read on the first load of a new device id in a browser.
+* `device` on `POST /session`: the WebGL renderer in a browser where it is
+  available without a prompt, the OS release in Node, or the game's own
+  `device` option.
+
+### Server prerequisites
+
+* `rs_exposure` must be accepted by public keys before this release: add it
+  to `SDK_AUTOMATIC_EVENTS` (it is not in the list on any server branch yet).
+* The Phase 2 delivery release (origin, signing, gzip, `index` on a 400), the
+  Phase 4 automatic event names and the Phase 5 `rs_ad_*` and `rs_attr_*` keys
+  must be deployed first: a public key refuses an unknown `rs_` key.
+
 ## 0.5.1 (held)
 
 - Add session-start config fetching, scoped persistent/offline caching, ETags, typed fallback getters and an optional readiness callback.

@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-export const VERSION = '0.5.1';
+export const VERSION = '0.6.0';
 
 export const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -23,7 +23,7 @@ export const FEEDBACK_CATEGORIES = Object.freeze(['bug', 'suggestion', 'complain
  */
 export const RS_KINDS = Object.freeze([
   'level_start', 'level_complete', 'death', 'none',
-  'purchase', 'resource', 'progression', 'error', 'health',
+  'purchase', 'resource', 'progression', 'error', 'health', 'ad', 'attribution',
 ]);
 
 /** The reserved keys Ravensight reads. Any other `rs_` key is a typo or a clash. */
@@ -35,6 +35,8 @@ const KNOWN_RS_KEYS = Object.freeze([
   'rs_flow', 'rs_resource',
   'rs_severity', 'rs_message', 'rs_stack',
   'rs_fps_median', 'rs_fps_p10', 'rs_memory_mb', 'rs_boot_ms',
+  'rs_ad_network', 'rs_ad_format', 'rs_ad_placement', 'rs_ad_result', 'rs_revenue_micros',
+  'rs_attr_source', 'rs_attr_network', 'rs_campaign', 'rs_adset', 'rs_creative', 'rs_touch_time',
 ]);
 
 const MAX_MESSAGE_CHARS = 200;
@@ -44,6 +46,455 @@ const SAMPLE_INTERVAL_MS = 1000;
 
 const cutText = (value, max) =>
   typeof value === 'string' && value.length > max ? Array.from(value).slice(0, max).join('') : value;
+
+// --- Delivery contract (docs/sdk/DELIVERY_CONTRACT.md) ----------------------
+
+/** Most events the persisted queue keeps, across every group. */
+export const MAX_PERSISTED_EVENTS = 500;
+/** Events older than this are dropped when the queue is loaded: the server refuses anything past 90 days. */
+const MAX_QUEUE_AGE_MS = 89 * 86400 * 1000;
+const QUEUE_FORMAT_VERSION = 2;
+/** A body this large or larger (before compression) is sent gzip compressed. */
+export const GZIP_MIN_BYTES = 1024;
+/**
+ * An unload send (keepalive or beacon) gets no answer the page can act on.
+ * Its events stay in the persisted queue marked unconfirmed, and the next
+ * launch resends them while the server's 24 hour duplicate window still
+ * recognises them; past this age they are presumed delivered and dropped.
+ */
+const UNCONFIRMED_RESEND_MS = 23 * 3600 * 1000;
+const QUEUE_KEY_PREFIX = 'ravensight_queue_';
+const ATTRIBUTION_SENT_KEY = 'ravensight_attribution_sent';
+
+/** 64-bit FNV-1a of the UTF-8 bytes of `text`, as 16 lowercase hex characters. Only names a queue; not a secret. */
+export function queueKeyHash(text) {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of utf8Bytes(String(text))) {
+    hash ^= BigInt(byte);
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, '0');
+}
+
+/** The UTF-8 bytes of a string, without TextEncoder where it is missing. */
+function utf8Bytes(text) {
+  if (typeof TextEncoder === 'function') return new TextEncoder().encode(text);
+  const out = [];
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp < 0x80) out.push(cp);
+    else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 63));
+    else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+    else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+  }
+  return Uint8Array.from(out);
+}
+
+const SHA256_K = Uint32Array.from([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+/**
+ * SHA-256 of a byte array. Synchronous on purpose: a page that is going away
+ * must sign its last beacon in the same tick, and Web Crypto is async only.
+ */
+function sha256(bytes) {
+  const length = bytes.length;
+  const padded = new Uint8Array(((length + 9 + 63) >> 6) << 6);
+  padded.set(bytes);
+  padded[length] = 0x80;
+  const bits = length * 8;
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 8, Math.floor(bits / 0x100000000));
+  view.setUint32(padded.length - 4, bits >>> 0);
+  const h = Uint32Array.from([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  const w = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let off = 0; off < padded.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + SHA256_K[i] + w[i]) >>> 0;
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  const out = new Uint8Array(32);
+  const outView = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) outView.setUint32(i * 4, h[i]);
+  return out;
+}
+
+/** HMAC-SHA256 keyed with the UTF-8 bytes of `secret` over the UTF-8 bytes of `message`, as 64 lowercase hex. */
+function hmacSha256Hex(secret, message) {
+  let key = utf8Bytes(String(secret));
+  if (key.length > 64) key = sha256(key);
+  const inner = new Uint8Array(64);
+  const outer = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) {
+    inner[i] = (key[i] || 0) ^ 0x36;
+    outer[i] = (key[i] || 0) ^ 0x5c;
+  }
+  const msg = utf8Bytes(String(message));
+  const first = new Uint8Array(64 + msg.length);
+  first.set(inner);
+  first.set(msg, 64);
+  const innerHash = sha256(first);
+  const second = new Uint8Array(96);
+  second.set(outer);
+  second.set(innerHash, 64);
+  return Array.from(sha256(second), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The request signature for a signing session (contract section 7.3):
+ * `v1=` and the lowercase hex HMAC-SHA256 of `"v1:" + timestamp + ":" + body`,
+ * keyed with the secret as text. `body` is the exact text sent, before gzip.
+ */
+export function signRequest(secret, timestamp, body) {
+  return 'v1=' + hmacSha256Hex(secret, 'v1:' + timestamp + ':' + body);
+}
+
+/**
+ * The signed body a beacon carries (section 7.4), for a send that cannot set
+ * headers. `body` is the ordinary request body as JSON text.
+ */
+export function signedBeaconBody(sessionToken, secret, timestamp, body) {
+  return {
+    sessionToken,
+    signed: { v: 1, t: timestamp, body, sig: hmacSha256Hex(secret, 'v1:' + timestamp + ':' + body) },
+  };
+}
+
+/** Typed error text caps the server exempts from the byte ceiling (section 6). */
+const TYPED_TEXT_CAPS = Object.freeze({ rs_message: MAX_MESSAGE_CHARS, rs_stack: MAX_STACK_CHARS });
+
+/**
+ * One event's data size as the server measures it: the UTF-8 bytes of its
+ * JSON, except that a typed error's `rs_message` and `rs_stack`, within
+ * their 200 and 2,000 character caps, count one byte a character.
+ */
+export function eventDataBytes(data) {
+  const json = JSON.stringify(data == null ? {} : data);
+  let bytes = utf8Length(json);
+  if (data && typeof data === 'object' && data.rs_kind === 'error') {
+    for (const key of Object.keys(TYPED_TEXT_CAPS)) {
+      const value = data[key];
+      if (typeof value === 'string' && value.length <= TYPED_TEXT_CAPS[key]) {
+        bytes -= utf8Length(JSON.stringify(value)) - value.length;
+      }
+    }
+  }
+  return bytes;
+}
+
+// --- Ads and attribution (docs/sdk/ADS_ATTRIBUTION_CONTRACT.md) ------------
+
+export const AD_FORMATS = Object.freeze(['banner', 'interstitial', 'rewarded', 'native', 'app_open', 'other']);
+export const AD_RESULTS = Object.freeze(['shown', 'clicked', 'failed', 'rewarded']);
+
+/**
+ * Revenue text in major units as whole micros, a digit string, working on
+ * the decimal digits so no float is ever multiplied: "0.0015" is "1500".
+ * Past six decimals it rounds half up. Accepts an exponent ("1.5e-3").
+ * Returns null for anything that is not a non-negative decimal number or
+ * whose micros would not fit in 18 digits.
+ */
+export function microsFromDecimalString(text) {
+  if (typeof text !== 'string' && typeof text !== 'number') return null;
+  const raw = String(text).trim();
+  const match = /^\+?(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(raw);
+  if (!match || (match[1] === '' && (match[2] || '') === '')) return null;
+  let intPart = match[1] || '';
+  let frac = match[2] || '';
+  const exp = match[3] ? parseInt(match[3], 10) : 0;
+  if (!Number.isFinite(exp) || Math.abs(exp) > 400) return null;
+  if (exp > 0) {
+    const moved = frac.slice(0, exp).padEnd(exp, '0');
+    intPart += moved;
+    frac = frac.slice(exp);
+  } else if (exp < 0) {
+    const shift = -exp;
+    const padded = intPart.padStart(shift, '0');
+    frac = padded.slice(padded.length - shift) + frac;
+    intPart = padded.slice(0, padded.length - shift);
+  }
+  const six = frac.slice(0, 6).padEnd(6, '0');
+  const roundUp = frac.length > 6 && frac.charCodeAt(6) >= 53; // '5'
+  let digits = ((intPart || '0') + six).replace(/^0+(?=\d)/, '');
+  if (roundUp) {
+    const chars = digits.split('');
+    let i = chars.length - 1;
+    while (i >= 0) {
+      if (chars[i] === '9') {
+        chars[i] = '0';
+        i -= 1;
+      } else {
+        chars[i] = String.fromCharCode(chars[i].charCodeAt(0) + 1);
+        break;
+      }
+    }
+    digits = (i < 0 ? '1' : '') + chars.join('');
+  }
+  digits = digits.replace(/^0+(?=\d)/, '');
+  return digits.length <= 18 ? digits : null;
+}
+
+/**
+ * A mediation callback's revenue (a double in major units) as micros. The
+ * double is written with its shortest round-trip text first, then rounded
+ * on its digits: 0.0015 is "1500" and 1.23456789 is "1234568".
+ */
+export function microsFromRevenue(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
+  return microsFromDecimalString(String(value));
+}
+
+/** A mediation SDK's ad format name mapped onto rs_ad_format. */
+export function adFormatFrom(name) {
+  const key = String(name == null ? '' : name).trim().toUpperCase();
+  if (['BANNER', 'MREC', 'LEADER'].includes(key)) return 'banner';
+  if (['INTER', 'INTERSTITIAL'].includes(key)) return 'interstitial';
+  if (['REWARDED', 'REWARDED_VIDEO', 'REWARDED_INTER'].includes(key)) return 'rewarded';
+  if (key === 'NATIVE') return 'native';
+  if (key === 'APP_OPEN') return 'app_open';
+  return 'other';
+}
+
+const textIn = (value, min, max) => typeof value === 'string' && value.length >= min && value.length <= max;
+
+// --- Experiment exposure (docs/sdk/EXPOSURE_CONTRACT.md) -------------------
+
+const EXPERIMENT_KEY = /^[a-z][a-z0-9_]{0,63}$/;
+const VARIANT_NAME = /^[a-z][a-z0-9_-]{0,39}$/;
+
+// --- Crash capture (docs/sdk/CRASH_CONTRACT.md) -----------------------------
+
+const MAX_CAPTURED_PER_SESSION = 50;
+const MAX_CAPTURED_PER_MESSAGE = 10;
+const MAX_STACK_FRAMES = 30;
+
+/** Every client capturing errors in this Node process. One process listener serves them all. */
+const nodeCaptureClients = new Set();
+let nodeCaptureInstalled = false;
+
+function onNodeUncaught(error, origin) {
+  for (const client of nodeCaptureClients) {
+    try {
+      client._captureError('game_crashed', 'critical', error, origin === 'unhandledRejection');
+    } catch (_err) {
+      // Capture must never add a second failure to a dying process.
+    }
+  }
+}
+
+/**
+ * Observes Node's uncaught exceptions without changing what happens next:
+ * `uncaughtExceptionMonitor` runs before the default handler, so the process
+ * still prints the error and exits with code 1 as it would without the SDK.
+ * An unhandled rejection reaches it too (Node's default `throw` mode).
+ */
+function installNodeCapture(client) {
+  nodeCaptureClients.add(client);
+  if (nodeCaptureInstalled) return;
+  try {
+    if (typeof process !== 'undefined' && process && typeof process.on === 'function') {
+      process.on('uncaughtExceptionMonitor', onNodeUncaught);
+      nodeCaptureInstalled = true;
+    }
+  } catch (_err) {
+    // No process events: nothing to observe.
+  }
+}
+
+function removeNodeCapture(client) {
+  nodeCaptureClients.delete(client);
+  if (!nodeCaptureInstalled || nodeCaptureClients.size > 0) return;
+  try {
+    process.removeListener('uncaughtExceptionMonitor', onNodeUncaught);
+  } catch (_err) {
+    // ignore
+  }
+  nodeCaptureInstalled = false;
+}
+
+/** `Type: message` for anything thrown or rejected, never empty. */
+function errorMessage(error) {
+  try {
+    if (error && typeof error === 'object') {
+      const name = typeof error.name === 'string' && error.name ? error.name : 'Error';
+      const message = typeof error.message === 'string' ? error.message : '';
+      return message ? name + ': ' + message : name;
+    }
+    const text = String(error);
+    return text ? 'Error: ' + text : 'Error';
+  } catch (_err) {
+    return 'Error';
+  }
+}
+
+/** Home directory prefixes of every common OS, so a user name never reaches a stack. */
+const HOME_PATH = /(?:\/Users\/|\/home\/|[A-Za-z]:\\Users\\|[A-Za-z]:\/Users\/)[^/\\\s:)]+[/\\]/g;
+
+/**
+ * An engine stack as the contract's frames: no message line, innermost first,
+ * at most 30 frames, scheme and host stripped from URLs, the working
+ * directory removed and any home directory replaced by `~/`.
+ */
+export function stackFrames(stack, options = {}) {
+  if (typeof stack !== 'string' || !stack) return '';
+  const roots = [];
+  if (options.root) roots.push(String(options.root));
+  const frames = [];
+  for (const rawLine of stack.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // V8 frames start "at "; Firefox and Safari frames are "fn@url:line:col".
+    if (!/^at\s/.test(line) && !/@.*:\d+(?::\d+)?$/.test(line) && !/^(?:https?|file):\/\//.test(line)) continue;
+    let frame = line.replace(/file:\/\/\/?/g, '/').replace(/\b(?:https?|blob):\/\/[^/\s)]+\//g, '');
+    for (const root of roots) {
+      if (root) frame = frame.split(root.replace(/[/\\]+$/, '') + '/').join('').split(root.replace(/[/\\]+$/, '') + '\\').join('');
+    }
+    frame = frame.replace(HOME_PATH, '~/');
+    frames.push(frame);
+    if (frames.length >= MAX_STACK_FRAMES) break;
+  }
+  return cutText(frames.join('\n'), MAX_STACK_CHARS);
+}
+
+// --- Device fields -----------------------------------------------------------
+
+const MAX_DEVICE_FIELD = 128;
+
+/** A device field as the contract allows it: printable text, trimmed, at most 128 characters, or null. */
+function deviceField(value) {
+  if (value == null) return null;
+  const text = cutText(String(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim(), MAX_DEVICE_FIELD);
+  return text ? text.trim() || null : null;
+}
+
+/**
+ * What the platform tells without a prompt and without a hardware id:
+ * the WebGL renderer in a browser where the debug extension answers, the
+ * OS release in Node. The model is never probed on the web.
+ */
+function probeDevice() {
+  const device = {};
+  try {
+    if (isBrowser() && typeof document.createElement === 'function') {
+      const canvas = document.createElement('canvas');
+      const gl = canvas && canvas.getContext ? canvas.getContext('webgl') || canvas.getContext('experimental-webgl') : null;
+      const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+      const gpu = ext ? deviceField(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : null;
+      if (gpu) device.gpu = gpu;
+      const lose = gl && gl.getExtension('WEBGL_lose_context');
+      if (lose) lose.loseContext();
+    } else if (typeof process !== 'undefined' && process && typeof process.getBuiltinModule === 'function') {
+      const os = process.getBuiltinModule('os');
+      const release = os && deviceField(os.release());
+      if (release) device.osVersion = release;
+    }
+  } catch (_err) {
+    // Device fields are optional.
+  }
+  return device;
+}
+
+/** A Node built in module, synchronously, where the runtime offers one. */
+function nodeBuiltin(name) {
+  try {
+    if (typeof process !== 'undefined' && process && typeof process.getBuiltinModule === 'function') {
+      return process.getBuiltinModule(name);
+    }
+  } catch (_err) {
+    // Not Node.
+  }
+  return null;
+}
+
+/**
+ * The persisted queue's backing store: one storage entry per ingest key in
+ * a browser (or the injected storage), one file per key in Node, written
+ * atomically through a temporary file and a rename. Null when neither exists.
+ */
+function makeQueueStore(storage, injected, ingestKey, queueDir, modules) {
+  const hash = queueKeyHash(ingestKey);
+  if (injected || isBrowser()) {
+    const key = QUEUE_KEY_PREFIX + hash;
+    return {
+      kind: 'storage',
+      read: () => storage.getItem(key),
+      write: (text) => storage.setItem(key, text),
+      remove: () => {
+        if (typeof storage.removeItem === 'function') storage.removeItem(key);
+        else storage.setItem(key, '');
+      },
+    };
+  }
+  const fs = (modules && modules.fs) || nodeBuiltin('fs');
+  const path = (modules && modules.path) || nodeBuiltin('path');
+  const os = (modules && modules.os) || nodeBuiltin('os');
+  if (!fs || !path) return null;
+  let dir = queueDir;
+  if (!dir) {
+    if (!os) return null;
+    dir = path.join(os.homedir(), '.ravensight');
+  }
+  const file = path.join(dir, 'queue-' + hash + '.json');
+  return {
+    kind: 'file',
+    file,
+    read: () => {
+      try {
+        return fs.readFileSync(file, 'utf8');
+      } catch (_err) {
+        return null;
+      }
+    },
+    write: (text) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const temp = file + '.' + process.pid + '.' + randomHex(4) + '.tmp';
+      fs.writeFileSync(temp, text, 'utf8');
+      fs.renameSync(temp, file);
+    },
+    remove: () => {
+      try {
+        fs.unlinkSync(file);
+      } catch (_err) {
+        // Already gone.
+      }
+    },
+  };
+}
+
+/** gzip bytes, or null when no compressor is available. */
+async function gzipText(text) {
+  const bytes = utf8Bytes(text);
+  try {
+    if (typeof CompressionStream === 'function' && typeof Response === 'function' && typeof Blob === 'function') {
+      const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+    const zlib = nodeBuiltin('zlib');
+    if (zlib) return new Uint8Array(zlib.gzipSync(bytes));
+  } catch (_err) {
+    // Fall back to a plain body.
+  }
+  return null;
+}
 
 /** The value at fraction `q` of an ascending list, interpolated between neighbours. */
 function quantile(sorted, q) {
@@ -78,8 +529,6 @@ export const MAX_EVENT_BYTES = 8192;
 const OPTIN_KEY = 'ravensight_optin';
 const CONSENT_MODES = Object.freeze(['opt_out', 'opt_in']);
 const MAX_DISTRIBUTION_LENGTH = 40;
-/** Retry waits vary by plus or minus this fraction, so clients that failed together do not retry together. */
-const BACKOFF_JITTER = 0.2;
 
 /**
  * Error thrown by the explicit request helpers (submitFeedback,
@@ -260,11 +709,6 @@ function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== '';
 }
 
-/** Strips the local device id: the server stamps it from the session. */
-function wireEvents(items) {
-  return items.map((item) => ({ event: item.event, data: item.data, timestamp: item.timestamp }));
-}
-
 /** A token from a string, a JSON string or an object with `token`. */
 function playtestTokenFrom(value) {
   if (value == null) return null;
@@ -363,6 +807,29 @@ export class Ravensight {
     this.maxSessions =
       opts.maxSessions == null ? DEFAULT_MAX_SESSIONS : Math.max(1, Math.floor(Number(opts.maxSessions)) || 1);
     this.debug = Boolean(opts.debug);
+    /**
+     * The persisted queue, on by default: events survive a reload, a crash or
+     * a lost network and go out on the next launch. `persistQueue: false`
+     * keeps them in memory only.
+     */
+    this.persistQueue = opts.persistQueue === undefined ? true : Boolean(opts.persistQueue);
+    this._queueDir = opts.queueDir == null ? null : String(opts.queueDir);
+    this._injectedStorage = Boolean(opts.storage);
+    /** Automatic error and crash capture, on by default. `captureErrors: false` turns it off. */
+    this.captureErrors = opts.captureErrors === undefined ? true : Boolean(opts.captureErrors);
+    /** Device fields the game supplies itself: { model, osVersion, gpu }. Merged over what the SDK finds. */
+    this._deviceOverride = opts.device && typeof opts.device === 'object' ? opts.device : null;
+    this._device = null;
+    this._deviceIdCreated = false;
+    /** The landing query string, read once, for the UTM attribution of a new device. */
+    this._landingSearch = '';
+    try {
+      if (isBrowser() && window.location && typeof window.location.search === 'string') {
+        this._landingSearch = window.location.search;
+      }
+    } catch (_err) {
+      // No location: no UTM attribution.
+    }
 
     this._fetch = opts.fetch || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
     if (!this._fetch && this._hasKey) {
@@ -428,6 +895,24 @@ export class Ravensight {
     this.onConfigReady = typeof opts.onConfigReady === 'function' ? opts.onConfigReady : null;
 
     this.queue = [];
+    /** Events handed to a keepalive or beacon send as the page went away: persisted, never resent this page life. */
+    this._unconfirmed = [];
+    this._queueStore = null;
+    this._queueOpened = false;
+    this._persistPending = false;
+    /** Set by a 403 on a track request: sending stops until the next launch, events stay queued. */
+    this._sendBlocked = false;
+    /** Until when a server Retry-After holds: never cut short, not even by flush(). */
+    this._retryAfterUntil = 0;
+    /** deviceId -> { generation, keys } of experiments exposed in that device's session. */
+    this._exposures = new Map();
+    /** deviceId -> how many sessions have replaced the first one this launch. */
+    this._sessionGenerations = new Map();
+    this._captureCounts = { key: null, total: 0, byMessage: new Map() };
+    this._capturing = false;
+    this._errorListenersBound = false;
+    this._onWindowError = null;
+    this._onRejection = null;
     this.stats = {
       queued: 0,
       sent: 0,
@@ -435,6 +920,10 @@ export class Ravensight {
       flushes: 0,
       sessions: 0,
       sessionsEvicted: 0,
+      /** Events read back from the persisted queue at start. */
+      restored: 0,
+      /** Persisted events dropped at start as older than 89 days. */
+      expired: 0,
       /** The last failed request: { code, status, at } with `at` in epoch ms, or null. */
       lastError: null,
     };
@@ -463,6 +952,10 @@ export class Ravensight {
     /** Set by a 403 playtest_job_closed. Permanent for this client. */
     this._playtestClosed = false;
 
+    // Read the persisted queue before anything new is queued, so restored
+    // events keep their place ahead of this launch's own.
+    this._openQueue();
+
     // Automatic lifecycle events, in a browser only: a Node client serves many
     // players and has no single game to start or exit. Never while inert or
     // before the opt-in yes.
@@ -485,6 +978,9 @@ export class Ravensight {
     this._nextSampleAt = 0;
     this._bootMs = null;
     if (this.performance && isBrowser()) this._startPerformance();
+
+    this._bindErrorCapture();
+    if (this._deviceIdCreated) this._captureUtm();
   }
 
   /** True only while the client is running and collecting: a key, consent, not opted out, not switched off by the server, the key not refused, not disposed. */
@@ -579,6 +1075,7 @@ export class Ravensight {
       return { trackingEnabled: false, sessionReady: false, reason: 'invalid_key' };
     }
 
+    await this._openQueueAsync();
     await this._checkSettings();
     this.initialized = true;
     if (this._playtestClosed) this.trackingEnabled = false;
@@ -614,9 +1111,7 @@ export class Ravensight {
     this._startTimer();
     this._bindLifecycle();
 
-    if (sessionReady && this.queue.length > 0) {
-      this.flush().catch(noop);
-    }
+    if (sessionReady && this.queue.length > 0) this._autoFlush();
 
     return { trackingEnabled: true, sessionReady, reason };
   }
@@ -652,11 +1147,15 @@ export class Ravensight {
     let bytes = Infinity;
     try {
       payload = Object.assign({}, data && typeof data === 'object' ? data : {});
-      for (const assignment of this._cachedConfig(deviceId)?.experiments || []) {
-        payload['rs_exp_' + assignment.key] = assignment.variant;
+      // Exposure tags are added when the event is queued, so an event sent
+      // later from the persisted queue keeps the variant it happened under.
+      // A well formed tag of the game's own is left alone.
+      for (const [key, variant] of this._exposureTags(deviceId)) {
+        const name = 'rs_exp_' + key;
+        if (!(typeof payload[name] === 'string' && VARIANT_NAME.test(payload[name]))) payload[name] = variant;
       }
       payload.rs_event_id = this._nextEventId(deviceId);
-      bytes = utf8Length(JSON.stringify(payload));
+      bytes = eventDataBytes(payload);
     } catch (_err) {
       payload = null;
     }
@@ -679,15 +1178,21 @@ export class Ravensight {
       this.stats.dropped += 1;
     }
 
+    // Unix milliseconds, assigned now and never at send time. The origin is
+    // the session this event belongs to; events tracked before the first
+    // session opens get it when that session opens.
+    const entry = this._sessions.get(deviceId);
     this.queue.push({
       event,
       data: payload,
-      timestamp: Math.floor(this._clock() / 1000),
+      timestamp: Math.floor(this._clock()),
       deviceId,
+      origin: entry && entry.token && entry.origin ? entry.origin : null,
     });
     this.stats.queued += 1;
+    this._schedulePersist();
 
-    if (this.queue.length >= MAX_BATCH_SIZE) this.flush().catch(noop);
+    if (this.queue.length >= MAX_BATCH_SIZE) this._autoFlush();
     return true;
   }
 
@@ -750,6 +1255,396 @@ export class Ravensight {
       rs_stack: cutText(o.stack, MAX_STACK_CHARS),
     }, o.data);
     return this.track(o.event || 'error', props, trackOptions);
+  }
+
+  /**
+   * One ad lifecycle step. `format` is one of AD_FORMATS, `result` one of
+   * AD_RESULTS. `options.revenueMicros` is whole micros of
+   * `options.currency` as a digit string (use microsFromDecimalString or
+   * microsFromRevenue, never `value * 1e6`), sent only with `shown`.
+   * Returns false, sending nothing, for a value the server would flag:
+   * revenue without a currency, revenue on another result, a malformed
+   * network, format, result, placement, micros or currency.
+   */
+  trackAd(network, format, result, options = {}, trackOptions) {
+    const o = options || {};
+    if (!textIn(network, 1, 64) || !AD_FORMATS.includes(format) || !AD_RESULTS.includes(result)) {
+      return this._refuseTyped('ad', 'network, format or result is not valid');
+    }
+    if (o.placement != null && !textIn(o.placement, 1, 100)) return this._refuseTyped('ad', 'placement must be 1 to 100 characters');
+    const hasRevenue = o.revenueMicros != null && o.revenueMicros !== '';
+    let micros;
+    let currency;
+    if (hasRevenue) {
+      micros = typeof o.revenueMicros === 'number' && Number.isSafeInteger(o.revenueMicros) && o.revenueMicros >= 0
+        ? String(o.revenueMicros) : o.revenueMicros;
+      if (typeof micros !== 'string' || !/^\d{1,18}$/.test(micros)) return this._refuseTyped('ad', 'revenueMicros must be a digit string of 1 to 18 digits');
+      currency = typeof o.currency === 'string' ? o.currency.toUpperCase() : o.currency;
+      if (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency)) return this._refuseTyped('ad', 'revenue needs a 3 letter currency');
+      if (result !== 'shown') return this._refuseTyped('ad', 'revenue goes on the shown result only');
+    } else if (o.currency != null && o.currency !== '') {
+      return this._refuseTyped('ad', 'a currency needs a revenue');
+    }
+    const props = this._typed('ad', {
+      rs_ad_network: network,
+      rs_ad_format: format,
+      rs_ad_placement: o.placement == null ? undefined : o.placement,
+      rs_ad_result: result,
+      rs_revenue_micros: micros,
+      rs_currency: currency,
+    }, o.data);
+    return this.track(o.event || 'rs_ad', props, trackOptions);
+  }
+
+  /** A paid impression: trackAd(network, format, 'shown', { placement, revenueMicros, currency }). */
+  trackAdRevenue(network, format, placement, revenueMicros, currency, trackOptions) {
+    return this.trackAd(network, format, 'shown', {
+      placement: placement == null || placement === '' ? undefined : placement,
+      revenueMicros,
+      currency,
+    }, trackOptions);
+  }
+
+  /**
+   * Where this install came from: `{ source, network?, campaign?, adset?,
+   * creative?, touchTime? }`. Sent once per device id: a flag stored beside
+   * the device id makes every later call return false, across restarts.
+   * The server keeps the first record per device anyway.
+   */
+  setAttribution(options) {
+    const o = options || {};
+    if (!this.isActive || !isNonEmptyString(this.deviceId)) return false;
+    if (!textIn(o.source, 1, 64)) return this._refuseTyped('attribution', 'source must be 1 to 64 characters');
+    const fields = { rs_attr_source: o.source };
+    const limits = { network: ['rs_attr_network', 100], campaign: ['rs_campaign', 200], adset: ['rs_adset', 200], creative: ['rs_creative', 200] };
+    for (const [name, [key, max]] of Object.entries(limits)) {
+      const value = o[name];
+      if (value == null || value === '') continue;
+      if (!textIn(value, 1, max)) return this._refuseTyped('attribution', name + ' must be 1 to ' + max + ' characters');
+      fields[key] = value;
+    }
+    if (o.touchTime != null) {
+      if (!Number.isSafeInteger(o.touchTime) || o.touchTime < 0) return this._refuseTyped('attribution', 'touchTime must be epoch milliseconds');
+      fields.rs_touch_time = o.touchTime;
+    }
+    if (this._attributionSentFor === this.deviceId || this._readAttributionSent() === this.deviceId) return false;
+    if (!this.track(o.event || 'rs_attribution', this._typed('attribution', fields))) return false;
+    this._writeAttributionSent(this.deviceId);
+    return true;
+  }
+
+  _readAttributionSent() {
+    if (this._playtestToken) return null;
+    try {
+      return this._storage.getItem(ATTRIBUTION_SENT_KEY);
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  _writeAttributionSent(deviceId) {
+    this._attributionSentFor = deviceId;
+    if (this._playtestToken) return;
+    try {
+      this._storage.setItem(ATTRIBUTION_SENT_KEY, deviceId);
+    } catch (_err) {
+      // Blocked storage: sent once per client instead.
+    }
+  }
+
+  /** On the first load of a new device id, the landing URL's UTM parameters as one attribution event. Nothing else is read. */
+  _captureUtm() {
+    if (!isBrowser() || !this._landingSearch || !this.isActive) return false;
+    let params;
+    try {
+      params = new URLSearchParams(this._landingSearch);
+    } catch (_err) {
+      return false;
+    }
+    const pick = (name, max) => {
+      const value = params.get(name);
+      return value == null || value === '' ? undefined : value.slice(0, max);
+    };
+    const network = pick('utm_source', 100);
+    const campaign = pick('utm_campaign', 200);
+    const adset = pick('utm_term', 200);
+    const creative = pick('utm_content', 200);
+    if (network === undefined && campaign === undefined && adset === undefined && creative === undefined && pick('utm_medium', 1) === undefined) {
+      return false;
+    }
+    return this.setAttribution({ source: 'utm', network, campaign, adset, creative, touchTime: Math.floor(this._clock()) });
+  }
+
+  _refuseTyped(kind, why) {
+    this._log(kind + ' event not sent: ' + why);
+    return false;
+  }
+
+  // --- Crash capture --------------------------------------------------------
+
+  /** Hooks the page's `error` and `unhandledrejection`, or Node's uncaught exceptions. Never while inert, before consent or under `captureErrors: false`. */
+  _bindErrorCapture() {
+    if (!this.captureErrors || !this._hasKey || !this._consented || this._errorListenersBound || this._disposed || this._disposing) return;
+    if (isBrowser()) {
+      if (typeof window.addEventListener !== 'function') return;
+      this._onWindowError = (event) => {
+        const error = event && event.error != null
+          ? event.error
+          : { name: 'Error', message: event && event.message ? String(event.message) : 'Script error' };
+        this._captureError('game_crashed', 'critical', error);
+      };
+      this._onRejection = (event) => this._captureError('game_error', 'error', event ? event.reason : undefined);
+      window.addEventListener('error', this._onWindowError);
+      window.addEventListener('unhandledrejection', this._onRejection);
+    } else {
+      installNodeCapture(this);
+    }
+    this._errorListenersBound = true;
+  }
+
+  _unbindErrorCapture() {
+    if (!this._errorListenersBound) return;
+    if (this._onWindowError) {
+      try {
+        window.removeEventListener('error', this._onWindowError);
+        window.removeEventListener('unhandledrejection', this._onRejection);
+      } catch (_err) {
+        // ignore
+      }
+    }
+    removeNodeCapture(this);
+    this._onWindowError = null;
+    this._onRejection = null;
+    this._errorListenersBound = false;
+  }
+
+  /**
+   * Turns automatic capture on or off at run time. Off stops capture only;
+   * events already queued stay queued.
+   */
+  setCaptureErrors(on) {
+    this.captureErrors = Boolean(on);
+    if (this.captureErrors) this._bindErrorCapture();
+    else this._unbindErrorCapture();
+  }
+
+  /**
+   * Queues one captured error as a typed error event and writes the queue
+   * to storage at once, because the process or page may be about to end.
+   * At most 10 per distinct message and 50 per session.
+   */
+  _captureError(name, severity, error) {
+    if (this._capturing || !this.captureErrors || !this.isActive) return false;
+    this._capturing = true;
+    try {
+      const message = cutText(errorMessage(error), MAX_MESSAGE_CHARS);
+      const sessionKey = this.deviceId + '\u0000' + this._generation(this.deviceId);
+      const counts = this._captureCounts;
+      if (counts.key !== sessionKey) {
+        counts.key = sessionKey;
+        counts.total = 0;
+        counts.byMessage = new Map();
+      }
+      const seen = counts.byMessage.get(message) || 0;
+      if (counts.total >= MAX_CAPTURED_PER_SESSION || seen >= MAX_CAPTURED_PER_MESSAGE) return false;
+      counts.total += 1;
+      counts.byMessage.set(message, seen + 1);
+      let root = null;
+      try {
+        if (!isBrowser() && typeof process !== 'undefined' && process && typeof process.cwd === 'function') root = process.cwd();
+      } catch (_err) {
+        root = null;
+      }
+      const stack = error && typeof error === 'object' && typeof error.stack === 'string' ? stackFrames(error.stack, { root }) : '';
+      const data = { rs_kind: 'error', rs_severity: severity, rs_message: message };
+      if (stack) data.rs_stack = stack;
+      const queued = this.track(name, data);
+      if (queued) this._persistNow();
+      return queued;
+    } catch (_err) {
+      return false;
+    } finally {
+      this._capturing = false;
+    }
+  }
+
+  // --- Experiment exposure --------------------------------------------------
+
+  /** How many sessions have replaced this device's first one in this launch. */
+  _generation(deviceId) {
+    return this._sessionGenerations.get(deviceId) || 0;
+  }
+
+  /** The experiments exposed in this device's current session that the latest config still runs. */
+  _exposureTags(deviceId) {
+    const exposure = this._exposures.get(deviceId);
+    if (!exposure || exposure.generation !== this._generation(deviceId)) return [];
+    const running = this._cachedConfig(deviceId)?.experiments || [];
+    const tags = [];
+    for (const row of running) {
+      if (exposure.keys.has(row.key) && EXPERIMENT_KEY.test(row.key) && VARIANT_NAME.test(row.variant)) {
+        tags.push([row.key, row.variant]);
+      }
+    }
+    return tags;
+  }
+
+  /**
+   * A typed config read: the first one in a session exposes every running
+   * experiment (the config answer does not say which key belongs to which),
+   * tags this session's later events and sends one `rs_exposure`.
+   */
+  _markExposed(deviceId, document) {
+    const experiments = document && Array.isArray(document.experiments) ? document.experiments : [];
+    if (experiments.length === 0 || !this.isActive) return;
+    const generation = this._generation(deviceId);
+    let exposure = this._exposures.get(deviceId);
+    if (!exposure || exposure.generation !== generation) {
+      exposure = { generation, keys: new Set() };
+      this._exposures.set(deviceId, exposure);
+    }
+    let added = false;
+    for (const row of experiments) {
+      if (!exposure.keys.has(row.key)) {
+        exposure.keys.add(row.key);
+        added = true;
+      }
+    }
+    if (added) this.track('rs_exposure', {}, deviceId === this.deviceId ? undefined : { deviceId });
+  }
+
+  // --- Persisted queue ------------------------------------------------------
+
+  /** Whether this client may keep a queue on disk or in storage at all. */
+  get _queueAllowed() {
+    return this.persistQueue && this._hasKey && this._consented && !this._playtestToken;
+  }
+
+  /** Opens the store and reads it back once. A bad file is an empty queue, never a crash. */
+  _openQueue(modules) {
+    if (this._queueOpened || !this._queueAllowed) return;
+    const store = makeQueueStore(this._storage, this._injectedStorage, this.ingestKey, this._queueDir, modules);
+    if (!store) return;
+    this._queueStore = store;
+    this._queueOpened = true;
+    let text = null;
+    try {
+      text = store.read();
+    } catch (_err) {
+      text = null;
+    }
+    const restored = this._parseQueue(text);
+    if (restored.length > 0) {
+      this.queue = restored.concat(this.queue);
+      this.stats.restored += restored.length;
+      while (this.queue.length > Math.min(this.maxQueueSize, MAX_PERSISTED_EVENTS)) {
+        this.queue.shift();
+        this.stats.dropped += 1;
+      }
+    }
+  }
+
+  /** Node without process.getBuiltinModule: load the file modules once, then open. */
+  async _openQueueAsync() {
+    if (this._queueOpened || !this._queueAllowed || isBrowser() || this._injectedStorage) return;
+    try {
+      const loaded = await Promise.all([import('node:fs'), import('node:path'), import('node:os')]);
+      this._openQueue({ fs: loaded[0], path: loaded[1], os: loaded[2] });
+      this._schedulePersist();
+    } catch (_err) {
+      // No file system: the queue stays in memory.
+    }
+  }
+
+  /** Queue items from the stored text: version 1 or 2, oldest first, 89 days, 500 events, unconfirmed past 23 hours dropped. */
+  _parseQueue(text) {
+    if (!text) return [];
+    let doc;
+    try {
+      doc = JSON.parse(text);
+    } catch (_err) {
+      return [];
+    }
+    if (!doc || typeof doc !== 'object' || (doc.version !== 1 && doc.version !== 2) || !Array.isArray(doc.groups)) return [];
+    const now = this._clock();
+    const items = [];
+    for (const group of doc.groups) {
+      if (!group || !Array.isArray(group.events)) continue;
+      const origin = doc.version === 2 && group.origin && typeof group.origin === 'object' && typeof group.origin.session === 'string'
+        ? group.origin : null;
+      const deviceId = isNonEmptyString(group.deviceId) ? group.deviceId : this.deviceId;
+      for (const raw of group.events) {
+        if (!raw || !isNonEmptyString(raw.event)) continue;
+        // A version 1 queue may hold seconds; read them as milliseconds.
+        let timestamp = Number(raw.timestamp);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) continue;
+        if (timestamp < 1e11) timestamp *= 1000;
+        if (now - timestamp > MAX_QUEUE_AGE_MS) {
+          this.stats.expired += 1;
+          continue;
+        }
+        const unconfirmedAt = Number(raw.unconfirmedAt);
+        if (Number.isFinite(unconfirmedAt) && unconfirmedAt > 0 && now - unconfirmedAt > UNCONFIRMED_RESEND_MS) continue;
+        const data = raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : {};
+        const item = { event: raw.event, data, timestamp, deviceId, origin };
+        if (Number.isFinite(unconfirmedAt) && unconfirmedAt > 0) item.unconfirmedAt = unconfirmedAt;
+        items.push(item);
+      }
+    }
+    if (items.length > MAX_PERSISTED_EVENTS) {
+      this.stats.dropped += items.length - MAX_PERSISTED_EVENTS;
+      items.splice(0, items.length - MAX_PERSISTED_EVENTS);
+    }
+    return items;
+  }
+
+  /** The queue as stored text, or '' when empty. Groups by device and origin, keeping order within each. */
+  _serializeQueue() {
+    const all = this._unconfirmed.concat(this.queue);
+    if (all.length === 0) return '';
+    const kept = all.slice(Math.max(0, all.length - MAX_PERSISTED_EVENTS));
+    const groups = [];
+    const byKey = new Map();
+    for (const item of kept) {
+      const key = item.deviceId + '\u0000' + (item.origin ? item.origin.session : '');
+      let group = byKey.get(key);
+      if (!group) {
+        group = { deviceId: item.deviceId, events: [] };
+        if (item.origin) group.origin = item.origin;
+        byKey.set(key, group);
+        groups.push(group);
+      }
+      const event = { event: item.event, timestamp: item.timestamp, data: item.data };
+      if (item.unconfirmedAt) event.unconfirmedAt = item.unconfirmedAt;
+      group.events.push(event);
+    }
+    return JSON.stringify({ version: QUEUE_FORMAT_VERSION, groups });
+  }
+
+  /** Writes the queue once after the current burst of changes. */
+  _schedulePersist() {
+    if (!this._queueStore || this._persistPending) return;
+    this._persistPending = true;
+    const run = () => {
+      this._persistPending = false;
+      this._persistNow();
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(run);
+    else Promise.resolve().then(run);
+  }
+
+  /** Writes the queue now, atomically; an empty queue removes the entry. */
+  _persistNow() {
+    if (!this._queueStore) return false;
+    try {
+      const text = this._queueAllowed ? this._serializeQueue() : '';
+      if (text) this._queueStore.write(text);
+      else this._queueStore.remove();
+      return true;
+    } catch (_err) {
+      // Full or blocked storage: the queue in memory is unaffected.
+      return false;
+    }
   }
 
   /** Extra data first, then the kind and every given typed key, so reserved keys win. */
@@ -911,7 +1806,7 @@ export class Ravensight {
               'rs_kind ' + JSON.stringify(value) + ' is not one of ' + RS_KINDS.join(', ') +
               '; the dashboard falls back to the event name';
           }
-        } else if (!KNOWN_RS_KEYS.includes(key)) {
+        } else if (!KNOWN_RS_KEYS.includes(key) && !key.startsWith('rs_exp_')) {
           problem = key + ' is not a key Ravensight reads; keys starting with rs_ are reserved';
         }
         if (!problem) continue;
@@ -932,13 +1827,19 @@ export class Ravensight {
    * @returns {Promise<{sent: number, queued: number, skipped?: string}>}
    */
   async flush(options = {}) {
-    const force = Boolean(options && options.force);
+    // An explicit flush cuts a backoff wait short; a server Retry-After is
+    // never cut short. Timers and the batch threshold use _autoFlush.
+    const respectBackoff = Boolean(options && options.respectBackoff);
 
     if (!this._canSend) return { sent: 0, queued: this.queue.length, skipped: 'inactive' };
     if (this.queue.length === 0) return { sent: 0, queued: 0 };
     if (this._flushing) return { sent: 0, queued: this.queue.length, skipped: 'in-progress' };
-    if (!force && this._clock() < this._nextAttemptAt) {
-      return { sent: 0, queued: this.queue.length, skipped: 'backoff' };
+    if (this._sendBlocked) return { sent: 0, queued: this.queue.length, skipped: 'refused' };
+    const now = this._clock();
+    if (now < this._retryAfterUntil) return { sent: 0, queued: this.queue.length, skipped: 'retry_after' };
+    if (now < this._nextAttemptAt) {
+      if (respectBackoff) return { sent: 0, queued: this.queue.length, skipped: 'backoff' };
+      this._nextAttemptAt = 0;
     }
 
     this._flushing = true;
@@ -952,7 +1853,12 @@ export class Ravensight {
   /** Waits out a flush already in flight, then forces one more. */
   async _flushAfterInflight() {
     if (this._flushPromise) await this._flushPromise.catch(noop);
-    return this.flush({ force: true });
+    return this.flush();
+  }
+
+  /** A flush from a timer or the batch threshold: it waits out any backoff. */
+  _autoFlush() {
+    this.flush({ respectBackoff: true }).catch(noop);
   }
 
   /** Prepare once, then reuse this object for retries. Never captures the screen automatically. */
@@ -1178,6 +2084,8 @@ export class Ravensight {
         if (this.deviceId == null) this.deviceId = this._loadOrCreateDeviceId();
         else if (this._deviceIdUnsaved) this._persistDeviceId(this.deviceId);
         this._deviceIdUnsaved = false;
+        this._openQueue();
+        this._bindErrorCapture();
       } else if (!next && this._consented) {
         this._consented = false;
         this._writeOptIn(false);
@@ -1190,6 +2098,8 @@ export class Ravensight {
       this._configs.clear();
       this.stats.dropped += this.queue.length;
       this.queue.length = 0;
+      this._unconfirmed.length = 0;
+      this._persistNow();
       this._stopTimer();
       this._stopFrameLoop();
     } else if (this.initialized && this.trackingEnabled) {
@@ -1203,6 +2113,7 @@ export class Ravensight {
       this._startPerformance();
       this._startFrameLoop();
     }
+    if (next && this._deviceIdCreated) this._captureUtm();
   }
 
   /** The same as setEnabled, under the name the LÖVE SDK uses. */
@@ -1377,6 +2288,7 @@ export class Ravensight {
     this._disposing = true;
     this._stopTimer();
     this._unbindLifecycle();
+    this._unbindErrorCapture();
 
     this._disposePromise = this._finishDispose(flush, timeoutMs);
     return this._disposePromise;
@@ -1408,14 +2320,20 @@ export class Ravensight {
       }
     }
 
-    const dropped = this.queue.length;
+    // With a persisted queue, what is left stays stored for the next launch
+    // and is not lost. Without one it is dropped.
+    const left = this.queue.length;
+    const kept = this._queueStore && this._queueAllowed && this._persistNow() ? left : 0;
+    const dropped = left - kept;
     this.stats.dropped += dropped;
     this.queue.length = 0;
+    this._unconfirmed.length = 0;
+    this._queueStore = null;
     this._disposed = true;
     this._sessions.clear();
     this._configGeneration += 1;
     this._configs.clear();
-    return { sent, dropped };
+    return { sent, dropped, kept };
   }
 
   // --- Session ------------------------------------------------------------
@@ -1494,6 +2412,11 @@ export class Ravensight {
         joinOutcome: null,
         joinPending: null,
         synthetic: null,
+        /** The /session answer's origin, stored with what is queued under it. */
+        origin: null,
+        /** { secret, offsetSeconds } on a signing session; memory only. */
+        signing: null,
+        opened: false,
       };
       this._sessions.set(deviceId, entry);
       // Never the entry being created: the caller is about to use it.
@@ -1537,6 +2460,8 @@ export class Ravensight {
     const body = { deviceId, gameVersion: this.gameVersion, platform: this.platform, sdk: 'js/' + VERSION };
     if (joinToken) body.joinToken = joinToken;
     if (this.distribution) body.distribution = this.distribution;
+    const device = this._deviceFields();
+    if (device) body.device = device;
 
     const res = await this._request('POST', '/session', { headers, body });
 
@@ -1555,8 +2480,11 @@ export class Ravensight {
         entry.synthetic = synthetic;
       }
       entry.joinToken = null;
+      if (entry.opened) this._sessionGenerations.set(deviceId, this._generation(deviceId) + 1);
+      entry.opened = true;
       entry.token = token;
       entry.expiresAt = this._resolveExpiry(res.body);
+      this._adoptSessionAnswer(deviceId, entry, res.body);
       // The entry may have been evicted meanwhile; put it back.
       if (this._sessions.get(deviceId) !== entry) this._sessions.set(deviceId, entry);
       this.stats.sessions += 1;
@@ -1630,6 +2558,8 @@ export class Ravensight {
   _disableTracking() {
     this.trackingEnabled = false;
     this.queue.length = 0;
+    this._unconfirmed.length = 0;
+    this._persistNow();
     this._stopTimer();
     this._log('tracking disabled by server kill switch');
   }
@@ -1643,6 +2573,8 @@ export class Ravensight {
     this._invalidKey = true;
     this.stats.dropped += this.queue.length;
     this.queue.length = 0;
+    this._unconfirmed.length = 0;
+    this._persistNow();
     this._stopTimer();
     if (!this._invalidKeyWarned && typeof console !== 'undefined') {
       this._invalidKeyWarned = true;
@@ -1664,6 +2596,52 @@ export class Ravensight {
     return this._errorCode(res, fallback);
   }
 
+  /**
+   * Keeps the session answer's `origin` (stored with the queue, exactly as
+   * received) and `signing` (memory only: the secret is never persisted),
+   * and gives every event this device queued before the session opened
+   * this session's origin.
+   */
+  _adoptSessionAnswer(deviceId, entry, body) {
+    const origin = body && body.origin && typeof body.origin === 'object' && typeof body.origin.session === 'string'
+      ? body.origin : null;
+    entry.origin = origin;
+    const signing = body && body.signing;
+    if (signing && typeof signing === 'object' && typeof signing.secret === 'string' && signing.secret) {
+      const serverTime = Number(signing.serverTime);
+      entry.signing = {
+        secret: signing.secret,
+        offsetSeconds: Number.isFinite(serverTime) ? Math.round(serverTime - this._clock() / 1000) : 0,
+      };
+    } else {
+      entry.signing = null;
+    }
+    if (!origin) return;
+    let changed = false;
+    for (const item of this.queue) {
+      if (item.deviceId === deviceId && !item.origin) {
+        item.origin = origin;
+        changed = true;
+      }
+    }
+    if (changed) this._schedulePersist();
+  }
+
+  /** The /session `device` object: the game's own values over what the platform tells, or null when nothing is known. */
+  _deviceFields() {
+    if (!this._device) {
+      const found = probeDevice();
+      const own = this._deviceOverride || {};
+      const device = {};
+      for (const key of ['model', 'osVersion', 'gpu']) {
+        const value = deviceField(own[key] != null ? own[key] : found[key]);
+        if (value) device[key] = value;
+      }
+      this._device = device;
+    }
+    return Object.keys(this._device).length > 0 ? Object.assign({}, this._device) : null;
+  }
+
   _resolveExpiry(body) {
     if (body.expiresAt != null) {
       if (typeof body.expiresAt === 'number' && Number.isFinite(body.expiresAt)) {
@@ -1679,13 +2657,42 @@ export class Ravensight {
 
   // --- Flushing -----------------------------------------------------------
 
+  /**
+   * The events of one request as the server takes them: `event`, `data`,
+   * `timestamp`, and `origin` when the event was queued under an earlier
+   * session than the one sending it (copied verbatim, never rebuilt).
+   */
+  _wireBatch(items, currentOrigin) {
+    return items.map((item) => {
+      const wire = { event: item.event, data: item.data, timestamp: item.timestamp };
+      if (item.origin && (!currentOrigin || item.origin.session !== currentOrigin.session)) wire.origin = item.origin;
+      return wire;
+    });
+  }
+
+  /** The signature headers for `bodyText` under a signing session, or an empty object. */
+  _signatureHeaders(entry, bodyText) {
+    if (!entry || !entry.signing) return {};
+    const timestamp = Math.floor(this._clock() / 1000) + entry.signing.offsetSeconds;
+    return {
+      'X-Ravensight-Timestamp': String(timestamp),
+      'X-Ravensight-Signature': signRequest(entry.signing.secret, timestamp, bodyText),
+    };
+  }
+
+  /**
+   * Sends the queue in batches of at most 50 under the delivery contract's
+   * response table (section 4.1). Events leave the queue, and the removal is
+   * stored, only after a 2xx or a 400 that names them.
+   */
   async _drain() {
     let sent = 0;
     let batchLimit = MAX_BATCH_SIZE;
-    let reauthAttempts = 0;
+    let unauthorizedInRow = 0;
+    let plainOnce = false;
 
     while (this.queue.length > 0) {
-      if (this._clock() < this._nextAttemptAt) break;
+      if (this._clock() < this._nextAttemptAt || this._sendBlocked) break;
 
       // One request carries one device: the leading run sharing the head's id.
       const deviceId = this.queue[0].deviceId;
@@ -1702,64 +2709,103 @@ export class Ravensight {
       // token; re-evaluate the head run instead.
       if (this.queue[0].deviceId !== deviceId) continue;
 
+      const entry = this._sessions.get(deviceId);
       const size = Math.min(batchLimit, this._runLength(0));
+      const bodyText = JSON.stringify({ events: this._wireBatch(this.queue.slice(0, size), entry && entry.origin) });
+      const headers = Object.assign({ 'X-Session-Token': token }, this._signatureHeaders(entry, bodyText));
       this._inflightSize = size;
       let res;
       try {
-        res = await this._request('POST', '/track/batch', {
-          headers: { 'X-Session-Token': token },
-          body: { events: wireEvents(this.queue.slice(0, size)) },
-        });
+        res = await this._request('POST', '/track/batch', { headers, rawBody: bodyText, compress: !plainOnce });
       } finally {
         this._inflightSize = 0;
       }
+      plainOnce = false;
 
       // dispose() timed out while this batch was in flight and has already
       // counted the queue as dropped. Leave the cleared queue alone.
       if (this._disposed) break;
 
-      if (res.status !== 202) this._recordError(this._failureCode(res, 'batch_failed'), res.status);
+      const status = res.status;
+      const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
+      if (status < 200 || status >= 300) this._recordError(this._failureCode(res, 'batch_failed'), status);
 
-      if (res.status === 202) {
+      if (status >= 200 && status < 300) {
+        // Remove first and store the removal, so a crash now resends little.
         this.queue.splice(0, size);
+        this._persistNow();
         sent += size;
         this.stats.sent += size;
         this.stats.flushes += 1;
         batchLimit = MAX_BATCH_SIZE;
-        reauthAttempts = 0;
+        unauthorizedInRow = 0;
         this._resetBackoff();
         continue;
       }
 
-      if (res.status === 401) {
-        // That device's session expired or was revoked. Its events stay
-        // queued and are re sent as soon as a fresh session is issued.
-        this._invalidateSession(deviceId);
-        reauthAttempts += 1;
-        if (reauthAttempts > 2) break;
-        this._log('session expired, re authenticating');
+      if (status === 400) {
+        const index = res.body ? res.body.index : undefined;
+        if (Number.isInteger(index) && index >= 0 && index < size) {
+          // The server named one event it will never take: drop it, resend the rest.
+          this.queue.splice(index, 1);
+          this.stats.dropped += 1;
+          this._persistNow();
+          this._log('dropped one event the server refused (' + (code || 'invalid') + ')');
+          continue;
+        }
+        if (code === 'batch_too_large') {
+          if (size > 1) {
+            batchLimit = Math.max(1, Math.floor(size / 2));
+            this._log('batch too large, splitting to ' + batchLimit);
+            continue;
+          }
+          this._dropHead(1, code);
+          batchLimit = MAX_BATCH_SIZE;
+          continue;
+        }
+        // Any other 400: the request's events will never be accepted.
+        this._dropHead(size, code || 'bad_request');
+        batchLimit = MAX_BATCH_SIZE;
         continue;
       }
 
-      if (res.status === 429) {
-        this._applyRetryAfter(res);
+      if (status === 401) {
+        // Keep the events, open a new session once and resend with the same
+        // ids. A second 401 in a row waits for the backoff.
+        this._invalidateSession(deviceId);
+        unauthorizedInRow += 1;
+        if (unauthorizedInRow >= 2) {
+          this._scheduleBackoff();
+          break;
+        }
+        this._log('session refused (' + (code || '401') + '), opening a new one');
+        continue;
+      }
+
+      if (status === 403) {
+        // Keep the events and stop sending until the next launch.
+        this._sendBlocked = true;
+        this._log('track refused with 403 (' + (code || 'forbidden') + '), sending stops until the next launch');
         break;
       }
 
-      if (res.status === 400) {
-        if (size > 1) {
-          // Payload too large for the server. Halve the batch and retry.
-          batchLimit = Math.max(1, Math.floor(size / 2));
-          this._log('batch rejected as oversize, splitting to ' + batchLimit);
+      if (status === 413 || status === 415) {
+        if (status === 415 && res.compressed) {
+          plainOnce = true;
           continue;
         }
-        // A single event the server will never accept. Drop it so the rest of
-        // the queue is not blocked forever.
-        this.queue.shift();
-        this.stats.dropped += 1;
+        if (status === 413 && size > 1) {
+          batchLimit = Math.max(1, Math.floor(size / 2));
+          continue;
+        }
+        this._dropHead(size, 'payload_too_large');
         batchLimit = MAX_BATCH_SIZE;
-        this._log('dropped one event rejected with HTTP 400');
         continue;
+      }
+
+      if (status === 429 || (status === 503 && this._hasRetryAfter(res))) {
+        this._applyRetryAfter(res);
+        break;
       }
 
       this._scheduleBackoff();
@@ -1767,6 +2813,18 @@ export class Ravensight {
     }
 
     return { sent, queued: this.queue.length };
+  }
+
+  /** Drops the first `count` events as refused for good, and stores the removal. */
+  _dropHead(count, code) {
+    this.queue.splice(0, count);
+    this.stats.dropped += count;
+    this._persistNow();
+    this._log('dropped ' + count + ' event' + (count === 1 ? '' : 's') + ' the server refused (' + code + ')');
+  }
+
+  _hasRetryAfter(res) {
+    return parseRetryAfterMs(res.headers ? res.headers.get('retry-after') : null) > 0;
   }
 
   /** How many events from `offset` share that event's device id, capped at one batch. */
@@ -1787,13 +2845,15 @@ export class Ravensight {
   _resetBackoff() {
     this._backoffMs = DEFAULT_RETRY_MS;
     this._nextAttemptAt = 0;
+    this._retryAfterUntil = 0;
   }
 
-  /** The backoff wait with plus or minus 20 percent jitter, never past the 5 minute ceiling. */
+  /** The backoff wait times a jitter factor in [0.5, 1), never past the 5 minute ceiling. */
   _scheduleBackoff() {
     let r = Number(this._random());
     if (!(r >= 0 && r < 1)) r = 0.5;
-    const factor = 1 - BACKOFF_JITTER + 2 * BACKOFF_JITTER * r;
+    // A factor in [0.5, 1), so devices that failed together do not retry together.
+    const factor = 0.5 + 0.5 * r;
     const wait = Math.min(Math.round(this._backoffMs * factor), MAX_BACKOFF_MS);
     this._nextAttemptAt = this._clock() + wait;
     this._backoffMs = Math.min(this._backoffMs * 2, MAX_BACKOFF_MS);
@@ -1802,7 +2862,9 @@ export class Ravensight {
   _applyRetryAfter(res) {
     const wait = parseRetryAfterMs(res.headers ? res.headers.get('retry-after') : null);
     if (wait > 0) {
+      // Exactly the server's wait: never less, never jittered.
       this._nextAttemptAt = this._clock() + wait;
+      this._retryAfterUntil = this._nextAttemptAt;
       this._log('rate limited, honoring Retry-After of ' + wait + 'ms');
       return;
     }
@@ -1827,10 +2889,15 @@ export class Ravensight {
   /**
    * Builds the request used for the last flush before a page goes away.
    * Pure and side effect free so it can be unit tested without a browser.
+   * `entry` is the session cache entry: its origin decides which events
+   * carry their own, and its signing secret signs the request. A keepalive
+   * fetch carries the signature in headers; a beacon cannot set headers, so
+   * it carries the signed body envelope (contract section 7.4). Neither is
+   * compressed: a page that is going away cannot wait for a compressor.
    */
-  _buildUnloadRequest(events, token, env) {
+  _buildUnloadRequest(events, token, env, entry) {
     const transport = chooseUnloadTransport(env || this._unloadEnv());
-    const body = JSON.stringify({ events: wireEvents(events) });
+    const body = JSON.stringify({ events: this._wireBatch(events, entry && entry.origin) });
     const url = this.apiUrl + '/track/batch';
 
     if (transport === 'fetch-keepalive') {
@@ -1838,13 +2905,19 @@ export class Ravensight {
         transport,
         url,
         body,
-        headers: { 'Content-Type': 'application/json', 'X-Session-Token': token },
+        headers: Object.assign(
+          { 'Content-Type': 'application/json', 'X-Session-Token': token },
+          this._signatureHeaders(entry, body),
+        ),
       };
     }
     if (transport === 'beacon') {
       // sendBeacon cannot set headers, so the token rides INSIDE the JSON
-      // body (never the URL, where proxies and logs could capture it). The
-      // API accepts body.sessionToken on ingest POSTs for exactly this path.
+      // body (never the URL, where proxies and logs could capture it).
+      if (entry && entry.signing) {
+        const t = Math.floor(this._clock() / 1000) + entry.signing.offsetSeconds;
+        return { transport, url, body: JSON.stringify(signedBeaconBody(token, entry.signing.secret, t, body)), headers: null };
+      }
       const parsed = JSON.parse(body);
       parsed.sessionToken = token;
       return {
@@ -1875,16 +2948,24 @@ export class Ravensight {
    * Best effort flush of one batch while the page is being hidden: the run of
    * events sharing the device id at `offset`, under that id's cached session.
    * `offset` skips events already in a batch request awaiting an answer.
+   *
+   * The events leave the in-memory queue, so this page never sends them
+   * again, but stay in the persisted queue marked unconfirmed: a keepalive
+   * answer of 2xx removes them, and otherwise the next launch resends them
+   * within the server's duplicate window, where a copy that did arrive is
+   * dropped as a duplicate.
    */
   _flushOnHidden(offset = 0) {
     // There is no page to hide in Node.
     if (!this._env && !isBrowser()) return false;
-    if (!this._canSend || this.queue.length <= offset) return false;
+    if (!this._canSend || this._sendBlocked || this.queue.length <= offset) return false;
+    if (this._clock() < this._retryAfterUntil) return false;
     const deviceId = this.queue[offset].deviceId;
     if (!this.isSessionValid(deviceId)) return false;
 
+    const entry = this._sessions.get(deviceId);
     const events = this.queue.slice(offset, offset + this._runLength(offset));
-    const req = this._buildUnloadRequest(events, this._sessions.get(deviceId).token);
+    const req = this._buildUnloadRequest(events, entry.token, undefined, entry);
     if (req.transport === 'none') return false;
 
     try {
@@ -1894,18 +2975,30 @@ export class Ravensight {
           headers: req.headers,
           body: req.body,
           keepalive: true,
-        }).catch(noop);
+        }).then((res) => {
+          if (res && res.status >= 200 && res.status < 300) this._confirmUnload(events);
+        }, noop);
       } else {
         const blob =
           typeof Blob === 'function' ? new Blob([req.body], { type: 'application/json' }) : req.body;
         navigator.sendBeacon(req.url, blob);
       }
-      // Optimistic: the page may never come back to confirm delivery.
       this.queue.splice(offset, events.length);
+      const at = Math.floor(this._clock());
+      for (const item of events) item.unconfirmedAt = at;
+      this._unconfirmed.push(...events);
+      this._persistNow();
       return true;
     } catch (_err) {
       return false;
     }
+  }
+
+  /** A keepalive send was answered with a 2xx: its events are delivered. */
+  _confirmUnload(events) {
+    const sent = new Set(events);
+    this._unconfirmed = this._unconfirmed.filter((item) => !sent.has(item));
+    if (this._queueStore) this._persistNow();
   }
 
   _bindLifecycle() {
@@ -1925,6 +3018,7 @@ export class Ravensight {
     if (this._pageHideBound || typeof window === 'undefined' || !window) return;
     if (typeof window.addEventListener !== 'function') return;
     this._onPageHide = () => {
+      if (this._queueStore) this._persistNow();
       if (this._exitSent || !this._startSent) return;
       this._exitSent = true;
       if (!this.track('game_exited')) return;
@@ -1962,9 +3056,7 @@ export class Ravensight {
 
   _startTimer() {
     if (this._timer || !(this.autoFlushMs > 0) || this._invalidKey) return;
-    this._timer = setInterval(() => {
-      this.flush().catch(noop);
-    }, this.autoFlushMs);
+    this._timer = setInterval(() => this._autoFlush(), this.autoFlushMs);
     // Do not hold a Node process open just for analytics.
     if (this._timer && typeof this._timer.unref === 'function') this._timer.unref();
   }
@@ -2073,7 +3165,10 @@ export class Ravensight {
 
   /** No coercion. Objects are copied so a caller cannot mutate cached settings. */
   getConfig(key, fallback, deviceId = this.deviceId) {
-    const values = this._cachedConfig(deviceId)?.values;
+    const document = this._cachedConfig(deviceId);
+    // A typed read is the exposure, not the fetch (EXPOSURE_CONTRACT.md).
+    if (document) this._markExposed(deviceId, document);
+    const values = document?.values;
     if (!values || !Object.prototype.hasOwnProperty.call(values, key)) return fallback;
     const value = values[key];
     if (value === null ? fallback !== null : typeof value !== typeof fallback || Array.isArray(value) !== Array.isArray(fallback)) return fallback;
@@ -2092,9 +3187,20 @@ export class Ravensight {
     const init = { method, headers };
     if (options.signal) init.signal = options.signal;
 
-    if (options.body !== undefined) {
+    let compressed = false;
+    if (options.rawBody !== undefined || options.body !== undefined) {
       headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(options.body);
+      const text = options.rawBody !== undefined ? options.rawBody : JSON.stringify(options.body);
+      init.body = text;
+      // gzip at 1,024 bytes or more; the signature already covers the plain text.
+      if (options.compress && utf8Length(text) >= GZIP_MIN_BYTES) {
+        const zipped = await gzipText(text);
+        if (zipped) {
+          init.body = zipped;
+          headers['Content-Encoding'] = 'gzip';
+          compressed = true;
+        }
+      }
     }
 
     let res;
@@ -2102,7 +3208,7 @@ export class Ravensight {
       res = await this._fetch(this.apiUrl + path, init);
     } catch (err) {
       this._log(method + ' ' + path + ' network error: ' + err.message);
-      return { status: 0, body: null, headers: null };
+      return { status: 0, body: null, headers: null, compressed };
     }
 
     let body = null;
@@ -2113,7 +3219,7 @@ export class Ravensight {
       body = null;
     }
 
-    return { status: res.status, body, headers: res.headers };
+    return { status: res.status, body, headers: res.headers, compressed };
   }
 
   async _checkSettings() {
@@ -2157,6 +3263,7 @@ export class Ravensight {
       // ignore
     }
     const created = 'dev_' + randomId();
+    this._deviceIdCreated = true;
     this._persistDeviceId(created);
     return created;
   }

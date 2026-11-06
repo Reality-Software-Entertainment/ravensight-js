@@ -26,7 +26,7 @@ export interface PlayerReportResult {
 
 export type RsKind =
   | 'level_start' | 'level_complete' | 'death' | 'none'
-  | 'purchase' | 'resource' | 'progression' | 'error' | 'health';
+  | 'purchase' | 'resource' | 'progression' | 'error' | 'health' | 'ad' | 'attribution';
 /** The values the reserved rs_kind property accepts, frozen. Keys starting with rs_ are reserved. */
 export declare const RS_KINDS: readonly RsKind[];
 
@@ -81,6 +81,56 @@ export interface RavensightOptions {
    * taken. Default false.
    */
   performance?: boolean;
+  /**
+   * Keep the queue in storage (a browser's localStorage entry per key, or a file per key in Node) so
+   * events survive a reload, a crash or a lost network. Default true.
+   */
+  persistQueue?: boolean;
+  /** Node only: the directory for the queue file. Default `~/.ravensight`. */
+  queueDir?: string;
+  /**
+   * Capture uncaught errors automatically: window `error` and `unhandledrejection` in a browser,
+   * `uncaughtExceptionMonitor` in Node (exit behaviour unchanged). Default true.
+   */
+  captureErrors?: boolean;
+  /** Device fields to send on POST /session in place of what the SDK finds. Each at most 128 printable characters. */
+  device?: DeviceFields;
+}
+
+export interface DeviceFields {
+  model?: string;
+  osVersion?: string;
+  gpu?: string;
+}
+
+export type AdFormat = 'banner' | 'interstitial' | 'rewarded' | 'native' | 'app_open' | 'other';
+export type AdResult = 'shown' | 'clicked' | 'failed' | 'rewarded';
+export declare const AD_FORMATS: readonly AdFormat[];
+export declare const AD_RESULTS: readonly AdResult[];
+
+export interface AdOptions {
+  /** The game's own placement name, 1 to 100 characters. */
+  placement?: string;
+  /** Whole micros of `currency` as a digit string (1 to 18 digits). Only with result 'shown'. */
+  revenueMicros?: string | number;
+  /** ISO 4217, required with revenueMicros. */
+  currency?: string;
+  /** Overrides the event name (default rs_ad). */
+  event?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface AttributionOptions {
+  /** utm, store_referrer, organic, or a partner name. 1 to 64 characters. */
+  source: string;
+  network?: string;
+  campaign?: string;
+  adset?: string;
+  creative?: string;
+  /** Epoch milliseconds of the click or open. */
+  touchTime?: number;
+  /** Overrides the event name (default rs_attribution). */
+  event?: string;
 }
 
 /** Fields shared by every typed helper. Reserved rs_ keys win over `data`. */
@@ -130,7 +180,7 @@ export interface ErrorOptions extends TypedEventBase {
 export interface TrackedEvent {
   event: string;
   data: Record<string, unknown>;
-  /** Unix seconds. */
+  /** Unix milliseconds, set when the event was tracked. */
   timestamp: number;
   /** The device the event was tracked as. Local only: never sent, the server stamps it from the session. */
   deviceId: string;
@@ -177,7 +227,7 @@ export interface RavensightLastError {
 export interface FlushResult {
   sent: number;
   queued: number;
-  skipped?: 'inactive' | 'in-progress' | 'backoff';
+  skipped?: 'inactive' | 'in-progress' | 'backoff' | 'retry_after' | 'refused';
 }
 
 export interface DisposeOptions {
@@ -190,6 +240,8 @@ export interface DisposeOptions {
 export interface DisposeResult {
   sent: number;
   dropped: number;
+  /** Events left in the persisted queue for the next launch. */
+  kept?: number;
 }
 
 export interface RavensightStats {
@@ -200,6 +252,10 @@ export interface RavensightStats {
   sessions: number;
   /** Cached sessions dropped to stay within maxSessions. */
   sessionsEvicted: number;
+  /** Events read back from the persisted queue at start. */
+  restored: number;
+  /** Persisted events dropped at start as older than 89 days. */
+  expired: number;
   /** The last failed request, from POST /session, GET /settings or a batch. */
   lastError: RavensightLastError | null;
 }
@@ -218,6 +274,25 @@ export declare class MemoryStorage implements RavensightStorage {
 }
 
 export declare function normalizeApiUrl(url?: string): string;
+export declare const MAX_PERSISTED_EVENTS: number;
+export declare const GZIP_MIN_BYTES: number;
+/** 64-bit FNV-1a of the key as 16 hex characters: the queue's storage name. */
+export declare function queueKeyHash(text: string): string;
+/** `v1=` plus the HMAC-SHA256 hex of `v1:<timestamp>:<body>`. */
+export declare function signRequest(secret: string, timestamp: number, body: string): string;
+export declare function signedBeaconBody(sessionToken: string, secret: string, timestamp: number, body: string): {
+  sessionToken: string;
+  signed: { v: 1; t: number; body: string; sig: string };
+};
+/** Event data size as the server measures it. */
+export declare function eventDataBytes(data: Record<string, unknown> | null | undefined): number;
+/** "0.0015" to "1500", on the digits, half up past six decimals. Null when not a decimal. */
+export declare function microsFromDecimalString(text: string | number): string | null;
+/** A mediation callback's double in major units as micros. */
+export declare function microsFromRevenue(value: number): string | null;
+export declare function adFormatFrom(name: string): AdFormat;
+/** An engine stack as contract frames: no message line, 30 frames, paths stripped. */
+export declare function stackFrames(stack: string, options?: { root?: string }): string;
 export declare function parseRetryAfterMs(value: string | null | undefined): number;
 export declare function chooseUnloadTransport(env: {
   hasFetchKeepalive?: boolean;
@@ -279,7 +354,16 @@ export declare class Ravensight {
   trackProgression(options: ProgressionOptions, trackOptions?: TrackOptions): boolean;
   /** Default event name `error`. */
   trackError(options: ErrorOptions, trackOptions?: TrackOptions): boolean;
-  flush(options?: { force?: boolean }): Promise<FlushResult>;
+  /** One ad lifecycle step. False, sending nothing, for a value the server would flag. */
+  trackAd(network: string, format: AdFormat, result: AdResult, options?: AdOptions, trackOptions?: TrackOptions): boolean;
+  /** A paid impression (result 'shown'). */
+  trackAdRevenue(network: string, format: AdFormat, placement: string | null | undefined, revenueMicros: string | number, currency: string, trackOptions?: TrackOptions): boolean;
+  /** Where this install came from. Sent once per device id, across restarts. */
+  setAttribution(options: AttributionOptions): boolean;
+  /** Turns automatic error capture on or off. Off keeps what is already queued. */
+  setCaptureErrors(on: boolean): void;
+  /** An explicit flush cuts a backoff wait short, never a server Retry-After. */
+  flush(): Promise<FlushResult>;
   /** null, undefined and '' mean not given. Rejects with code invalid_category, or invalid_rating unless rating is an integer 1 to 5, before any request. */
   createReport(input: PlayerReportInput): Promise<PreparedReport>;
   captureScreenshot(canvas: HTMLCanvasElement): Promise<Blob>;

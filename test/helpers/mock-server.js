@@ -4,16 +4,22 @@
  * SDK's retry paths are exercised against actual HTTP.
  */
 import http from 'node:http';
+import { gunzipSync } from 'node:zlib';
 
 const MAX_BATCH_SIZE = 50;
 
+/** The parsed JSON body (gzip decoded when the request says so) and its exact text. */
 function readBody(req) {
   return new Promise((resolve) => {
-    let raw = '';
+    const chunks = [];
     req.on('data', (chunk) => {
-      raw += chunk;
+      chunks.push(chunk);
     });
     req.on('end', () => {
+      let buffer = Buffer.concat(chunks);
+      if (req.headers['content-encoding'] === 'gzip') buffer = gunzipSync(buffer);
+      const raw = buffer.toString('utf8');
+      req.rawText = raw;
       if (!raw) return resolve(null);
       try {
         resolve(JSON.parse(raw));
@@ -65,6 +71,10 @@ export async function startMockServer(config = {}) {
     sessionDelayMs: config.sessionDelayMs == null ? 0 : config.sessionDelayMs,
     /** When set, a session opened with a join token answers `synthetic` (true|false) and joined: true. */
     joinSynthetic: config.joinSynthetic == null ? null : config.joinSynthetic,
+    /** When true, every session answer carries an origin { session, build, platform, stamp }. */
+    origins: Boolean(config.origins),
+    /** When true, every session answer carries signing { secret, serverTime }. */
+    signing: Boolean(config.signing),
     seq: 0,
   };
 
@@ -79,6 +89,7 @@ export async function startMockServer(config = {}) {
       query: url.searchParams,
       headers: req.headers,
       body,
+      text: req.rawText,
     });
 
     const path = url.pathname;
@@ -123,6 +134,12 @@ export async function startMockServer(config = {}) {
         expiresIn: state.sessionExpiresIn,
         expiresAt: Math.floor(Date.now() / 1000) + state.sessionExpiresIn,
       };
+      if (state.origins) {
+        created.origin = { session: 'ses_' + state.seq, build: body && body.gameVersion, platform: body && body.platform, stamp: 'o1.stamp' + state.seq };
+      }
+      if (state.signing) {
+        created.signing = { algorithm: 'HMAC-SHA256', version: 1, secret: 'secret_' + state.seq, serverTime: Math.floor(Date.now() / 1000) };
+      }
       if (body && body.joinToken != null && state.joinSynthetic != null) {
         created.joined = true;
         created.synthetic = state.joinSynthetic;
@@ -147,7 +164,7 @@ export async function startMockServer(config = {}) {
       const events = body && Array.isArray(body.events) ? body.events : null;
       if (!events) return send(res, 400, { error: 'invalid_payload' });
       if (events.length > MAX_BATCH_SIZE) return send(res, 400, { error: 'batch_too_large' });
-      if (events.length > state.maxBatchAccept) return send(res, 400, { error: 'payload_too_large' });
+      if (events.length > state.maxBatchAccept) return send(res, 400, { error: 'batch_too_large' });
       state.events.push(...events);
       state.batches.push({
         token: req.headers['x-session-token'],

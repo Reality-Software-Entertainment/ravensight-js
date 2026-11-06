@@ -23,10 +23,16 @@ test('fetch uses existing ingest endpoint, typed values, clone isolation and ass
   result.values.rules.bonus = 99;
   rs.getConfig('rules', {}).bonus = 100;
   assert.deepEqual(rs.getConfig('rules', {}), { bonus: 2 });
-  rs.track('start', { rs_exp_difficulty: 'forged' });
+  // The first typed read exposed the session: one rs_exposure, carrying the tag.
+  assert.deepEqual(rs.queue.map(row => row.event), ['rs_exposure']);
   assert.equal(rs.queue[0].data.rs_exp_difficulty, 'easy');
+  // A well formed tag of the game's own is left alone; a malformed one is replaced.
+  rs.track('start', { rs_exp_difficulty: 'forged' });
+  assert.equal(rs.queue[1].data.rs_exp_difficulty, 'forged');
+  rs.track('start', { rs_exp_difficulty: 'Not Valid' });
+  assert.equal(rs.queue[2].data.rs_exp_difficulty, 'easy');
   rs.trackPurchase({ amount: 20, currency: 'usd', itemType: 'boost', itemId: 'one' });
-  assert.equal(rs.queue[1].data.rs_exp_difficulty, 'easy');
+  assert.equal(rs.queue[3].data.rs_exp_difficulty, 'easy');
   await rs.dispose({ flush: false });
 });
 test('matching ETag, network failure and malformed document retain last known values', async () => {
@@ -39,7 +45,7 @@ test('matching ETag, network failure and malformed document retain last known va
   next = response(doc({ speed: 'bad' }, [{ key: 'x', variant: 'invalid value' }]));
   await rs.fetchConfig(); assert.equal(rs.getConfig('speed', 0), 3);
   next = response(doc({}, [])); await rs.fetchConfig(); rs.track('after');
-  assert.equal(rs.queue[0].data.rs_exp_difficulty, undefined);
+  assert.equal(rs.queue.find(row => row.event === 'after').data.rs_exp_difficulty, undefined);
   assert.equal(rs.getConfig('speed', 0), 0);
   await rs.dispose({ flush: false });
 });
@@ -70,10 +76,13 @@ test('concurrent requests deduplicate; opt out discards in-flight values and cal
 test('multi-player events use only their own cached assignment and build changes invalidate it', async () => {
   const { rs } = make({ fetch: async url => response(doc({}, [{ key: 'difficulty', variant: new URL(url).searchParams.get('deviceId') === 'player-a' ? 'easy' : 'hard' }])) });
   await rs.fetchConfig(); await rs.fetchConfig('player-b');
+  rs.getConfig('speed', 0); rs.getConfig('speed', 0, 'player-b'); rs.getConfig('speed', 0, 'player-c');
   rs.track('a'); rs.track('b', {}, { deviceId: 'player-b' }); rs.track('c', {}, { deviceId: 'player-c' });
-  assert.deepEqual(rs.queue.map(row => row.data.rs_exp_difficulty), ['easy', 'hard', undefined]);
-  await rs.setDeviceId('player-b'); rs.track('b2'); assert.equal(rs.queue[3].data.rs_exp_difficulty, 'hard');
-  rs.gameVersion = '2'; rs.track('new_build'); assert.equal(rs.queue[4].data.rs_exp_difficulty, undefined);
+  const tagOf = name => rs.queue.find(row => row.event === name).data.rs_exp_difficulty;
+  assert.deepEqual(['a', 'b', 'c'].map(tagOf), ['easy', 'hard', undefined]);
+  assert.equal(rs.queue.filter(row => row.event === 'rs_exposure').length, 2, 'one exposure per exposed player');
+  await rs.setDeviceId('player-b'); rs.track('b2'); assert.equal(tagOf('b2'), 'hard');
+  rs.gameVersion = '2'; rs.track('new_build'); assert.equal(tagOf('new_build'), undefined);
   await rs.dispose({ flush: false });
 });
 test('consent and inert clients make no config requests or storage writes', async () => {

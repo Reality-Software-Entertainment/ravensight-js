@@ -271,7 +271,7 @@ whether `rs.queue` is draining.
 ### `rs.track(event, data?, { deviceId }?)`
 
 Queues an event. Safe to call before `init()`. Returns `false` when tracking is
-off. Timestamps are recorded as unix seconds at the moment of the call, so a
+off. Timestamps are recorded as unix milliseconds at the moment of the call, so a
 delayed flush still reports when the thing actually happened.
 
 `deviceId` sends this one event as another device, under that id's own
@@ -434,8 +434,10 @@ resolves `{ joined: false, reason: 'already_joined' }`; otherwise it resolves
 Shuts the client down. The timer and page listeners stop at once and `track()`
 returns `false` from that moment. By default the queue is then flushed, bounded
 by `timeoutMs`. In a browser, whatever is still queued after that goes out in
-one last best effort keepalive or beacon request. Anything left is dropped and
-counted in `rs.stats.dropped`. Resolves with `{ sent, dropped }`. Events in a
+one last best effort keepalive or beacon request. With the persisted queue on
+(the default), anything left stays stored for the next launch and is counted
+in `kept`; with `persistQueue: false` it is dropped and counted in
+`rs.stats.dropped`. Resolves with `{ sent, dropped, kept }`. Events in a
 request that timed out are counted as dropped even if it later lands, and are
 never sent a second time. Like `flush()`, it sends even if `init()` was never
 called.
@@ -474,6 +476,73 @@ or remove its own call, otherwise every session counts twice. These are the
 same two names the LÖVE SDK sends, so a dashboard covering both platforms
 counts sessions the same way. Playtest sessions run in a browser, so they send
 them too.
+
+## Automatic error capture
+
+On by default; `captureErrors: false` (or `rs.setCaptureErrors(false)` at run
+time) turns it off. Turning it off stops capture; events already queued stay
+queued. Nothing is captured while the client is inert, before an opt-in yes,
+or after an opt-out.
+
+| Where | Event | `rs_severity` |
+|---|---|---|
+| Browser: window `error` | `game_crashed` | `critical` |
+| Browser: `unhandledrejection` | `game_error` | `error` |
+| Node: an uncaught exception, or an unhandled rejection in Node's default mode | `game_crashed` | `critical` |
+
+Each is a typed error event (`rs_kind: 'error'`) with `rs_message` (the error
+type and message) and `rs_stack` (frames only, innermost first). It is written
+to the persisted queue the moment it is captured, so a crash that ends the
+process is sent on the next launch, stamped with the session, build and
+platform of the run that crashed. At most 10 per distinct message and 50 per
+session are captured, so an error raised every frame cannot spend your event
+meter.
+
+In Node the SDK observes `uncaughtExceptionMonitor`, which does not change what
+happens next: the process still prints the error and exits as it would without
+the SDK. One listener serves every client and goes away with the last one.
+
+Limits, stated plainly: a browser cannot report a crash of the tab or the GPU
+process, only script errors; a cross-origin script without CORS reports only
+`Script error.` with no stack. Node native crashes (a segfault in an addon) end
+the process before any JavaScript runs, so they are not captured. There is no
+symbolication: a minified bundle's frames arrive as minified names.
+
+## Ads and attribution
+
+```js
+// A paid impression, in micros of the currency: 0.0015 USD is "1500".
+rs.trackAdRevenue('admob', 'rewarded', 'level_end', '1500', 'USD');
+
+// A mediation callback that reports a double in major units:
+rs.trackAdRevenue('applovin', adFormatFrom(ad.format), ad.placement, microsFromRevenue(ad.revenue), 'USD');
+
+// Clicks, rewards and failures carry no revenue.
+rs.trackAd('admob', 'rewarded', 'rewarded', { placement: 'level_end' });
+
+// Where this install came from, once per device.
+rs.setAttribution({ source: 'store_referrer', network: 'google', campaign: 'spring' });
+```
+
+`trackAd(network, format, result, { placement, revenueMicros, currency })` sends
+one `rs_ad` event. `format` is `banner`, `interstitial`, `rewarded`, `native`,
+`app_open` or `other`; `result` is `shown`, `clicked`, `failed` or `rewarded`.
+Revenue is a digit string of whole micros, sent only with `shown`, always with
+a three letter currency, never converted. `microsFromDecimalString('0.0015')`
+and `microsFromRevenue(0.0015)` both give `"1500"`, working on the decimal
+digits and rounding half up past six decimals, so no float is ever multiplied.
+The helpers return `false` and send nothing for a value the server would flag,
+such as revenue without a currency.
+
+`setAttribution({ source, network, campaign, adset, creative, touchTime })`
+sends one `rs_attribution` event per device id: a flag stored beside the device
+id (`ravensight_attribution_sent`) makes every later call return `false`, across
+restarts. In a browser the SDK does this for you on the first load of a new
+device id when the landing URL has a UTM parameter: `utm_source` becomes the
+network, `utm_campaign` the campaign, `utm_term` the ad set and `utm_content`
+the creative, with source `utm`. No other parameter is read. An attribution
+partner's install callback names the device by `rs.deviceId`; pass it to the
+partner as its customer user id before the partner starts.
 
 ## Public builds
 
@@ -542,8 +611,8 @@ that passes a key and none of these options.
   playtest job) means the key was revoked, rotated or is wrong, so the SDK
   stops for the rest of the run: queue cleared, nothing retried, one
   warning. The next launch tries the key again.
-* **Jitter.** Retry waits vary by plus or minus 20 percent, never past 5
-  minutes. A server's `Retry-After` is obeyed exactly.
+* **Jitter.** Retry waits are multiplied by a random factor between 0.5 and
+  1, never past 5 minutes. A server's `Retry-After` is obeyed exactly.
 * **Events whose data is over 8,192 bytes** as JSON are dropped by `track()`
   with one warning and never sent.
 
@@ -558,8 +627,27 @@ the session sends `deviceId`, `gameVersion`, `platform` and, when set,
 The SDK generates a random device id on first run (`crypto.randomUUID`
 where available) and stores it in `localStorage` under
 `ravensight_device_id`. No hardware identifier, advertising id, IP based
-fingerprint or personal data is collected by the SDK itself. Only the
-events you choose to send leave the browser.
+fingerprint or personal data is collected by the SDK itself. Besides the
+events you send, the SDK sends:
+
+* **Device fields**, once per session on `POST /session`: `gpu`, the WebGL
+  renderer name, in a browser where `WEBGL_debug_renderer_info` answers
+  without a prompt; `osVersion`, the OS release, in Node. The device model is
+  never probed on the web. Each value is at most 128 printable characters and
+  none is a hardware identifier. Pass `device: { model, osVersion, gpu }` to
+  send your own values instead. The server derives the country itself; the SDK
+  never sends one.
+* **Crash data**, when automatic capture is on (the default): for each
+  uncaught error, its type and message (cut to 200 characters) and up to 30
+  stack frames (cut to 2,000 characters), with URL hosts, the working
+  directory and home directory names stripped from paths. No variables,
+  memory, environment or command line. See [Automatic error capture](#automatic-error-capture).
+* **Attribution**, once per install: the `utm_source`, `utm_campaign`,
+  `utm_term` and `utm_content` values of the landing URL when any is present,
+  and nothing else from the URL.
+
+The persisted queue holds queued events and each session's opaque origin
+stamp in the same storage; never the session's signing secret.
 
 `rs.setEnabled(false)` stops all sending and discards anything still
 queued, so an opt out does not leave player data sitting in memory.
@@ -623,10 +711,10 @@ function onAnalyticsToggled(checked) {
 | `consent: 'opt_in'` | yes, yes stored as `ravensight_optin` in the storage the device id uses | yes, `ravensight_optin` in the save folder |
 | `distribution` | yes | yes (desktop; on the web the page's SDK sends it) |
 | Refused key | ends the run | ends the run |
-| Retry jitter | plus or minus 20 percent | plus or minus 20 percent |
+| Retry jitter | a factor between 0.5 and 1 (0.6.0) | plus or minus 20 percent |
 | `rs_event_id` | yes | yes |
 | 8,192 byte event cap | dropped at `track()`, `stats.lastError` | dropped, `flush_failed` |
-| Saved queue | no, in memory | yes, sent on the next launch |
+| Saved queue | yes, `localStorage` or a file, sent on the next launch (0.6.0) | yes, sent on the next launch |
 | Batching | timer (`autoFlushMs`, 15 s) | 2 s |
 | Web | native | bridge (`rs.flushOnHidden(inflight)` on exit) |
 
@@ -634,31 +722,57 @@ function onAnalyticsToggled(checked) {
 
 * **Batching.** Up to 50 events per request, the server hard limit. A flush
   keeps sending batches until the queue drains.
-* **Offline queue.** Events accumulate up to `maxQueueSize` (default 500). Past
-  that the oldest are dropped so the newest are always kept.
-* **Never dropped on failure.** Events are only removed from the queue after the
-  server answers `202`.
+* **Persisted queue.** On by default. In a browser the queue lives in one
+  `localStorage` entry per ingest key (`ravensight_queue_<hash>`), written on
+  every change and on `pagehide`; in Node it is one file per key,
+  `~/.ravensight/queue-<hash>.json` (or `queueDir`), written through a
+  temporary file and a rename so a partial write never replaces a good one.
+  It is read back once at start, so events survive a reload, a crash, a closed
+  tab or a lost network. At most 500 events are kept (the oldest go first) and
+  anything older than 89 days is dropped at start and counted in
+  `stats.expired`. `persistQueue: false` keeps the queue in memory only. Two
+  tabs of the same game share one entry, so the last tab to write wins.
+* **Original session, build and platform.** Each event remembers the session
+  it was tracked under (the `origin` the server returned with that session).
+  An event sent on a later launch carries that origin, so the server stores it
+  under the run it happened in, not the one that sent it. The origin is opaque,
+  is kept only with the queue and is never logged.
+* **Timestamps.** Every event carries the unix milliseconds of the moment it
+  was tracked, never the moment it was sent.
+* **Removed only once delivered.** An event leaves the queue, and the removal
+  is written to storage, only after a `2xx`, or a `400` that names it by
+  `index`. Everything else keeps it.
 * **One device per batch.** Each request carries the leading run of queued
   events that share one device id, under that id's session.
-* **Session expiry.** A `401` clears that device's session only, opens a new
-  one and re sends the same batch.
+* **Answers.** `400` with `index` drops that event and resends the rest;
+  `400 batch_too_large` halves the batch, and a single event still too large is
+  dropped; any other `400` drops the request's events. A `401` opens one new
+  session and resends with the same ids; a second `401` in a row waits for the
+  backoff. A `403` keeps the events and stops sending until the next launch.
+  `413` splits the batch; `415` resends once uncompressed. `429`, and `503`
+  with `Retry-After`, wait exactly the server's `Retry-After`. Anything else
+  backs off.
+* **Backoff.** From 10 seconds, doubling to a 5 minute ceiling, each wait
+  multiplied by a random factor between 0.5 and 1 so devices that failed
+  together do not retry together. `rs.flush()` cuts a backoff short; nothing
+  cuts a `Retry-After` short.
+* **Compression.** A request body of 1,024 bytes or more is sent gzip
+  compressed (`Content-Encoding: gzip`). Page-hide sends are never compressed.
+* **Signed requests.** When `POST /session` answers with `signing` (sessions
+  opened with a public key), every batch is signed with that session's secret:
+  `X-Ravensight-Timestamp` and `X-Ravensight-Signature: v1=<hex>`, an
+  HMAC-SHA256 of `v1:<timestamp>:<body>` over the uncompressed body, with the
+  device clock corrected by the server's time. The secret is kept in memory
+  only. A beacon, which cannot set headers, carries the signed body envelope
+  instead.
 * **Invalid key.** A key refused by the settings check or `POST /session`
   ends the run: the queue is cleared and nothing is retried.
-* **Rate limits.** A `429` honors `Retry-After` in seconds, exactly. With no such
-  header, and after any other failure, the SDK backs off exponentially from 10
-  seconds up to a 5 minute ceiling, each wait varied by plus or minus 20
-  percent. The queue is held, never discarded.
-* **Oversize events.** An event whose data is over 8,192 bytes as JSON is
-  dropped by `track()` and never sent.
-* **Oversize batches.** A `400` halves the batch and retries, down to a single
-  event. An event that is still rejected on its own is dropped so it cannot
-  block everything behind it.
-* **No re-send while in flight.** The page-hide flush never sends a batch that
-  is still in flight, so a batch aborted by a real unload can be lost rather
-  than duplicated. A batch whose response is lost, from a network error or a
-  `5xx` after the server already stored it, stays queued and can be sent again
-  on the next flush. It carries the same `rs_event_id` as the first attempt,
-  so the server can recognise it as the same event.
+* **Oversize events.** An event whose data is over 8,192 bytes as the server
+  measures it (JSON bytes, with a typed error's message and stack counted one
+  byte a character) is dropped by `track()` and never sent.
+* **Duplicates.** Every event carries an `rs_event_id`, kept across resends,
+  so a resend whose first copy was stored is dropped by the server as a
+  duplicate within its duplicate window (24 hours by default).
 
 ## Flush on page hide
 
@@ -668,6 +782,14 @@ the page goes hidden. It prefers `fetch` with `keepalive: true` rather than
 batch endpoint authenticates with `X-Session-Token`. `sendBeacon` is used only
 where keepalive is unavailable, and then the token travels inside the JSON body
 as `sessionToken`, never in the URL, where proxies and logs could capture it.
+On a signing session the beacon body is the signed envelope
+`{ sessionToken, signed: { v, t, body, sig } }`.
+
+A page that is going away cannot wait for an answer, so the events of that
+last batch stay in the persisted queue marked unconfirmed. A keepalive answer
+of `2xx` removes them. Otherwise the next launch resends them if it comes
+within 23 hours, inside the server's 24 hour duplicate window, where a copy
+that did arrive is dropped; past that they are presumed delivered.
 
 ## Ravensight Playtest
 
@@ -733,10 +855,18 @@ bounds browser storage; multi-player servers also have a bounded in-memory cache
 No config requests happen before opt-in consent or while tracking is disabled.
 Playtest runs do not read or write the persistent cache.
 
-Active experiment assignments add `rs_exp_<key>` properties to events tracked
-after that config is available, including typed helpers. Already queued events
-keep their original properties. For multi-player servers, call
-`await rs.fetchConfig(playerId)` before tracking that player's experiment events.
+A fetch alone is not an exposure. The first `getConfig` read in a session
+exposes that player to every experiment the config answer lists: the SDK sends
+one `rs_exposure` event, and every event queued after it in that session
+carries `rs_exp_<key>: <variant>` for each, typed helpers included. Events
+queued before the read stay untagged, a new session starts untagged until its
+own first read, and an experiment missing from a later fetch (stopped) is no
+longer tagged. Tags are added when an event is queued, so an event sent later
+from the persisted queue keeps the variant it happened under. A well formed
+`rs_exp_<key>` of your own is left alone; a malformed one is replaced. For
+multi-player servers, call `await rs.fetchConfig(playerId)` and read with
+`getConfig(key, fallback, playerId)` before tracking that player's experiment
+events.
 Changing devices or builds never borrows another context's assignments. An
 unchanged ETag response is free; a fresh config response uses one ordinary event
 from the shared event allowance. Keep safe defaults in the game.
