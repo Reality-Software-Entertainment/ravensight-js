@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **Automatic error capture**, on by default. Uncaught errors, unhandled
+  rejections, failed `fetch` and `XMLHttpRequest` calls to the page's own
+  site (5xx and network failures as `error`, 4xx as `warning`), resource
+  load failures, `console.error` and dead clicks on buttons become `error`
+  events with `rs_source`, `rs_severity`, `rs_message`, optional `rs_stack`
+  and `rs_error_type`. A request is sent as method, host and templated path
+  only (`POST api.example.com/v1/kickoff/:id 500`), never a query, header
+  or body. See "Automatic error capture" in the README.
+* Hooks install when a keyed, consented client is made. Up to 5 boot errors
+  are held in memory until the first settings or session answer, then sent
+  if the game's `errorCapture.enabled` is not false, else discarded. Nothing
+  installs without a key or before the opt-in yes; `setEnabled(false)` and
+  `dispose()` remove every hook and restore every wrapper still in place.
+* Device caps per session: 30 captures, 3 per error, 10 trails, 6 a minute.
+  `stats.errorsCaptured` and `stats.errorsCapped` count them. `ERROR_CAPS`
+  is exported.
+* On-device scrub of every automatic capture (emails, bearer tokens, JWTs,
+  `gt_` keys, long token runs with a digit, IP addresses, home folders, URL
+  queries), exported as `scrubText`. Manual `trackError` text is unchanged.
+* `rs_trail`: the last 20 track calls, console lines and navigations, sent
+  with an error only when the game's trail switch is on.
+* Node: `uncaughtExceptionMonitor` only, exit behaviour unchanged, flush
+  best effort.
+* Options `captureErrors` (default `true`), `captureDeadClicks` (default
+  `true`) and `captureRequestHosts` (default none). Read-only
+  `rs.capturingErrors` and `rs.errorCapture` (`{ enabled, trail }`).
+* `trackError({ errorType })`, sent as `rs_error_type`, cut to 100
+  characters.
+
+### Changed
+
+* A `413` answer to a batch is handled like a `400`: the batch is split and
+  the one event still refused is dropped, never resent as is.
+* When the queue is full, automatic errors are dropped before gameplay
+  events.
+* The SDK resolves the page's native `fetch` under its own wrapper, so its
+  own requests are never observed.
+
 ## 0.5.1 (held)
 
 - Add session-start config fetching, scoped persistent/offline caching, ETags, typed fallback getters and an optional readiness callback.
