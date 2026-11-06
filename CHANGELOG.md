@@ -63,6 +63,9 @@ prerequisites" below.
   available without a prompt, the OS release in Node, or the game's own
   `device` option.
 
+* The README states where the Node queue file lives (the home directory, or
+  `queueDir`) and that browser storage cannot be kept out of backups.
+
 ### Server prerequisites
 
 * `rs_exposure` must be accepted by public keys before this release: add it

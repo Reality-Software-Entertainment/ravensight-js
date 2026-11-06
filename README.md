@@ -713,6 +713,14 @@ events you send, the SDK sends:
 The persisted queue holds queued events and each session's opaque origin
 stamp in the same storage; never the session's signing secret.
 
+**Backups.** In a browser the queue lives in the page's `localStorage`, which
+the SDK cannot keep out of any backup the browser or the player makes. In
+Node the queue file is `~/.ravensight/queue-<hash>.json` in the home directory
+of the user running the process (or `queueDir`); it is included in whatever
+backs up that home directory. It holds origin stamps and scrubbed error
+captures, never a trail or a secret; point `queueDir` at a folder your backups
+skip if that matters for your deployment.
+
 `rs.setEnabled(false)` stops all sending and discards anything still
 queued, so an opt out does not leave player data sitting in memory.
 
