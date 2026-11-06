@@ -391,13 +391,23 @@ const SCRUB_RULES = [
   [/[A-Za-z0-9+/=_-]{32,}/g, (run) => (/\d/.test(run) && !isPathRun(run) ? '[token]' : run)],
 ];
 
-const PATH_WORDS = [/^$/, /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/, /^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$/, /^[A-Z0-9]{1,6}$/];
+const PATH_PARTS = [/^[a-z0-9]+$/, /^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$/, /^[A-Z0-9]{1,6}$/];
 
-/** True when a long run is a path: it has '/' and every piece is empty or a path word under 32 characters. */
+/**
+ * True when a long run is a path: it has '/' and every piece is empty or a
+ * path word under 32 characters. A path word is one or more parts joined by
+ * '_' or '-', each part lowercase, CamelCase or an acronym of 1 to 6
+ * capitals or digits.
+ */
 function isPathRun(run) {
   return (
     run.includes('/') &&
-    run.split('/').every((piece) => piece.length < 32 && PATH_WORDS.some((word) => word.test(piece)))
+    run.split('/').every(
+      (piece) =>
+        piece === '' ||
+        (piece.length < 32 &&
+          piece.split(/[_-]/).every((part) => part !== '' && PATH_PARTS.some((word) => word.test(part)))),
+    )
   );
 }
 
