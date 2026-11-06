@@ -65,6 +65,8 @@ export async function startMockServer(config = {}) {
     sessionDelayMs: config.sessionDelayMs == null ? 0 : config.sessionDelayMs,
     /** When set, a session opened with a join token answers `synthetic` (true|false) and joined: true. */
     joinSynthetic: config.joinSynthetic == null ? null : config.joinSynthetic,
+    /** When set, `errorCapture` on the settings and session answers. */
+    errorCapture: config.errorCapture === undefined ? undefined : config.errorCapture,
     seq: 0,
   };
 
@@ -85,7 +87,9 @@ export async function startMockServer(config = {}) {
 
     if (req.method === 'GET' && path === '/api/v1/settings') {
       if (state.settingsStatus !== 200) return send(res, state.settingsStatus, { error: 'boom' });
-      return send(res, 200, { trackingEnabled: state.trackingEnabled });
+      const settings = { trackingEnabled: state.trackingEnabled };
+      if (state.errorCapture !== undefined) settings.errorCapture = state.errorCapture;
+      return send(res, 200, settings);
     }
 
     if (req.method === 'POST' && path === '/api/v1/session') {
@@ -123,6 +127,7 @@ export async function startMockServer(config = {}) {
         expiresIn: state.sessionExpiresIn,
         expiresAt: Math.floor(Date.now() / 1000) + state.sessionExpiresIn,
       };
+      if (state.errorCapture !== undefined) created.errorCapture = state.errorCapture;
       if (body && body.joinToken != null && state.joinSynthetic != null) {
         created.joined = true;
         created.synthetic = state.joinSynthetic;

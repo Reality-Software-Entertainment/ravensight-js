@@ -345,6 +345,8 @@ const MAX_TRAIL_LINE_CHARS = 120;
 const TRAIL_LINES = 20;
 const MAX_DEAD_CLICK_NAME_CHARS = 60;
 const DEAD_CLICK_MS = 2000;
+/** Captures held in memory before the first settings or session answer. */
+const MAX_BOOT_ERRORS = 5;
 /** After a dead click is reported, no new watch starts for this long. */
 const DEAD_CLICK_COOLDOWN_MS = 30000;
 /** Marks a wrapper so the SDK can find the function it wraps. */
@@ -1000,6 +1002,7 @@ function uninstallErrorHooks() {
   if (!errorHooks.installed) return;
   errorHooks.installed = false;
   stopDeadWatch(errorHooks.deadWatch);
+  errorHooks.deadCooldownUntil = 0;
   const undo = errorHooks.undo;
   errorHooks.undo = [];
   for (let i = undo.length - 1; i >= 0; i--) {
@@ -1133,9 +1136,10 @@ export class Ravensight {
       errorsCapped: 0,
     };
 
-    // Automatic error capture. Installed by init() once the session answer
-    // is in, never without a key, before consent, or with the game's
-    // errorCapture.enabled false.
+    // Automatic error capture. Installed at construction with a key and
+    // consent, so boot errors are caught; at most 5 are held in memory until
+    // the first settings or session answer says capture is on, and dropped
+    // unsent if it says off. Never with the game's errorCapture.enabled false.
     this.captureErrors = opts.captureErrors === undefined ? true : Boolean(opts.captureErrors);
     this.captureDeadClicks = opts.captureDeadClicks === undefined ? true : Boolean(opts.captureDeadClicks);
     if (opts.captureRequestHosts != null && !Array.isArray(opts.captureRequestHosts)) {
@@ -1147,6 +1151,10 @@ export class Ravensight {
     /** The game's switches from the settings and session answers. Absent means enabled, no trail. */
     this.errorCapture = { enabled: true, trail: false };
     this._errorHooked = false;
+    /** True once a settings or session answer has been read. */
+    this._errorAnswered = false;
+    /** Captures waiting for that answer, at most MAX_BOOT_ERRORS. */
+    this._bootErrors = [];
     this._trail = [];
     this._errorCaps = { total: 0, perKey: new Map(), trails: 0, console: 0, deadClick: 0, tokens: ERROR_CAPS.perMinute, refilledAt: this._clock() };
     this._deadClickMs = Number(opts._deadClickMs) > 0 ? Number(opts._deadClickMs) : DEAD_CLICK_MS;
@@ -1200,6 +1208,7 @@ export class Ravensight {
     this._nextSampleAt = 0;
     this._bootMs = null;
     if (this.performance && isBrowser()) this._startPerformance();
+    this._syncErrorCapture();
   }
 
   /** True only while the client is running and collecting: a key, consent, not opted out, not switched off by the server, the key not refused, not disposed. */
@@ -1511,16 +1520,20 @@ export class Ravensight {
   /** Reads `errorCapture: { enabled, trail }` from a settings or session answer. Absent keeps what we had. */
   _readErrorCapture(body) {
     const answer = body && body.errorCapture;
-    if (!answer || typeof answer !== 'object') return;
-    this.errorCapture = { enabled: answer.enabled !== false, trail: answer.trail === true };
-    if (!this.errorCapture.trail) this._trail.length = 0;
+    if (answer && typeof answer === 'object') {
+      this.errorCapture = { enabled: answer.enabled !== false, trail: answer.trail === true };
+      if (!this.errorCapture.trail) this._trail.length = 0;
+    }
+    this._errorAnswered = true;
     this._syncErrorCapture();
+    // Boot errors: sent now that capture is known to be on, else already discarded.
+    const held = this._bootErrors.splice(0);
+    if (this._errorHooked) for (const capture of held) this._captureAuto(capture);
   }
 
   /** Installs or removes this client's hooks to match its state. */
   _syncErrorCapture() {
-    const want =
-      this.captureErrors && this.errorCapture.enabled && this.initialized && this.isActive;
+    const want = this.captureErrors && this.errorCapture.enabled && this.isActive;
     if (want && !this._errorHooked) {
       this._errorHooked = true;
       errorHooks.clients.add(this);
@@ -1528,6 +1541,7 @@ export class Ravensight {
     } else if (!want && this._errorHooked) {
       this._errorHooked = false;
       this._trail.length = 0;
+      this._bootErrors.length = 0;
       errorHooks.clients.delete(this);
       if (errorHooks.clients.size === 0) uninstallErrorHooks();
     }
@@ -1598,6 +1612,12 @@ export class Ravensight {
    */
   _captureAuto(capture) {
     if (!this._errorHooked || !this.isActive) return false;
+    if (!this._errorAnswered) {
+      // Before the first answer: hold, unscrubbed caps applied later on release.
+      if (this._bootErrors.length < MAX_BOOT_ERRORS) this._bootErrors.push(capture);
+      else this.stats.errorsCapped += 1;
+      return false;
+    }
     const caps = this._errorCaps;
     const now = this._clock();
     // Token bucket: 6 a minute, refilled continuously.
