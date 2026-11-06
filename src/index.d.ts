@@ -81,7 +81,33 @@ export interface RavensightOptions {
    * taken. Default false.
    */
   performance?: boolean;
+  /**
+   * Automatic error capture: uncaught errors, unhandled rejections, failed requests, console.error
+   * and, in a browser, dead clicks. Installed by init() once the session answer is in, and only
+   * with a key, consent, and the game's errorCapture.enabled not false. Default true.
+   */
+  captureErrors?: boolean;
+  /** Report a click on a button that changes nothing for 2 seconds. Browser only. Default true. */
+  captureDeadClicks?: boolean;
+  /**
+   * Hosts outside the page's own site whose failed requests may be captured: an exact host
+   * name, or `*.example.com` for its subdomains. Default none.
+   */
+  captureRequestHosts?: string[];
 }
+
+/** Per-session device caps on automatic error capture. */
+export declare const ERROR_CAPS: Readonly<{
+  total: number;
+  perKey: number;
+  trails: number;
+  perMinute: number;
+  console: number;
+  deadClick: number;
+}>;
+
+/** The on-device scrub applied to every automatic capture: emails, tokens, keys, addresses, home paths, URL queries. */
+export declare function scrubText(value: unknown): string;
 
 /** Fields shared by every typed helper. Reserved rs_ keys win over `data`. */
 export interface TypedEventBase {
@@ -125,6 +151,8 @@ export interface ErrorOptions extends TypedEventBase {
   message: string;
   /** Cut to 2000 characters. */
   stack?: string;
+  /** The error's class or type, sent as rs_error_type. Cut to 100 characters. */
+  errorType?: string;
 }
 
 export interface TrackedEvent {
@@ -202,6 +230,10 @@ export interface RavensightStats {
   sessionsEvicted: number;
   /** The last failed request, from POST /session, GET /settings or a batch. */
   lastError: RavensightLastError | null;
+  /** Errors captured automatically and queued. */
+  errorsCaptured: number;
+  /** Automatic captures dropped on the device by the caps. */
+  errorsCapped: number;
 }
 
 export declare class RavensightError extends Error {
@@ -258,6 +290,13 @@ export declare class Ravensight {
   readonly autoEvents: boolean;
   /** True when opt-in performance sampling was requested. */
   readonly performance: boolean;
+  readonly captureErrors: boolean;
+  readonly captureDeadClicks: boolean;
+  readonly captureRequestHosts: readonly string[];
+  /** The game's switches from the settings and session answers. */
+  readonly errorCapture: { enabled: boolean; trail: boolean };
+  /** True while this client's error hooks are installed. */
+  readonly capturingErrors: boolean;
   trackingEnabled: boolean;
   initialized: boolean;
 

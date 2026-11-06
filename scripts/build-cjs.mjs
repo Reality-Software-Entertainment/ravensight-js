@@ -30,6 +30,8 @@ const NAMED_EXPORTS = [
   'normalizeApiUrl',
   'parseRetryAfterMs',
   'chooseUnloadTransport',
+  'ERROR_CAPS',
+  'scrubText',
 ];
 
 for (const name of NAMED_EXPORTS) {

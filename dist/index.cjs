@@ -33,7 +33,7 @@ const KNOWN_RS_KEYS = Object.freeze([
   'rs_status', 'rs_p1', 'rs_p2', 'rs_p3', 'rs_score',
   'rs_amount', 'rs_currency', 'rs_item_type', 'rs_item_id', 'rs_cart', 'rs_transaction_id',
   'rs_flow', 'rs_resource',
-  'rs_severity', 'rs_message', 'rs_stack',
+  'rs_severity', 'rs_message', 'rs_stack', 'rs_source', 'rs_error_type', 'rs_trail',
   'rs_fps_median', 'rs_fps_p10', 'rs_memory_mb', 'rs_boot_ms',
 ]);
 
@@ -323,6 +323,694 @@ function isBrowser() {
   return typeof window !== 'undefined' && typeof document !== 'undefined';
 }
 
+// --- Automatic error capture ----------------------------------------------
+//
+// One set of page hooks shared by every client that has error capture on.
+// The hooks only observe: they chain to whatever was there, never swallow an
+// error, never read a request or response body, and never change what the
+// game's own code sees. Each client applies its own caps.
+
+/** Per-session device caps from the error capture contract. */
+const ERROR_CAPS = Object.freeze({
+  total: 30,
+  perKey: 3,
+  trails: 10,
+  perMinute: 6,
+  console: 5,
+  deadClick: 3,
+});
+const MAX_ERROR_TYPE_CHARS = 100;
+const MAX_TRAIL_CHARS = 1500;
+const MAX_TRAIL_LINE_CHARS = 120;
+const TRAIL_LINES = 20;
+const MAX_DEAD_CLICK_NAME_CHARS = 60;
+const DEAD_CLICK_MS = 2000;
+/** After a dead click is reported, no new watch starts for this long. */
+const DEAD_CLICK_COOLDOWN_MS = 30000;
+/** Marks a wrapper so the SDK can find the function it wraps. */
+const WRAPPED = typeof Symbol === 'function' ? Symbol.for('ravensight.wrapped') : '__ravensightWrapped';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BUTTON_SELECTOR =
+  'button, [role="button"], input[type="button"], input[type="submit"], input[type="reset"], input[type="image"]';
+
+/** The function a Ravensight wrapper stands in for, else `fn` itself. */
+function unwrapFn(fn) {
+  return typeof fn === 'function' && typeof fn[WRAPPED] === 'function' ? fn[WRAPPED] : fn;
+}
+
+/**
+ * The on-device scrub. Same rules as the server's, applied in this order:
+ * a URL loses its query and fragment; bearer tokens, JWT-shaped strings,
+ * `gt_` keys become [token]; emails become [email]; home directories become
+ * ~; IPv4 and IPv6 addresses become [ip]; a run of 32 or more base64 or hex
+ * characters with a digit in it becomes [token].
+ */
+const SCRUB_RULES = [
+  [/([a-z][a-z0-9+.-]*:\/\/[^\s?#'"<>()]+)[?#][^\s'"<>()]*/gi, '$1'],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, '[token]'],
+  [/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?/g, '[token]'],
+  [/\bgt_[A-Za-z0-9_]+/g, '[token]'],
+  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, '[email]'],
+  [/\/(?:Users|home)\/[^/\s:'"()]+/g, '~'],
+  [/\b[A-Za-z]:\\Users\\[^\\\s:'"()]+/gi, '~'],
+  [/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]'],
+  [
+    /(^|[^0-9A-Za-z:.])((?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})(?![0-9A-Za-z:])/g,
+    '$1[ip]',
+  ],
+  // '/' is left out so a long file path is not mistaken for a token, and a
+  // run with no digit is an identifier, not a secret.
+  [/[A-Za-z0-9+=_-]{32,}/g, (run) => (/\d/.test(run) ? '[token]' : run)],
+];
+
+function scrubText(value) {
+  let text = String(value == null ? '' : value);
+  for (const [pattern, replacement] of SCRUB_RULES) text = text.replace(pattern, replacement);
+  return text;
+}
+
+/** Scrub, then cut to `max` characters. */
+function cleanText(value, max) {
+  return cutText(scrubText(value), max);
+}
+
+/** The local dedupe template: numbers, hex runs, UUIDs, URLs and quoted text become placeholders. */
+function messageTemplate(message) {
+  return String(message)
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>')
+    .replace(/(["'`])[^"'`]{0,200}\1/g, '<str>')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>')
+    .replace(/\b[0-9a-f]{8,}\b/gi, '<hex>')
+    .replace(/\d+/g, '<n>');
+}
+
+/** The file of the first stack frame, line and column dropped, or ''. */
+function firstFrame(stack) {
+  if (!stack) return '';
+  for (const line of String(stack).split('\n')) {
+    const match = /([^\s(@]+):\d+:\d+\)?\s*$/.exec(line);
+    if (match) return match[1];
+  }
+  return '';
+}
+
+/** A path with number, long hex and UUID segments replaced by `:id`. */
+function templatePath(pathname) {
+  return String(pathname || '/')
+    .split('/')
+    .map((seg) => (/^\d+$/.test(seg) || /^[0-9a-f]{8,}$/i.test(seg) || UUID_RE.test(seg) ? ':id' : seg))
+    .join('/');
+}
+
+/** The registrable part of a host name, near enough: the last two labels, three for `co.uk` shapes. */
+function siteOf(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  if (!host.includes('.') || host.includes(':') || /^[\d.]+$/.test(host)) return host;
+  const parts = host.split('.');
+  const n = parts.length >= 3 && parts[parts.length - 2].length <= 3 && parts[parts.length - 1].length === 2 ? 3 : 2;
+  return parts.slice(-n).join('.');
+}
+
+/** The class or type of a thrown value, or undefined. */
+function errorTypeOf(value) {
+  try {
+    if (value && typeof value === 'object') {
+      if (typeof value.name === 'string' && value.name) return value.name;
+      if (value.constructor && typeof value.constructor.name === 'string') return value.constructor.name;
+      return undefined;
+    }
+  } catch (_err) {
+    // A hostile getter.
+  }
+  return undefined;
+}
+
+/** A short text for any value, without running the game's own toString. */
+function describeValue(value) {
+  try {
+    if (typeof value === 'string') return value;
+    if (value == null || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+      return String(value);
+    }
+    if (typeof value === 'object' && typeof value.message === 'string') {
+      const type = errorTypeOf(value);
+      return type ? type + ': ' + value.message : value.message;
+    }
+    if (typeof value === 'function') return '[function]';
+    if (typeof value === 'symbol') return '[symbol]';
+    const json = JSON.stringify(value);
+    return typeof json === 'string' ? json.slice(0, 400) : '[object]';
+  } catch (_err) {
+    return '[object]';
+  }
+}
+
+/** The shared hook state. Installed while at least one client has capture on. */
+const errorHooks = {
+  clients: new Set(),
+  installed: false,
+  undo: [],
+  /** True between pagehide and pageshow: failures then are the page going away. */
+  pageHidden: false,
+  /** Re-entrancy guard: nothing the SDK does while capturing is captured. */
+  capturing: false,
+  /** Counts requests, navigations and track calls, for the dead click watcher. */
+  activity: 0,
+  /** Forms that fired submit, so a submit button is never a dead click. */
+  submitted: typeof WeakSet === 'function' ? new WeakSet() : null,
+  deadWatch: null,
+  deadCooldownUntil: 0,
+};
+/** API bases of every keyed client: requests to them are the SDK's own. */
+const sdkApiUrls = new Set();
+/** Storage upload URLs the SDK is sending right now. */
+const sdkUploadUrls = new Set();
+
+function isSdkUrl(href) {
+  if (sdkUploadUrls.has(href)) return true;
+  for (const base of sdkApiUrls) {
+    if (href === base || href.startsWith(base + '/') || href.startsWith(base + '?')) return true;
+  }
+  return false;
+}
+
+function eachErrorClient(fn) {
+  if (errorHooks.capturing) return;
+  errorHooks.capturing = true;
+  try {
+    for (const client of errorHooks.clients) {
+      try {
+        fn(client);
+      } catch (_err) {
+        // One client's failure never reaches the game or another client.
+      }
+    }
+  } finally {
+    errorHooks.capturing = false;
+  }
+}
+
+function noteActivity() {
+  errorHooks.activity += 1;
+}
+
+/** { url, method, signal } for an http(s) request that is not the SDK's own, else null. */
+function describeRequest(input, init) {
+  let raw = null;
+  let method = null;
+  let signal = null;
+  if (typeof input === 'string') raw = input;
+  else if (input && typeof input === 'object') {
+    raw = typeof input.url === 'string' ? input.url : typeof input.href === 'string' ? input.href : null;
+    if (typeof input.method === 'string') method = input.method;
+    if (input.signal) signal = input.signal;
+  }
+  if (init && typeof init === 'object') {
+    if (typeof init.method === 'string') method = init.method;
+    if (init.signal) signal = init.signal;
+  }
+  if (raw == null) return null;
+  const base = typeof location !== 'undefined' && location && location.href ? location.href : undefined;
+  const url = new URL(raw, base);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (isSdkUrl(url.href)) return null;
+  return { url, method: (method || 'GET').toUpperCase(), signal };
+}
+
+function isOffline() {
+  try {
+    return typeof navigator !== 'undefined' && navigator && navigator.onLine === false;
+  } catch (_err) {
+    return false;
+  }
+}
+
+/** A finished request: `status` 0 is a network failure. Aborts, unload and offline are not failures. */
+function onRequestFinished(info, status, aborted) {
+  if (aborted || (info.signal && info.signal.aborted)) return;
+  if (errorHooks.pageHidden) return;
+  if (status > 0 && status < 400) return;
+  if (status === 0 && isOffline()) return;
+  eachErrorClient((client) => client._captureRequest(info, status));
+}
+
+function wrapFetch(undo) {
+  const original = globalThis.fetch;
+  if (typeof original !== 'function') return;
+  let live = true;
+  const wrapper = function fetch(input, init) {
+    const result = original.apply(this, arguments);
+    if (!live) return result;
+    try {
+      const info = describeRequest(input, init);
+      if (info && result && typeof result.then === 'function') {
+        noteActivity();
+        // A branch of its own: the game's promise is returned untouched.
+        result.then(
+          (res) => {
+            try {
+              // An opaque (no-cors) answer hides its status: not a failure.
+              if (res && (res.type === 'opaque' || res.type === 'opaqueredirect')) return;
+              onRequestFinished(info, res ? Number(res.status) || 0 : 0, false);
+            } catch (_err) {
+              // ignore
+            }
+          },
+          (err) => {
+            try {
+              onRequestFinished(info, 0, Boolean(err && err.name === 'AbortError'));
+            } catch (_err) {
+              // ignore
+            }
+          },
+        );
+      }
+    } catch (_err) {
+      // An unparseable URL: the original fetch has already answered for it.
+    }
+    return result;
+  };
+  wrapper[WRAPPED] = original;
+  globalThis.fetch = wrapper;
+  undo.push(() => {
+    live = false;
+    if (globalThis.fetch === wrapper) globalThis.fetch = original;
+  });
+}
+
+function wrapXhr(undo) {
+  const Xhr = globalThis.XMLHttpRequest;
+  if (typeof Xhr !== 'function' || !Xhr.prototype) return;
+  const proto = Xhr.prototype;
+  const originalOpen = proto.open;
+  const originalSend = proto.send;
+  if (typeof originalOpen !== 'function' || typeof originalSend !== 'function') return;
+  let live = true;
+  const requests = new WeakMap();
+  const open = function open(method, url) {
+    try {
+      if (live) {
+        const info = describeRequest(String(url), { method: String(method) });
+        const prior = requests.get(this);
+        requests.set(this, { info, aborted: false, watched: prior ? prior.watched : false });
+      }
+    } catch (_err) {
+      requests.delete(this);
+    }
+    return originalOpen.apply(this, arguments);
+  };
+  const send = function send() {
+    try {
+      const state = live ? requests.get(this) : null;
+      if (state && state.info) {
+        noteActivity();
+        state.aborted = false;
+        if (!state.watched) {
+          state.watched = true;
+          const xhr = this;
+          xhr.addEventListener('abort', () => {
+            const s = requests.get(xhr);
+            if (s) s.aborted = true;
+          });
+          xhr.addEventListener('loadend', () => {
+            try {
+              const s = requests.get(xhr);
+              if (!live || !s || !s.info) return;
+              onRequestFinished(s.info, Number(xhr.status) || 0, s.aborted);
+            } catch (_err) {
+              // ignore
+            }
+          });
+        }
+      }
+    } catch (_err) {
+      // Observing must never stop the request.
+    }
+    return originalSend.apply(this, arguments);
+  };
+  open[WRAPPED] = originalOpen;
+  send[WRAPPED] = originalSend;
+  proto.open = open;
+  proto.send = send;
+  undo.push(() => {
+    live = false;
+    if (proto.open === open) proto.open = originalOpen;
+    if (proto.send === send) proto.send = originalSend;
+  });
+}
+
+function wrapConsole(undo) {
+  if (typeof console === 'undefined' || !console) return;
+  for (const [name, level] of [['error', 'error'], ['warn', 'warn']]) {
+    const original = console[name];
+    if (typeof original !== 'function') continue;
+    let live = true;
+    const wrapper = function () {
+      const result = original.apply(this, arguments);
+      if (live) {
+        try {
+          onConsole(level, arguments);
+        } catch (_err) {
+          // ignore
+        }
+      }
+      return result;
+    };
+    wrapper[WRAPPED] = original;
+    console[name] = wrapper;
+    undo.push(() => {
+      live = false;
+      if (console[name] === wrapper) console[name] = original;
+    });
+  }
+}
+
+function onConsole(level, args) {
+  if (errorHooks.capturing) return;
+  const parts = [];
+  let thrown = null;
+  for (let i = 0; i < args.length && i < 8; i++) {
+    const arg = args[i];
+    if (!thrown && arg && typeof arg === 'object' && typeof arg.message === 'string') thrown = arg;
+    parts.push(describeValue(arg));
+  }
+  const text = parts.join(' ');
+  // The SDK's own log lines are never captured.
+  if (text.startsWith('[ravensight]')) return;
+  eachErrorClient((client) => {
+    client._trailLine(level, text);
+    if (level === 'error') {
+      client._captureAuto({
+        source: 'console',
+        severity: 'warning',
+        message: text,
+        type: thrown ? errorTypeOf(thrown) : undefined,
+        stack: thrown && typeof thrown.stack === 'string' ? thrown.stack : undefined,
+      });
+    }
+  });
+}
+
+function onWindowError(event) {
+  if (errorHooks.capturing || !event) return;
+  const target = event.target;
+  const win = typeof window !== 'undefined' ? window : null;
+  if (target && target !== win && typeof target.tagName === 'string') {
+    onResourceError(target);
+    return;
+  }
+  const err = event.error;
+  let message = null;
+  let stack;
+  try {
+    if (err && typeof err === 'object' && typeof err.message === 'string') message = err.message;
+    if (err && typeof err === 'object' && typeof err.stack === 'string') stack = err.stack;
+  } catch (_err) {
+    // A hostile getter.
+  }
+  if (message == null) message = typeof event.message === 'string' && event.message ? event.message : describeValue(err);
+  if (!stack && typeof event.filename === 'string' && event.filename) {
+    stack = 'at ' + event.filename + ':' + (event.lineno || 0) + ':' + (event.colno || 0);
+  }
+  const type = errorTypeOf(err);
+  eachErrorClient((client) =>
+    client._captureAuto({ source: 'uncaught', severity: 'error', message, type, stack }),
+  );
+}
+
+function onResourceError(element) {
+  let raw = '';
+  try {
+    raw = element.currentSrc || element.src || element.href || '';
+  } catch (_err) {
+    return;
+  }
+  if (typeof raw !== 'string' || !raw) return;
+  let info;
+  try {
+    info = describeRequest(raw, null);
+  } catch (_err) {
+    return;
+  }
+  if (!info || errorHooks.pageHidden || isOffline()) return;
+  const tag = element.tagName.toLowerCase();
+  eachErrorClient((client) => client._captureResource(info, tag));
+}
+
+function onUnhandledRejection(event) {
+  if (errorHooks.capturing || !event) return;
+  const reason = event.reason;
+  let message;
+  let stack;
+  try {
+    message =
+      reason && typeof reason === 'object' && typeof reason.message === 'string' ? reason.message : describeValue(reason);
+    if (reason && typeof reason === 'object' && typeof reason.stack === 'string') stack = reason.stack;
+  } catch (_err) {
+    message = '[object]';
+  }
+  const type = errorTypeOf(reason);
+  eachErrorClient((client) =>
+    client._captureAuto({ source: 'unhandled_rejection', severity: 'error', message, type, stack }),
+  );
+}
+
+/** Node: observes an uncaught exception without handling it, so exit behaviour is unchanged. */
+function onNodeUncaught(err, origin) {
+  if (errorHooks.capturing) return;
+  let message;
+  let stack;
+  try {
+    message = err && typeof err === 'object' && typeof err.message === 'string' ? err.message : describeValue(err);
+    if (err && typeof err === 'object' && typeof err.stack === 'string') stack = err.stack;
+  } catch (_err) {
+    message = '[object]';
+  }
+  const source = origin === 'unhandledRejection' ? 'unhandled_rejection' : 'uncaught';
+  const type = errorTypeOf(err);
+  eachErrorClient((client) => {
+    if (client._captureAuto({ source, severity: 'error', message, type, stack })) {
+      // Best effort only: the process usually exits before this answers.
+      client.flush({ force: true }).catch(noop);
+    }
+  });
+}
+
+function onNavigation() {
+  noteActivity();
+  let path = '/';
+  try {
+    path = templatePath(location.pathname);
+  } catch (_err) {
+    // ignore
+  }
+  eachErrorClient((client) => client._trailLine('nav', path));
+}
+
+function onPageHide() {
+  errorHooks.pageHidden = true;
+  noteActivity();
+}
+
+function onPageShow() {
+  errorHooks.pageHidden = false;
+}
+
+function onSubmit(event) {
+  noteActivity();
+  try {
+    if (errorHooks.submitted && event && event.target && typeof event.target === 'object') {
+      errorHooks.submitted.add(event.target);
+    }
+  } catch (_err) {
+    // ignore
+  }
+}
+
+/** The element's accessible name, near enough: aria-label, labelledby, value, text, title, else its tag. */
+function accessibleName(el) {
+  try {
+    const attr = (name) => (typeof el.getAttribute === 'function' ? el.getAttribute(name) : null);
+    const label = attr('aria-label');
+    if (label && label.trim()) return label;
+    const labelledBy = attr('aria-labelledby');
+    if (labelledBy && typeof document.getElementById === 'function') {
+      const text = labelledBy
+        .split(/\s+/)
+        .map((id) => {
+          const node = document.getElementById(id);
+          return node && typeof node.textContent === 'string' ? node.textContent : '';
+        })
+        .join(' ')
+        .trim();
+      if (text) return text;
+    }
+    if (String(el.tagName).toLowerCase() === 'input' && typeof el.value === 'string' && el.value.trim()) {
+      return el.value;
+    }
+    const text = typeof el.textContent === 'string' ? el.textContent.replace(/\s+/g, ' ').trim() : '';
+    if (text) return text;
+    const title = attr('title');
+    if (title && title.trim()) return title;
+  } catch (_err) {
+    // Fall through to the tag.
+  }
+  return String(el.tagName || 'element').toLowerCase();
+}
+
+function isDisabled(el) {
+  try {
+    if (el.disabled === true) return true;
+    if (typeof el.getAttribute === 'function' && el.getAttribute('aria-disabled') === 'true') return true;
+    if (typeof el.matches === 'function' && el.matches(':disabled')) return true;
+  } catch (_err) {
+    // ignore
+  }
+  return false;
+}
+
+function onClick(event) {
+  if (errorHooks.capturing || !event || event.isTrusted === false) return;
+  let watcher = null;
+  for (const client of errorHooks.clients) {
+    if (client.captureDeadClicks) {
+      watcher = client;
+      break;
+    }
+  }
+  if (!watcher || errorHooks.deadWatch || typeof MutationObserver !== 'function') return;
+  const now = Date.now();
+  if (now < errorHooks.deadCooldownUntil) return;
+  let el = null;
+  try {
+    const target = event.target;
+    el = target && typeof target.closest === 'function' ? target.closest(BUTTON_SELECTOR) : null;
+  } catch (_err) {
+    return;
+  }
+  if (!el || isDisabled(el)) return;
+
+  const watch = { el, activity: errorHooks.activity, mutated: false, href: null, observer: null, timer: null };
+  try {
+    watch.href = location.href;
+  } catch (_err) {
+    // ignore
+  }
+  try {
+    watch.observer = new MutationObserver(() => {
+      watch.mutated = true;
+    });
+    watch.observer.observe(document.documentElement || document, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      characterData: true,
+    });
+  } catch (_err) {
+    return;
+  }
+  errorHooks.deadWatch = watch;
+  watch.timer = setTimeout(() => finishDeadWatch(watch), watcher._deadClickMs);
+  if (watch.timer && typeof watch.timer.unref === 'function') watch.timer.unref();
+}
+
+function stopDeadWatch(watch) {
+  if (!watch) return;
+  try {
+    if (watch.observer) watch.observer.disconnect();
+  } catch (_err) {
+    // ignore
+  }
+  if (watch.timer) clearTimeout(watch.timer);
+  if (errorHooks.deadWatch === watch) errorHooks.deadWatch = null;
+}
+
+function finishDeadWatch(watch) {
+  // Read any pending records before deciding: a change made just now counts.
+  try {
+    if (watch.observer && typeof watch.observer.takeRecords === 'function' && watch.observer.takeRecords().length) {
+      watch.mutated = true;
+    }
+  } catch (_err) {
+    // ignore
+  }
+  stopDeadWatch(watch);
+  if (watch.mutated || watch.activity !== errorHooks.activity || errorHooks.pageHidden) return;
+  try {
+    if (watch.href !== null && location.href !== watch.href) return;
+  } catch (_err) {
+    // ignore
+  }
+  const el = watch.el;
+  try {
+    const form = el.form || (typeof el.closest === 'function' ? el.closest('form') : null);
+    if (form && errorHooks.submitted && errorHooks.submitted.has(form)) return;
+  } catch (_err) {
+    // ignore
+  }
+  const tag = String(el.tagName || 'element').toLowerCase();
+  const name = cutText(scrubText(accessibleName(el)).replace(/\s+/g, ' '), MAX_DEAD_CLICK_NAME_CHARS);
+  // No quotes around the name, so the server's template keeps it.
+  const message = 'Dead click: ' + tag + ' ' + name;
+  let reported = false;
+  eachErrorClient((client) => {
+    if (!client.captureDeadClicks) return;
+    if (client._captureAuto({ source: 'dead_click', severity: 'warning', message, type: 'DeadClick' })) reported = true;
+  });
+  if (reported) errorHooks.deadCooldownUntil = Date.now() + DEAD_CLICK_COOLDOWN_MS;
+}
+
+function installErrorHooks() {
+  if (errorHooks.installed) return;
+  errorHooks.installed = true;
+  errorHooks.pageHidden = false;
+  const undo = [];
+  errorHooks.undo = undo;
+  const listen = (target, type, fn, capture) => {
+    try {
+      target.addEventListener(type, fn, capture);
+      undo.push(() => target.removeEventListener(type, fn, capture));
+    } catch (_err) {
+      // A partial environment: that hook is skipped.
+    }
+  };
+  if (isBrowser()) {
+    listen(window, 'error', onWindowError, true);
+    listen(window, 'unhandledrejection', onUnhandledRejection, false);
+    listen(window, 'pagehide', onPageHide, false);
+    listen(window, 'pageshow', onPageShow, false);
+    listen(window, 'popstate', onNavigation, false);
+    listen(window, 'hashchange', onNavigation, false);
+    listen(document, 'click', onClick, true);
+    listen(document, 'submit', onSubmit, true);
+    wrapFetch(undo);
+    wrapXhr(undo);
+    wrapConsole(undo);
+  } else if (typeof process !== 'undefined' && process && typeof process.on === 'function') {
+    // Monitor only: a monitor never handles the error, so the process exits
+    // exactly as it would without the SDK. No unhandledRejection listener,
+    // because adding one changes Node's exit behaviour; a rejection that
+    // Node raises as uncaught reaches the monitor with that origin.
+    process.on('uncaughtExceptionMonitor', onNodeUncaught);
+    undo.push(() => process.removeListener('uncaughtExceptionMonitor', onNodeUncaught));
+  }
+}
+
+function uninstallErrorHooks() {
+  if (!errorHooks.installed) return;
+  errorHooks.installed = false;
+  stopDeadWatch(errorHooks.deadWatch);
+  const undo = errorHooks.undo;
+  errorHooks.undo = [];
+  for (let i = undo.length - 1; i >= 0; i--) {
+    try {
+      undo[i]();
+    } catch (_err) {
+      // ignore
+    }
+  }
+}
+
 /**
  * Ravensight analytics client.
  *
@@ -364,7 +1052,9 @@ class Ravensight {
       opts.maxSessions == null ? DEFAULT_MAX_SESSIONS : Math.max(1, Math.floor(Number(opts.maxSessions)) || 1);
     this.debug = Boolean(opts.debug);
 
-    this._fetch = opts.fetch || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
+    // Never the error capture wrapper: the SDK's own requests are not observed.
+    const nativeFetch = unwrapFn(opts.fetch || (typeof fetch === 'function' ? fetch : null));
+    this._fetch = opts.fetch ? nativeFetch : nativeFetch ? nativeFetch.bind(globalThis) : null;
     if (!this._fetch && this._hasKey) {
       throw new TypeError('Ravensight: no global fetch found. Use Node 18+ or pass `fetch`.');
     }
@@ -437,7 +1127,32 @@ class Ravensight {
       sessionsEvicted: 0,
       /** The last failed request: { code, status, at } with `at` in epoch ms, or null. */
       lastError: null,
+      /** Errors captured automatically and queued. */
+      errorsCaptured: 0,
+      /** Automatic captures dropped on the device by the caps. */
+      errorsCapped: 0,
     };
+
+    // Automatic error capture. Installed by init() once the session answer
+    // is in, never without a key, before consent, or with the game's
+    // errorCapture.enabled false.
+    this.captureErrors = opts.captureErrors === undefined ? true : Boolean(opts.captureErrors);
+    this.captureDeadClicks = opts.captureDeadClicks === undefined ? true : Boolean(opts.captureDeadClicks);
+    if (opts.captureRequestHosts != null && !Array.isArray(opts.captureRequestHosts)) {
+      throw new TypeError('Ravensight: `captureRequestHosts` must be an array of host names');
+    }
+    this.captureRequestHosts = (opts.captureRequestHosts || [])
+      .filter(isNonEmptyString)
+      .map((host) => host.trim().toLowerCase());
+    /** The game's switches from the settings and session answers. Absent means enabled, no trail. */
+    this.errorCapture = { enabled: true, trail: false };
+    this._errorHooked = false;
+    this._trail = [];
+    this._errorCaps = { total: 0, perKey: new Map(), trails: 0, console: 0, deadClick: 0, tokens: ERROR_CAPS.perMinute, refilledAt: this._clock() };
+    this._deadClickMs = Number(opts._deadClickMs) > 0 ? Number(opts._deadClickMs) : DEAD_CLICK_MS;
+    /** Set while the SDK queues its own capture, so it is not a track call or trail line. */
+    this._internalTrack = false;
+    if (this._hasKey) sdkApiUrls.add(this.apiUrl);
 
     this._disposed = false;
     this._disposing = false;
@@ -613,6 +1328,7 @@ class Ravensight {
 
     this._startTimer();
     this._bindLifecycle();
+    this._syncErrorCapture();
 
     if (sessionReady && this.queue.length > 0) {
       this.flush().catch(noop);
@@ -674,18 +1390,40 @@ class Ravensight {
       return false;
     }
 
+    const auto = this._internalTrack;
     if (this.queue.length >= this.maxQueueSize) {
-      this.queue.shift();
+      // Gameplay events keep their place ahead of automatic errors: a full
+      // queue drops the incoming error, or the oldest queued error (never
+      // one in a batch awaiting an answer) before any gameplay event.
+      if (auto) {
+        this.stats.dropped += 1;
+        return false;
+      }
+      let at = -1;
+      for (let i = this._inflightSize; i < this.queue.length; i++) {
+        if (this.queue[i].auto) {
+          at = i;
+          break;
+        }
+      }
+      if (at >= 0) this.queue.splice(at, 1);
+      else this.queue.shift();
       this.stats.dropped += 1;
     }
 
-    this.queue.push({
+    const item = {
       event,
       data: payload,
       timestamp: Math.floor(this._clock() / 1000),
       deviceId,
-    });
+    };
+    if (auto) item.auto = true;
+    this.queue.push(item);
     this.stats.queued += 1;
+    if (!auto && this._errorHooked) {
+      noteActivity();
+      this._trailLine('track', event);
+    }
 
     if (this.queue.length >= MAX_BATCH_SIZE) this.flush().catch(noop);
     return true;
@@ -741,13 +1479,14 @@ class Ravensight {
     return this.track(o.event || 'progression_' + o.status, props, trackOptions);
   }
 
-  /** severity is 'debug', 'info', 'warning', 'error' or 'critical'. Message is cut to 200 characters, stack to 2000. */
+  /** severity is 'debug', 'info', 'warning', 'error' or 'critical'. Message is cut to 200 characters, stack to 2000, errorType to 100. */
   trackError(options, trackOptions) {
     const o = options || {};
     const props = this._typed('error', {
       rs_severity: o.severity,
       rs_message: cutText(o.message, MAX_MESSAGE_CHARS),
       rs_stack: cutText(o.stack, MAX_STACK_CHARS),
+      rs_error_type: cutText(o.errorType, MAX_ERROR_TYPE_CHARS),
     }, o.data);
     return this.track(o.event || 'error', props, trackOptions);
   }
@@ -760,6 +1499,153 @@ class Ravensight {
       if (fields[key] !== undefined) props[key] = fields[key];
     }
     return props;
+  }
+
+  // --- Automatic error capture --------------------------------------------
+
+  /** True while this client's error hooks are installed. */
+  get capturingErrors() {
+    return this._errorHooked;
+  }
+
+  /** Reads `errorCapture: { enabled, trail }` from a settings or session answer. Absent keeps what we had. */
+  _readErrorCapture(body) {
+    const answer = body && body.errorCapture;
+    if (!answer || typeof answer !== 'object') return;
+    this.errorCapture = { enabled: answer.enabled !== false, trail: answer.trail === true };
+    if (!this.errorCapture.trail) this._trail.length = 0;
+    this._syncErrorCapture();
+  }
+
+  /** Installs or removes this client's hooks to match its state. */
+  _syncErrorCapture() {
+    const want =
+      this.captureErrors && this.errorCapture.enabled && this.initialized && this.isActive;
+    if (want && !this._errorHooked) {
+      this._errorHooked = true;
+      errorHooks.clients.add(this);
+      installErrorHooks();
+    } else if (!want && this._errorHooked) {
+      this._errorHooked = false;
+      this._trail.length = 0;
+      errorHooks.clients.delete(this);
+      if (errorHooks.clients.size === 0) uninstallErrorHooks();
+    }
+  }
+
+  /** Adds one line to the trail ring, when the game's trail switch is on. */
+  _trailLine(level, text) {
+    if (!this._errorHooked || !this.errorCapture.trail) return;
+    const flat = String(text).replace(/\s+/g, ' ').trim();
+    const line = '+' + Math.max(0, this._clock() - this._startedAt) + ' ' + level + ' ' + flat;
+    this._trail.push(cleanText(line, MAX_TRAIL_LINE_CHARS));
+    if (this._trail.length > TRAIL_LINES) this._trail.shift();
+  }
+
+  /** The trail as one string, oldest first, cut from the oldest end to 1,500 characters. */
+  _trailText() {
+    const lines = this._trail.slice();
+    let text = lines.join('\n');
+    while (text.length > MAX_TRAIL_CHARS && lines.length > 1) {
+      lines.shift();
+      text = lines.join('\n');
+    }
+    return cutText(text, MAX_TRAIL_CHARS);
+  }
+
+  /** Whether a request to this host may be captured: the page's own site, or a listed host. */
+  _requestHostAllowed(url) {
+    const host = String(url.hostname || '').toLowerCase();
+    for (const listed of this.captureRequestHosts) {
+      if (host === listed) return true;
+      if (listed.startsWith('*.') && host.endsWith(listed.slice(1))) return true;
+    }
+    let pageHost = '';
+    try {
+      pageHost = location.hostname;
+    } catch (_err) {
+      return false;
+    }
+    return Boolean(pageHost) && siteOf(host) === siteOf(pageHost);
+  }
+
+  /** A failed request: `status` 0 is a network failure. */
+  _captureRequest(info, status) {
+    if (!this._requestHostAllowed(info.url)) return false;
+    const message =
+      info.method + ' ' + info.url.host + templatePath(info.url.pathname) + ' ' + (status > 0 ? status : 'network');
+    return this._captureAuto({
+      source: 'request',
+      severity: status === 0 || status >= 500 ? 'error' : 'warning',
+      message,
+    });
+  }
+
+  /** A script, image, style or media file that failed to load. */
+  _captureResource(info, tag) {
+    if (!this._requestHostAllowed(info.url)) return false;
+    return this._captureAuto({
+      source: 'request',
+      severity: 'warning',
+      message: tag + ' ' + info.url.host + templatePath(info.url.pathname) + ' failed',
+      type: 'ResourceError',
+    });
+  }
+
+  /**
+   * Queues one automatic capture after the device caps and the scrub.
+   * Returns true when it was queued. Over a cap it is dropped silently.
+   */
+  _captureAuto(capture) {
+    if (!this._errorHooked || !this.isActive) return false;
+    const caps = this._errorCaps;
+    const now = this._clock();
+    // Token bucket: 6 a minute, refilled continuously.
+    const perMs = ERROR_CAPS.perMinute / 60000;
+    caps.tokens = Math.min(ERROR_CAPS.perMinute, caps.tokens + Math.max(0, now - caps.refilledAt) * perMs);
+    caps.refilledAt = now;
+    const capped = () => {
+      this.stats.errorsCapped += 1;
+      return false;
+    };
+    if (caps.total >= ERROR_CAPS.total || caps.tokens < 1) return capped();
+    if (capture.source === 'console' && caps.console >= ERROR_CAPS.console) return capped();
+    if (capture.source === 'dead_click' && caps.deadClick >= ERROR_CAPS.deadClick) return capped();
+
+    const message = cleanText(capture.message == null ? '' : capture.message, MAX_MESSAGE_CHARS) || '(no message)';
+    const stack = capture.stack ? cleanText(capture.stack, MAX_STACK_CHARS) : '';
+    const type = capture.type ? cleanText(capture.type, MAX_ERROR_TYPE_CHARS) : '';
+    const key = type + '\u0000' + messageTemplate(message) + '\u0000' + firstFrame(stack);
+    const seen = caps.perKey.get(key) || 0;
+    if (seen >= ERROR_CAPS.perKey) return capped();
+
+    const props = {
+      rs_kind: 'error',
+      rs_severity: capture.severity,
+      rs_message: message,
+      rs_source: capture.source,
+    };
+    if (type) props.rs_error_type = type;
+    if (stack) props.rs_stack = stack;
+    const withTrail = this.errorCapture.trail && this._trail.length > 0 && caps.trails < ERROR_CAPS.trails;
+    if (withTrail) props.rs_trail = this._trailText();
+
+    this._internalTrack = true;
+    let queued = false;
+    try {
+      queued = this.track('error', props);
+    } finally {
+      this._internalTrack = false;
+    }
+    if (!queued) return false;
+    caps.total += 1;
+    caps.tokens -= 1;
+    caps.perKey.set(key, seen + 1);
+    if (withTrail) caps.trails += 1;
+    if (capture.source === 'console') caps.console += 1;
+    if (capture.source === 'dead_click') caps.deadClick += 1;
+    this.stats.errorsCaptured += 1;
+    return true;
   }
 
   // --- Performance sampling (opt in) --------------------------------------
@@ -1061,8 +1947,10 @@ class Ravensight {
       form.append('file', state.image, 'screenshot');
       this._reportState(state.report);
       let response;
+      sdkUploadUrls.add(url.href);
       try { response = await this._fetch(url.href, { method: 'POST', body: form, credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(30000) }); }
       catch (_) { throw new RavensightError('Screenshot upload failed. Retry the same prepared report.', 'upload_failed'); }
+      finally { sdkUploadUrls.delete(url.href); }
       if (response.status < 200 || response.status >= 300) throw new RavensightError('Screenshot upload failed. Retry the same prepared report.', 'upload_failed', response.status);
       state.uploaded = true;
     }
@@ -1183,7 +2071,10 @@ class Ravensight {
         this._writeOptIn(false);
       }
     }
-    if (next === this.enabled) return;
+    if (next === this.enabled) {
+      this._syncErrorCapture();
+      return;
+    }
     this.enabled = next;
     if (!next) {
       this._configGeneration += 1;
@@ -1203,6 +2094,7 @@ class Ravensight {
       this._startPerformance();
       this._startFrameLoop();
     }
+    this._syncErrorCapture();
   }
 
   /** The same as setEnabled, under the name the LÖVE SDK uses. */
@@ -1377,6 +2269,7 @@ class Ravensight {
     this._disposing = true;
     this._stopTimer();
     this._unbindLifecycle();
+    this._syncErrorCapture();
 
     this._disposePromise = this._finishDispose(flush, timeoutMs);
     return this._disposePromise;
@@ -1563,6 +2456,7 @@ class Ravensight {
       this._resetBackoff();
       this._evictSessions(deviceId);
       this._log('session ready');
+      this._readErrorCapture(res.body);
       await this.fetchConfig(deviceId);
       return token;
     }
@@ -1631,6 +2525,7 @@ class Ravensight {
     this.trackingEnabled = false;
     this.queue.length = 0;
     this._stopTimer();
+    this._syncErrorCapture();
     this._log('tracking disabled by server kill switch');
   }
 
@@ -1644,6 +2539,7 @@ class Ravensight {
     this.stats.dropped += this.queue.length;
     this.queue.length = 0;
     this._stopTimer();
+    this._syncErrorCapture();
     if (!this._invalidKeyWarned && typeof console !== 'undefined') {
       this._invalidKeyWarned = true;
       console.warn(
@@ -1746,7 +2642,9 @@ class Ravensight {
         break;
       }
 
-      if (res.status === 400) {
+      // A 413 is the same problem as a 400: split, then drop the one bad
+      // event. Never retried as is.
+      if (res.status === 400 || res.status === 413) {
         if (size > 1) {
           // Payload too large for the server. Halve the batch and retry.
           batchLimit = Math.max(1, Math.floor(size / 2));
@@ -1758,7 +2656,7 @@ class Ravensight {
         this.queue.shift();
         this.stats.dropped += 1;
         batchLimit = MAX_BATCH_SIZE;
-        this._log('dropped one event rejected with HTTP 400');
+        this._log('dropped one event rejected with HTTP ' + res.status);
         continue;
       }
 
@@ -2122,6 +3020,7 @@ class Ravensight {
     });
     if (res.status === 200 && res.body && typeof res.body.trackingEnabled === 'boolean') {
       this.trackingEnabled = res.body.trackingEnabled;
+      this._readErrorCapture(res.body);
       return;
     }
     const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
@@ -2197,3 +3096,5 @@ module.exports.Ravensight = Ravensight;
 module.exports.normalizeApiUrl = normalizeApiUrl;
 module.exports.parseRetryAfterMs = parseRetryAfterMs;
 module.exports.chooseUnloadTransport = chooseUnloadTransport;
+module.exports.ERROR_CAPS = ERROR_CAPS;
+module.exports.scrubText = scrubText;
