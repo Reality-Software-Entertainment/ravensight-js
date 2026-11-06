@@ -227,6 +227,11 @@ and hand written canvas games.
 | `random` | `Math.random` | Source for the backoff jitter. `() => 0.5` gives the exact, unjittered wait in tests. |
 | `performance` | `false` | Sample the frame rate and send one `health` event per session on page hide. See [Typed events](#typed-events). |
 | `debug` | `false` | Log SDK activity to the console, and warn about reserved `rs_` keys. |
+| `captureErrors` | `true` | Capture errors automatically. `false` opts this client out. See [Automatic error capture](#automatic-error-capture). |
+| `captureDeadClicks` | `true` | In a browser, report a click on a button that changes nothing for 2 seconds. |
+| `captureRequestHosts` | `[]` | Hosts outside your page's own site whose failed requests may be captured: `'api.partner.io'`, or `'*.cdn.example'` for its subdomains. |
+
+Read `rs.capturingErrors` to see whether this client's error hooks are in.
 
 ### `await rs.init()`
 
@@ -327,7 +332,7 @@ rs.trackError({ severity: 'error', message: err.message, stack: err.stack });
 | `trackPurchase` | `amount`, `currency`, `itemType`, `itemId` | `cart`, `transactionId` | `purchase` |
 | `trackResource` | `flow`, `resource`, `amount` | `itemType`, `itemId` | `resource_source`, `resource_sink` |
 | `trackProgression` | `status`, `p1` | `p2`, `p3`, `score` | `progression_start`, `progression_complete`, `progression_fail` |
-| `trackError` | `severity`, `message` | `stack` | `error` |
+| `trackError` | `severity`, `message` | `stack`, `errorType` (sent as `rs_error_type`) | `error` |
 
 **Health sampling is opt in.** Pass `performance: true` in a browser and the
 SDK samples the frame rate once per second from `requestAnimationFrame`, keeps
@@ -476,6 +481,101 @@ or remove its own call, otherwise every session counts twice. These are the
 same two names the LÖVE SDK sends, so a dashboard covering both platforms
 counts sessions the same way. Playtest sessions run in a browser, so they send
 them too.
+
+## Automatic error capture
+
+A broken button should not wait for a player's screenshot. With a key and
+consent, the SDK reports errors as ordinary `error` events (`rs_kind: 'error'`)
+that the dashboard groups into issues.
+
+### What is captured
+
+| Source (`rs_source`) | What | Severity |
+| --- | --- | --- |
+| `uncaught` | An error nothing caught (the window `error` event). | `error` |
+| `unhandled_rejection` | A promise rejection nothing handled. | `error` |
+| `request` | A `fetch` or `XMLHttpRequest` that answered 5xx or never reached the server. | `error` |
+| `request` | One that answered 4xx, and a script, image, style or media file that failed to load. | `warning` |
+| `console` | A `console.error` call, at most 5 a session. | `warning` |
+| `dead_click` | A click on a button followed by 2 seconds with no change to the page, no navigation, no request and no `track` call. | `warning` |
+
+A failed request is sent as its method, host and path with ids replaced, never
+a query string, header or body: `POST api.example.com/v1/kickoff/:id 500`. Path
+segments that are numbers, hex of 8 or more characters or UUIDs become `:id`.
+Only requests to your page's own site are captured (`game.example.com` and
+`api.example.com` are one site), plus any host you list in
+`captureRequestHosts`. Aborted requests, requests made while the browser is
+offline and requests cut off by the page closing are not failures. A dead
+click names the button by its accessible name (its `aria-label`, or its text),
+cut to 60 characters. Disabled buttons and buttons that submitted a form are
+ignored, and after one dead click is reported no other is watched for 30
+seconds. Dead clicks are off on a page where a canvas covers more than half
+the window, because a canvas UI changes in ways the watcher cannot see.
+
+In Node the SDK listens to `uncaughtExceptionMonitor` only. It never handles
+the error, so your process exits exactly as it would without the SDK, and it
+adds no `unhandledRejection` listener (one would change how Node exits). A
+rejection Node raises as uncaught is reported with `rs_source:
+'unhandled_rejection'`. Requests and the console are not observed in Node.
+Sending is best effort: the process usually exits before the request
+finishes, so a server that must keep a crash should call `rs.trackError()`
+and `await rs.flush()` in its own handler.
+
+### How it behaves
+
+* The hooks only observe. They run beside your own handlers, never stop an
+  error, never change what your code sees, and never read a request or
+  response body. `fetch` returns a promise that settles exactly as the
+  original does, with the same response or the same error, and a rejection
+  your code ignores is still reported as unhandled.
+* The SDK's own requests and log lines are never captured.
+* Hooks go in when the client is made, so errors during loading are caught.
+  At most 5 are held in memory until the first answer from Ravensight, and a
+  warning never pushes a real error out of them. If
+  the game's error capture switch is on they are sent; if it is off they are
+  discarded and the hooks come out. Nothing is installed without a key or
+  before the player's yes under `consent: 'opt_in'`, and `setEnabled(false)`
+  and `dispose()` remove everything.
+* Each page session sends at most 30 errors, at most 3 of the same error and
+  at most 6 a minute. The caps belong to the client, so in Node they cover
+  the life of the process, not one player. Anything past that is dropped on the device. Read
+  `rs.stats.errorsCaptured` and `rs.stats.errorsCapped`.
+* When the queue is full, errors are dropped before your gameplay events.
+
+### Privacy
+
+Before anything is queued, the message, stack and trail are scrubbed on the
+device: emails become `[email]`, bearer tokens, JWTs, `gt_` keys and long
+token-like runs become `[token]`, IP addresses become `[ip]`, home folders
+(`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`,
+`C:\Documents and Settings\<name>`, the whole name, spaces included) become
+`~`, and a URL
+loses any `user:password@`, its query and its fragment. Long text is cut
+before it is scrubbed, so a huge log line costs little. The server scrubs
+again. Messages are cut to
+200 characters and stacks to 2,000. Text you send yourself with
+`trackError()` is sent as you wrote it and scrubbed by the server.
+
+### The trail
+
+When the game's trail switch is on in the dashboard (off by default), an
+error carries the last 20 things that happened before it, as `rs_trail`:
+your `track` calls by name, `console.warn` and `console.error` lines, and page
+navigations, each with the milliseconds since the client started. It is kept
+in memory only, sent only with an error, and on at most 10 errors a session.
+
+### Turning it off
+
+* For one build: `new Ravensight({ captureErrors: false })`.
+* Dead clicks only: `captureDeadClicks: false`.
+* For the whole game, without a new build: switch error capture off in the
+  game's settings on the dashboard. The SDK reads it from Ravensight's answer.
+
+### Cost
+
+Each captured error is one event on your ordinary event meter, like any
+`track` call. The trail adds nothing. The device caps above bound what one
+player can send.
 
 ## Ads and attribution
 
@@ -706,9 +806,11 @@ function onAnalyticsToggled(checked) {
 * **Removed only once delivered.** An event leaves the queue, and the removal
   is written to storage, only after a `2xx`, or a `400` that names it by
   `index`. Everything else keeps it.
-* **Errors behind gameplay.** Error events (`rs_kind: 'error'`) queue behind
-  gameplay events, and a full queue evicts the oldest error first, so a burst
-  of errors never pushes out the game's own events.
+* **Errors behind gameplay.** A full queue drops an incoming automatically
+  captured error, and otherwise evicts the oldest captured error before any
+  gameplay event, so a burst of errors never pushes out the game's own
+  events. The flag is kept in storage across restarts, and a captured error
+  is written to storage at once.
 * **One device per batch.** Each request carries the leading run of queued
   events that share one device id, under that id's session.
 * **Answers.** `400` with `index` drops that event and resends the rest;

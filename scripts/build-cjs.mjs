@@ -41,6 +41,8 @@ const NAMED_EXPORTS = [
   'microsFromDecimalString',
   'microsFromRevenue',
   'adFormatFrom',
+  'ERROR_CAPS',
+  'scrubText',
 ];
 
 for (const name of NAMED_EXPORTS) {

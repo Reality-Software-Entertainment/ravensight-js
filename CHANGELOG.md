@@ -3,11 +3,10 @@
 ## Unreleased
 
 Follows the server's SDK delivery, ads and attribution, exposure and device
-contracts. Automatic error capture is not in this release (it ships from the
-separate error capture branch). The server releases for those contracts ship first; see
-"Server prerequisites" below.
+contracts. The server releases for those contracts ship first; see "Server
+prerequisites" below.
 
-### Changes for 0.5.x games
+### Changes for 0.6.0 games
 
 * The queue is persisted by default: one `localStorage` entry per ingest key in
   a browser, one file per key in Node (`~/.ravensight`, or `queueDir`),
@@ -30,10 +29,13 @@ separate error capture branch). The server releases for those contracts ship fir
   until the next launch (`skipped: 'refused'`). A second `401` in a row waits
   for the backoff. `413` splits, `415` resends once uncompressed, and a `503`
   with `Retry-After` waits exactly that long.
-* Error events (`rs_kind: 'error'`) queue behind gameplay events: a gameplay
-  event is placed ahead of every queued error (never inside a batch awaiting
-  an answer), and a full queue evicts the oldest error first. An incoming
-  error with no error to evict is dropped.
+* Automatically captured errors keep the 0.6.0 full-queue rule in the
+  persisted queue: an incoming captured error is dropped, and otherwise the
+  oldest captured error goes before any gameplay event. The flag is stored
+  with the queue, so the rule still holds after a restart, and a captured
+  error is written to storage at once.
+* A `413` on a batch halves it as in 0.6.0; only a `400 batch_too_large`
+  halves it among the `400` answers.
 * Experiment tags follow the exposure contract: a config fetch alone tags
   nothing. The first `getConfig` read in a session sends one `rs_exposure`
   event and tags that session's later events. A well formed `rs_exp_<key>` of
@@ -65,6 +67,56 @@ separate error capture branch). The server releases for those contracts ship fir
 * The Phase 2 delivery release (origin, signing, gzip, `index` on a 400) and
   the Phase 5 `rs_ad_*` and `rs_attr_*` keys must be deployed first: a public
   key refuses an unknown `rs_` key.
+
+## 0.6.0 - 2026-11-06
+
+### Added
+
+* **Automatic error capture**, on by default. Uncaught errors, unhandled
+  rejections, failed `fetch` and `XMLHttpRequest` calls to the page's own
+  site (5xx and network failures as `error`, 4xx as `warning`), resource
+  load failures, `console.error` and dead clicks on buttons become `error`
+  events with `rs_source`, `rs_severity`, `rs_message`, optional `rs_stack`
+  and `rs_error_type`. A request is sent as method, host and templated path
+  only (`POST api.example.com/v1/kickoff/:id 500`), never a query, header
+  or body. See "Automatic error capture" in the README.
+* Hooks install when a keyed, consented client is made. Up to 5 boot errors
+  are held in memory until the first settings or session answer, then sent
+  if the game's `errorCapture.enabled` is not false, else discarded. Nothing
+  installs without a key or before the opt-in yes; `setEnabled(false)` and
+  `dispose()` remove every hook and restore every wrapper still in place.
+* Device caps per session: 30 captures, 3 per error, 10 trails, 6 a minute.
+  `stats.errorsCaptured` and `stats.errorsCapped` count them. `ERROR_CAPS`
+  is exported.
+* On-device scrub of every automatic capture (emails, bearer tokens, JWTs,
+  `gt_` keys, long token runs with a digit unless they are file paths, IP
+  addresses, home folders, URL user info, queries and fragments), exported
+  as `scrubText`. Text is cut to 4 times the field's limit before the
+  scrub. Manual `trackError` text is unchanged.
+* A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder, with either slash
+  (scrub contract 5, vectors 6).
+* Dead clicks are off on a page where a canvas covers more than half the
+  window.
+* `rs_trail`: the last 20 track calls, console lines and navigations, sent
+  with an error only when the game's trail switch is on.
+* Node: `uncaughtExceptionMonitor` only, exit behaviour unchanged, flush
+  best effort.
+* Options `captureErrors` (default `true`), `captureDeadClicks` (default
+  `true`) and `captureRequestHosts` (default none). Read-only
+  `rs.capturingErrors` and `rs.errorCapture` (`{ enabled, trail }`).
+* `trackError({ errorType })`, sent as `rs_error_type`, cut to 100
+  characters.
+
+### Changed
+
+* A `413` answer to a batch is handled like a `400`: the batch is split and
+  the one event still refused is dropped, never resent as is.
+* When the queue is full, automatic errors are dropped before gameplay
+  events.
+* The SDK resolves the page's native `fetch` under its own wrapper, so its
+  own requests are never observed. The wrapper returns a promise that
+  settles as the original does, so an ignored rejection is still unhandled.
 
 ## 0.5.1 (held)
 
