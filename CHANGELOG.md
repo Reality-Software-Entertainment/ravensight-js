@@ -21,8 +21,12 @@
   `stats.errorsCaptured` and `stats.errorsCapped` count them. `ERROR_CAPS`
   is exported.
 * On-device scrub of every automatic capture (emails, bearer tokens, JWTs,
-  `gt_` keys, long token runs with a digit, IP addresses, home folders, URL
-  queries), exported as `scrubText`. Manual `trackError` text is unchanged.
+  `gt_` keys, long token runs with a digit unless they are file paths, IP
+  addresses, home folders, URL user info, queries and fragments), exported
+  as `scrubText`. Text is cut to 4 times the field's limit before the
+  scrub. Manual `trackError` text is unchanged.
+* Dead clicks are off on a page where a canvas covers more than half the
+  window.
 * `rs_trail`: the last 20 track calls, console lines and navigations, sent
   with an error only when the game's trail switch is on.
 * Node: `uncaughtExceptionMonitor` only, exit behaviour unchanged, flush
@@ -40,7 +44,8 @@
 * When the queue is full, automatic errors are dropped before gameplay
   events.
 * The SDK resolves the page's native `fetch` under its own wrapper, so its
-  own requests are never observed.
+  own requests are never observed. The wrapper returns a promise that
+  settles as the original does, so an ignored rejection is still unhandled.
 
 ## 0.5.1 (held)
 

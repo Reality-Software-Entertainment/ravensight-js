@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 
 import Ravensight, { MemoryStorage, ERROR_CAPS, scrubText } from '../src/index.js';
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { startMockServer, fakeClock } from './helpers/mock-server.js';
 
 const SCRUB_VECTORS = JSON.parse(readFileSync(new URL('./fixtures/scrub-vectors.json', import.meta.url), 'utf8'));
@@ -593,7 +594,55 @@ test("the SDK's own console lines are not captured or trailed", async (t) => {
   assert.equal(errors(rs).length, 0);
 });
 
+test('observing a fetch never marks its rejection handled', () => {
+  // In a child process: node:test reports an unhandled rejection as a failure.
+  const script = `
+    const { default: Ravensight, MemoryStorage } = await import(${JSON.stringify(new URL('../src/index.js', import.meta.url).href)});
+    const target = { addEventListener() {}, removeEventListener() {} };
+    Object.assign(globalThis, { window: target, document: { ...target }, location: { href: 'https://game.example.com/', hostname: 'game.example.com' } });
+    Object.defineProperty(globalThis, 'navigator', { value: { onLine: true, userAgent: 'test' }, configurable: true });
+    globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+    const rs = new Ravensight({ ingestKey: 'gt_live_x', apiUrl: 'http://127.0.0.1:9/api/v1', autoEvents: false, storage: new MemoryStorage(), fetch: async () => ({ status: 0 }) });
+    if (!rs.capturingErrors) throw new Error('hooks not installed');
+    const seen = [];
+    process.on('unhandledRejection', (reason) => seen.push(String(reason)));
+    await fetch('https://game.example.com/handled').catch(() => {});
+    fetch('https://game.example.com/ignored');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    console.log(JSON.stringify(seen));
+  `;
+  const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  assert.deepEqual(JSON.parse(out.trim().split('\n').pop()), ['TypeError: Failed to fetch']);
+});
+
+test('relative URLs resolve against document.baseURI', async (t) => {
+  const dom = withDom(t);
+  dom.doc.baseURI = 'https://game.example.com/build/v2/';
+  const { rs } = await startCapturing(t, dom);
+  dom.routes.set('api/kickoff/5', 500);
+  await fetch('api/kickoff/5');
+  await tick();
+  assert.equal(errors(rs)[0].rs_message, 'GET game.example.com/build/v2/api/kickoff/:id 500');
+});
+
 // --- console.error -----------------------------------------------------------
+
+test('console arguments are not stringified when no trail or capture will use them', async (t) => {
+  const dom = withDom(t);
+  const clock = fakeClock();
+  await startCapturing(t, dom, { errorCapture: { enabled: true, trail: false } }, { now: clock });
+  let reads = 0;
+  const noisy = { toJSON: () => (reads += 1) };
+  console.warn('warn', noisy);
+  assert.equal(reads, 0, 'a warning with the trail off is never read');
+  for (let i = 0; i < ERROR_CAPS.console; i++) {
+    clock.advance(60000);
+    console.error('line ' + 'abcdef'[i]);
+  }
+  console.error('past the cap', noisy);
+  assert.equal(reads, 0, 'past the console cap nothing is read');
+  assert.equal(dom.consoleCalls.error.length, ERROR_CAPS.console + 1, 'the console still gets every call');
+});
 
 test('console.error chains to the original and is a capped warning capture', async (t) => {
   const dom = withDom(t);
@@ -764,6 +813,32 @@ test('no dead click for disabled buttons, submitted forms, non-buttons or untrus
   assert.equal(errors(rs).length, 0);
 });
 
+test('the observer disconnects at the first mutation', async (t) => {
+  const dom = withDom(t);
+  await startCapturing(t, dom);
+  dom.fire('document', 'click', { target: element('button', { text: 'Go' }) });
+  assert.equal(dom.observerCount(), 1);
+  dom.mutate();
+  assert.equal(dom.observerCount(), 0);
+  await sleep(60);
+});
+
+test('dead clicks are off while a canvas covers more than half the viewport', async (t) => {
+  const dom = withDom(t);
+  const { rs } = await startCapturing(t, dom);
+  dom.win.innerWidth = 1000;
+  dom.win.innerHeight = 800;
+  let rect = { left: 0, top: 0, right: 1000, bottom: 500 };
+  dom.doc.querySelectorAll = (selector) => (selector === 'canvas' ? [{ getBoundingClientRect: () => rect }] : []);
+  dom.fire('document', 'click', { target: element('button', { text: 'Menu' }) });
+  assert.equal(dom.observerCount(), 0, 'a canvas over 62 percent of the page');
+  rect = { left: 0, top: 0, right: 300, bottom: 200 };
+  dom.fire('document', 'click', { target: element('button', { text: 'Menu' }) });
+  assert.equal(dom.observerCount(), 1, 'a small canvas leaves the watcher on');
+  await sleep(60);
+  assert.equal(errors(rs).length, 1);
+});
+
 test('captureDeadClicks: false never watches a click', async (t) => {
   const dom = withDom(t);
   const { rs } = await startCapturing(t, dom, {}, { captureDeadClicks: false });
@@ -912,6 +987,23 @@ test('scrubText follows the contract rules', () => {
 test('scrubText produces every shared contract vector', () => {
   assert.ok(SCRUB_VECTORS.cases.length > 0);
   for (const { name, in: input, out } of SCRUB_VECTORS.cases) assert.equal(scrubText(input), out, name);
+});
+
+test('a 200,000 character line is cut before the scrub, so capture stays fast', async (t) => {
+  const dom = withDom(t);
+  const { rs } = await startCapturing(t, dom, { errorCapture: { enabled: true, trail: true } });
+  // Long letter runs are the slow case for the URL and email rules.
+  const huge = 'a'.repeat(100000) + '@' + 'b'.repeat(99999);
+  const started = performance.now();
+  console.error(huge);
+  dom.fire('window', 'error', { target: dom.win, error: Object.assign(new Error(huge), { stack: huge }) });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 50, 'took ' + elapsed.toFixed(1) + ' ms');
+  // Only ours: Node may print its own warning through console.error first.
+  const [fromConsole, uncaught] = errors(rs).filter((d) => d.rs_message.startsWith('aaa'));
+  assert.ok(fromConsole.rs_message.length <= 200);
+  assert.ok(uncaught.rs_stack.length <= 2000);
+  assert.ok(uncaught.rs_trail.length <= 1500);
 });
 
 test('the scrub runs before the cut, so a token past the limit cannot leak a prefix', async (t) => {

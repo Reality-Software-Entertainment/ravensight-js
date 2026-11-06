@@ -362,24 +362,28 @@ function unwrapFn(fn) {
 
 /**
  * The on-device scrub. Same rules as the server's, applied in this order:
- * a URL loses its query and fragment; bearer tokens, JWT-shaped strings,
+ * a URL loses any user:password@, then its query and fragment; bearer tokens, JWT-shaped strings,
  * `gt_` keys become [token]; emails become [email]; home directories become
  * ~; IPv4 and IPv6 addresses become [ip]; a run of 32 or more base64 or hex
  * characters with a digit in it becomes [token], unless it is a path of
  * path words.
  */
 const SCRUB_RULES = [
-  [/([a-z][a-z0-9+.-]*:\/\/[^\s?#'"<>()]+)[?#][^\s'"<>()]*/gi, '$1'],
+  // Anchored at a word boundary or a non-class character, so a long run
+  // with no match is walked once, not once per start position.
+  [/\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/?#@]+@/gi, '$1'],
+  [/\b([a-z][a-z0-9+.-]{0,30}:\/\/[^\s?#'"<>()]+)[?#][^\s'"<>()]*/gi, '$1'],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, '[token]'],
   [/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?/g, '[token]'],
   [/\bgt_[A-Za-z0-9_]+/g, '[token]'],
-  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, '[email]'],
+  [/(^|[^A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, '$1[email]'],
   [/\/(?:Users|home)\/[^/\s:'"()]+/g, '~'],
   [/\b[A-Za-z]:\\Users\\[^\\\s:'"()]+/gi, '~'],
   [/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[ip]'],
   [
     /(^|[^0-9A-Za-z:.])((?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})(?![0-9A-Za-z:])/g,
-    '$1[ip]',
+    // An address has a digit somewhere, so a scope like Face::Add is kept.
+    (match, before, address) => (/\d/.test(address) ? before + '[ip]' : match),
   ],
   // A run with no digit is an identifier, not a secret. A run with '/' is
   // kept only when every piece is a path word, so file paths survive and a
@@ -404,14 +408,24 @@ export function scrubText(value) {
 }
 
 /** Scrub, then cut to `max` characters. */
+/**
+ * Cut to 4 times `max`, scrub, then cut to `max`. Some scrub rules are
+ * quadratic in their input, so they never see more than a bounded string.
+ */
 function cleanText(value, max) {
-  return cutText(scrubText(value), max);
+  return cutText(scrubText(preCut(value, max * 4)), max);
+}
+
+/** At most `max` characters, sliced cheaply first so a huge string is never walked whole. */
+function preCut(value, max) {
+  const text = String(value == null ? '' : value);
+  return cutText(text.length > max * 2 ? text.slice(0, max * 2) : text, max);
 }
 
 /** The local dedupe template: numbers, hex runs, UUIDs, URLs and quoted text become placeholders. */
 function messageTemplate(message) {
   return String(message)
-    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>')
+    .replace(/[a-z][a-z0-9+.-]{0,30}:\/\/\S+/gi, '<url>')
     .replace(/(["'`])[^"'`]{0,200}\1/g, '<str>')
     .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>')
     .replace(/\b[0-9a-f]{8,}\b/gi, '<hex>')
@@ -544,7 +558,16 @@ function describeRequest(input, init) {
     if (init.signal) signal = init.signal;
   }
   if (raw == null) return null;
-  const base = typeof location !== 'undefined' && location && location.href ? location.href : undefined;
+  let base;
+  try {
+    if (typeof document !== 'undefined' && document && typeof document.baseURI === 'string' && document.baseURI) {
+      base = document.baseURI;
+    } else if (typeof location !== 'undefined' && location && location.href) {
+      base = location.href;
+    }
+  } catch (_err) {
+    base = undefined;
+  }
   const url = new URL(raw, base);
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
   if (isSdkUrl(url.href)) return null;
@@ -575,20 +598,25 @@ function wrapFetch(undo) {
   const wrapper = function fetch(input, init) {
     const result = original.apply(this, arguments);
     if (!live) return result;
+    let returned = result;
     try {
       const info = describeRequest(input, init);
       if (info && result && typeof result.then === 'function') {
         noteActivity();
-        // A branch of its own: the game's promise is returned untouched.
-        result.then(
+        // The game gets a promise that settles exactly as fetch's does: the
+        // same response, or the same error rethrown. Observing never marks
+        // a rejection handled, so one the game ignores is still unhandled.
+        returned = result.then(
           (res) => {
             try {
               // An opaque (no-cors) answer hides its status: not a failure.
-              if (res && (res.type === 'opaque' || res.type === 'opaqueredirect')) return;
-              onRequestFinished(info, res ? Number(res.status) || 0 : 0, false);
+              if (!(res && (res.type === 'opaque' || res.type === 'opaqueredirect'))) {
+                onRequestFinished(info, res ? Number(res.status) || 0 : 0, false);
+              }
             } catch (_err) {
               // ignore
             }
+            return res;
           },
           (err) => {
             try {
@@ -596,13 +624,14 @@ function wrapFetch(undo) {
             } catch (_err) {
               // ignore
             }
+            throw err;
           },
         );
       }
     } catch (_err) {
       // An unparseable URL: the original fetch has already answered for it.
     }
-    return result;
+    return returned;
   };
   wrapper[WRAPPED] = original;
   globalThis.fetch = wrapper;
@@ -701,12 +730,21 @@ function wrapConsole(undo) {
 
 function onConsole(level, args) {
   if (errorHooks.capturing) return;
+  // Nothing is stringified unless a trail or a capture will use it.
+  let needed = false;
+  for (const client of errorHooks.clients) {
+    if (client._wantsConsole(level)) {
+      needed = true;
+      break;
+    }
+  }
+  if (!needed) return;
   const parts = [];
   let thrown = null;
   for (let i = 0; i < args.length && i < 8; i++) {
     const arg = args[i];
     if (!thrown && arg && typeof arg === 'object' && typeof arg.message === 'string') thrown = arg;
-    parts.push(describeValue(arg));
+    parts.push(preCut(describeValue(arg), MAX_STACK_CHARS));
   }
   const text = parts.join(' ');
   // The SDK's own log lines are never captured.
@@ -883,6 +921,28 @@ function isDisabled(el) {
   return false;
 }
 
+/**
+ * True when a canvas covers more than half the viewport. A canvas UI changes
+ * state the watcher cannot see, so dead clicks are off on such a page.
+ */
+function canvasCoversPage() {
+  try {
+    if (typeof document.querySelectorAll !== 'function') return false;
+    const width = Number(window.innerWidth) || 0;
+    const height = Number(window.innerHeight) || 0;
+    if (!(width > 0 && height > 0)) return false;
+    for (const canvas of document.querySelectorAll('canvas')) {
+      const rect = canvas.getBoundingClientRect();
+      const visibleW = Math.max(0, Math.min(rect.right, width) - Math.max(rect.left, 0));
+      const visibleH = Math.max(0, Math.min(rect.bottom, height) - Math.max(rect.top, 0));
+      if (visibleW * visibleH > (width * height) / 2) return true;
+    }
+  } catch (_err) {
+    // Unknown layout: keep watching.
+  }
+  return false;
+}
+
 function onClick(event) {
   if (errorHooks.capturing || !event || event.isTrusted === false) return;
   let watcher = null;
@@ -902,7 +962,7 @@ function onClick(event) {
   } catch (_err) {
     return;
   }
-  if (!el || isDisabled(el)) return;
+  if (!el || isDisabled(el) || canvasCoversPage()) return;
 
   const watch = { el, activity: errorHooks.activity, mutated: false, href: null, observer: null, timer: null };
   try {
@@ -912,7 +972,13 @@ function onClick(event) {
   }
   try {
     watch.observer = new MutationObserver(() => {
+      // The first change settles it: stop observing at once.
       watch.mutated = true;
+      try {
+        watch.observer.disconnect();
+      } catch (_err) {
+        // ignore
+      }
     });
     watch.observer.observe(document.documentElement || document, {
       subtree: true,
@@ -963,7 +1029,7 @@ function finishDeadWatch(watch) {
     // ignore
   }
   const tag = String(el.tagName || 'element').toLowerCase();
-  const name = cutText(scrubText(accessibleName(el)).replace(/\s+/g, ' '), MAX_DEAD_CLICK_NAME_CHARS);
+  const name = cleanText(preCut(accessibleName(el), MAX_DEAD_CLICK_NAME_CHARS * 4).replace(/\s+/g, ' '), MAX_DEAD_CLICK_NAME_CHARS);
   // No quotes around the name, so the server's template keeps it.
   const message = 'Dead click: ' + tag + ' ' + name;
   let reported = false;
@@ -1559,10 +1625,20 @@ export class Ravensight {
     }
   }
 
+  /** Whether a console line at `level` would reach this client's trail or a capture. */
+  _wantsConsole(level) {
+    if (!this._errorHooked || !this.isActive) return false;
+    if (this.errorCapture.trail) return true;
+    if (level !== 'error') return false;
+    if (!this._errorAnswered) return this._bootErrors.length < MAX_BOOT_ERRORS;
+    const caps = this._errorCaps;
+    return caps.console < ERROR_CAPS.console && caps.total < ERROR_CAPS.total;
+  }
+
   /** Adds one line to the trail ring, when the game's trail switch is on. */
   _trailLine(level, text) {
     if (!this._errorHooked || !this.errorCapture.trail) return;
-    const flat = String(text).replace(/\s+/g, ' ').trim();
+    const flat = preCut(text, MAX_TRAIL_LINE_CHARS * 4).replace(/\s+/g, ' ').trim();
     const line = '+' + Math.max(0, this._clock() - this._startedAt) + ' ' + level + ' ' + flat;
     this._trail.push(cleanText(line, MAX_TRAIL_LINE_CHARS));
     if (this._trail.length > TRAIL_LINES) this._trail.shift();

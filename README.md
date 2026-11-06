@@ -507,7 +507,8 @@ offline and requests cut off by the page closing are not failures. A dead
 click names the button by its accessible name (its `aria-label`, or its text),
 cut to 60 characters. Disabled buttons and buttons that submitted a form are
 ignored, and after one dead click is reported no other is watched for 30
-seconds. A game drawn on a canvas has no buttons to watch.
+seconds. Dead clicks are off on a page where a canvas covers more than half
+the window, because a canvas UI changes in ways the watcher cannot see.
 
 In Node the SDK listens to `uncaughtExceptionMonitor` only. It never handles
 the error, so your process exits exactly as it would without the SDK, and it
@@ -522,7 +523,9 @@ and `await rs.flush()` in its own handler.
 
 * The hooks only observe. They run beside your own handlers, never stop an
   error, never change what your code sees, and never read a request or
-  response body. `fetch` returns the same promise it always did.
+  response body. `fetch` returns a promise that settles exactly as the
+  original does, with the same response or the same error, and a rejection
+  your code ignores is still reported as unhandled.
 * The SDK's own requests and log lines are never captured.
 * Hooks go in when the client is made, so errors during loading are caught.
   At most 5 are held in memory until the first answer from Ravensight. If
@@ -531,7 +534,8 @@ and `await rs.flush()` in its own handler.
   before the player's yes under `consent: 'opt_in'`, and `setEnabled(false)`
   and `dispose()` remove everything.
 * Each page session sends at most 30 errors, at most 3 of the same error and
-  at most 6 a minute. Anything past that is dropped on the device. Read
+  at most 6 a minute. The caps belong to the client, so in Node they cover
+  the life of the process, not one player. Anything past that is dropped on the device. Read
   `rs.stats.errorsCaptured` and `rs.stats.errorsCapped`.
 * When the queue is full, errors are dropped before your gameplay events.
 
@@ -541,7 +545,9 @@ Before anything is queued, the message, stack and trail are scrubbed on the
 device: emails become `[email]`, bearer tokens, JWTs, `gt_` keys and long
 token-like runs become `[token]`, IP addresses become `[ip]`, home folders
 (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`) become `~`, and a URL
-loses its query and fragment. The server scrubs again. Messages are cut to
+loses any `user:password@`, its query and its fragment. Long text is cut
+before it is scrubbed, so a huge log line costs little. The server scrubs
+again. Messages are cut to
 200 characters and stacks to 2,000. Text you send yourself with
 `trackError()` is sent as you wrote it and scrubbed by the server.
 
