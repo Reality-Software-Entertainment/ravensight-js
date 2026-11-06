@@ -373,8 +373,18 @@ function makeQueueStore(storage, injected, ingestKey, queueDir, modules) {
     write: (text) => {
       fs.mkdirSync(dir, { recursive: true });
       const temp = file + '.' + process.pid + '.' + randomHex(4) + '.tmp';
-      fs.writeFileSync(temp, text, 'utf8');
-      fs.renameSync(temp, file);
+      try {
+        fs.writeFileSync(temp, text, 'utf8');
+        fs.renameSync(temp, file);
+      } catch (err) {
+        // A failed write never leaves a temporary file behind.
+        try {
+          fs.unlinkSync(temp);
+        } catch (_err) {
+          // Never written.
+        }
+        throw err;
+      }
     },
     remove: () => {
       try {
