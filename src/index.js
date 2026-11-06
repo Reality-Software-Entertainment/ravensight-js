@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-export const VERSION = '0.5.1';
+export const VERSION = '0.6.0';
 
 export const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
