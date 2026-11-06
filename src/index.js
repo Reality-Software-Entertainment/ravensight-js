@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-export const VERSION = '0.6.0';
+export const VERSION = '0.5.1';
 
 export const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -272,6 +272,11 @@ export function adFormatFrom(name) {
   if (key === 'NATIVE') return 'native';
   if (key === 'APP_OPEN') return 'app_open';
   return 'other';
+}
+
+/** An error event: a typed error (`rs_kind: 'error'`). It queues behind gameplay and is evicted first. */
+function isErrorEvent(item) {
+  return Boolean(item && item.data && item.data.rs_kind === 'error');
 }
 
 const textIn = (value, min, max) => typeof value === 'string' && value.length >= min && value.length <= max;
@@ -1071,22 +1076,22 @@ export class Ravensight {
       return false;
     }
 
-    if (this.queue.length >= this.maxQueueSize) {
-      this.queue.shift();
-      this.stats.dropped += 1;
-    }
-
     // Unix milliseconds, assigned now and never at send time. The origin is
     // the session this event belongs to; events tracked before the first
     // session opens get it when that session opens.
     const entry = this._sessions.get(deviceId);
-    this.queue.push({
+    const item = {
       event,
       data: payload,
       timestamp: Math.floor(this._clock()),
       deviceId,
       origin: entry && entry.token && entry.origin ? entry.origin : null,
-    });
+    };
+    if (isErrorEvent(item)) item.error = true;
+    if (!this._enqueue(item)) {
+      this.stats.dropped += 1;
+      return false;
+    }
     this.stats.queued += 1;
     this._schedulePersist();
 
@@ -1397,6 +1402,7 @@ export class Ravensight {
         if (Number.isFinite(unconfirmedAt) && unconfirmedAt > 0 && now - unconfirmedAt > UNCONFIRMED_RESEND_MS) continue;
         const data = raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data) ? raw.data : {};
         const item = { event: raw.event, data, timestamp, deviceId, origin };
+        if (isErrorEvent(item)) item.error = true;
         if (Number.isFinite(unconfirmedAt) && unconfirmedAt > 0) item.unconfirmedAt = unconfirmedAt;
         items.push(item);
       }
@@ -2633,6 +2639,46 @@ export class Ravensight {
 
   _hasRetryAfter(res) {
     return parseRetryAfterMs(res.headers ? res.headers.get('retry-after') : null) > 0;
+  }
+
+  /**
+   * Adds one event under the queue's two ordering rules. Gameplay events go
+   * ahead of every queued error event (never inside a batch awaiting an
+   * answer), and a full queue evicts the oldest queued error first, then the
+   * oldest event. An incoming error with no error to evict is the one
+   * dropped. Returns false when the incoming event was dropped.
+   */
+  _enqueue(item) {
+    const start = Math.min(this._inflightSize, this.queue.length);
+    let firstError = -1;
+    for (let i = start; i < this.queue.length; i++) {
+      if (this.queue[i].error) {
+        firstError = i;
+        break;
+      }
+    }
+    if (this.queue.length >= this.maxQueueSize) {
+      if (firstError >= 0) {
+        this.queue.splice(firstError, 1);
+        this.stats.dropped += 1;
+        firstError = -1;
+        for (let i = start; i < this.queue.length; i++) {
+          if (this.queue[i].error) {
+            firstError = i;
+            break;
+          }
+        }
+      } else if (item.error) {
+        return false;
+      } else {
+        this.queue.shift();
+        this.stats.dropped += 1;
+        firstError = -1;
+      }
+    }
+    if (!item.error && firstError >= 0) this.queue.splice(firstError, 0, item);
+    else this.queue.push(item);
+    return true;
   }
 
   /** How many events from `offset` share that event's device id, capped at one batch. */

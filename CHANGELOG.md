@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 (held)
+## Unreleased
 
 Follows the server's SDK delivery, ads and attribution, exposure and device
 contracts. Automatic error capture is not in this release (it ships from the
@@ -30,6 +30,10 @@ separate error capture branch). The server releases for those contracts ship fir
   until the next launch (`skipped: 'refused'`). A second `401` in a row waits
   for the backoff. `413` splits, `415` resends once uncompressed, and a `503`
   with `Retry-After` waits exactly that long.
+* Error events (`rs_kind: 'error'`) queue behind gameplay events: a gameplay
+  event is placed ahead of every queued error (never inside a batch awaiting
+  an answer), and a full queue evicts the oldest error first. An incoming
+  error with no error to evict is dropped.
 * Experiment tags follow the exposure contract: a config fetch alone tags
   nothing. The first `getConfig` read in a session sends one `rs_exposure`
   event and tags that session's later events. A well formed `rs_exp_<key>` of

@@ -513,3 +513,56 @@ test('an unload batch stays stored unconfirmed: a keepalive 2xx clears it, other
   assert.deepEqual(late.queue, [], 'past 23 hours it is presumed delivered');
   await late.dispose({ flush: false });
 });
+
+// --- Error events queue behind gameplay ------------------------------------------
+
+test('gameplay events queue ahead of error events, never inside a batch in flight', async (t) => {
+  const server = await startMockServer({ batchDelayMs: 60 });
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoEvents: false });
+  await rs.init();
+  rs.track('ev_0');
+  rs.trackError({ severity: 'error', message: 'one' });
+  rs.trackError({ severity: 'error', message: 'two' });
+  rs.track('ev_1');
+  assert.deepEqual(rs.queue.map((e) => e.event), ['ev_0', 'ev_1', 'error', 'error']);
+
+  const flushing = rs.flush();
+  await new Promise((r) => setTimeout(r, 20));
+  rs.track('ev_2');
+  assert.deepEqual(rs.queue.map((e) => e.event), ['ev_0', 'ev_1', 'error', 'error', 'ev_2'], 'the batch in flight is never reordered');
+  await flushing;
+  rs.trackError({ severity: 'error', message: 'three' });
+  rs.track('ev_3');
+  assert.deepEqual(rs.queue.map((e) => e.event), ['ev_3', 'error'], 'the flush sent ev_2 in its next batch');
+  await rs.dispose({ flush: false });
+});
+
+test('a full queue evicts the oldest error first; an incoming error with none to evict is dropped', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server, { autoEvents: false, maxQueueSize: 3 });
+  rs.track('a');
+  rs.trackError({ severity: 'error', message: 'old' });
+  rs.track('b');
+  rs.track('c');
+  assert.deepEqual(rs.queue.map((e) => e.data.rs_message || e.event), ['a', 'b', 'c'], 'the error went first');
+  assert.equal(rs.trackError({ severity: 'error', message: 'new' }), false, 'no error to evict: the incoming one is dropped');
+  rs.track('d');
+  assert.deepEqual(rs.queue.map((e) => e.event), ['b', 'c', 'd'], 'with no error queued the oldest goes');
+  assert.equal(rs.stats.dropped, 3);
+  await rs.dispose({ flush: false });
+});
+
+test('restored error events still queue behind gameplay', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const storage = new MemoryStorage();
+  const first = makeClient(server, { storage, autoEvents: false });
+  first.trackError({ severity: 'error', message: 'boom' });
+  await first.dispose({ flush: false });
+  const next = makeClient(server, { storage, autoEvents: false });
+  next.track('play');
+  assert.deepEqual(next.queue.map((e) => e.event), ['play', 'error']);
+  await next.dispose({ flush: false });
+});

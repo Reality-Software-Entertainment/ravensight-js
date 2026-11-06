@@ -675,10 +675,10 @@ function onAnalyticsToggled(checked) {
 | `consent: 'opt_in'` | yes, yes stored as `ravensight_optin` in the storage the device id uses | yes, `ravensight_optin` in the save folder |
 | `distribution` | yes | yes (desktop; on the web the page's SDK sends it) |
 | Refused key | ends the run | ends the run |
-| Retry jitter | a factor between 0.5 and 1 (0.6.0) | plus or minus 20 percent |
+| Retry jitter | a factor between 0.5 and 1 (unreleased) | plus or minus 20 percent |
 | `rs_event_id` | yes | yes |
 | 8,192 byte event cap | dropped at `track()`, `stats.lastError` | dropped, `flush_failed` |
-| Saved queue | yes, `localStorage` or a file, sent on the next launch (0.6.0) | yes, sent on the next launch |
+| Saved queue | yes, `localStorage` or a file, sent on the next launch (unreleased) | yes, sent on the next launch |
 | Batching | timer (`autoFlushMs`, 15 s) | 2 s |
 | Web | native | bridge (`rs.flushOnHidden(inflight)` on exit) |
 
@@ -706,6 +706,9 @@ function onAnalyticsToggled(checked) {
 * **Removed only once delivered.** An event leaves the queue, and the removal
   is written to storage, only after a `2xx`, or a `400` that names it by
   `index`. Everything else keeps it.
+* **Errors behind gameplay.** Error events (`rs_kind: 'error'`) queue behind
+  gameplay events, and a full queue evicts the oldest error first, so a burst
+  of errors never pushes out the game's own events.
 * **One device per batch.** Each request carries the leading run of queued
   events that share one device id, under that id's session.
 * **Answers.** `400` with `index` drops that event and resends the rest;

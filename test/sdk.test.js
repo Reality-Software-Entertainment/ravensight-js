@@ -1986,12 +1986,12 @@ test('reserved keys win over caller data, the event name can be overridden, bad 
   assert.equal(e.data.rs_kind, 'purchase');
   assert.doesNotThrow(() => rs.trackPurchase({ amount: 4.99, currency: 7 }));
   assert.equal(lastEvent(rs).data.rs_amount, 4.99, 'passed through for the server to flag');
-  assert.doesNotThrow(() => rs.trackError());
   assert.doesNotThrow(() => rs.trackResource(null));
   rs.trackProgression({ status: 'weird', p1: 'x' });
   assert.equal(lastEvent(rs).event, 'progression_weird');
   rs.trackResource({ event: 'loot', flow: 'source', resource: 'g', amount: 1 });
   assert.equal(lastEvent(rs).event, 'loot');
+  assert.doesNotThrow(() => rs.trackError());
   await rs.dispose({ flush: false });
 });
 
