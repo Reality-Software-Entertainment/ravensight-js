@@ -295,6 +295,19 @@ test('boot errors: hooks install at construction and hold at most 5 captures unt
   assert.equal(rs._bootErrors.length, 0);
 });
 
+test('boot errors: many console lines then one uncaught error, the error survives', async (t) => {
+  const dom = withDom(t);
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = dom.own(makeClient(server));
+  for (let i = 0; i < 20; i++) console.error('noise ' + 'abcdefghijklmnopqrst'[i]);
+  dom.fire('window', 'error', { target: dom.win, error: new Error('the real one') });
+  assert.equal(rs._bootErrors.length, 5);
+  await rs.init();
+  const sent = errors(rs);
+  assert.ok(sent.some((d) => d.rs_message === 'the real one' && d.rs_severity === 'error'));
+});
+
 test('boot errors are discarded unsent when the answer says capture is off', async (t) => {
   const dom = withDom(t);
   const server = await startMockServer({ errorCapture: { enabled: false, trail: false } });
@@ -693,6 +706,32 @@ test('device caps: a token bucket of 6 a minute, 3 per key and 30 a session', as
   assert.equal(errors(rs).length, ERROR_CAPS.total, 'never more than 30 a session');
   assert.equal(rs.stats.errorsCaptured, 30);
   assert.ok(rs.stats.errorsCapped > 0);
+});
+
+test('once the caps are spent a capture is never scrubbed or templated', async (t) => {
+  const dom = withDom(t);
+  const clock = fakeClock();
+  const { rs } = await startCapturing(t, dom, {}, { now: clock });
+  const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN';
+  for (let i = 0; i < 40; i++) {
+    clock.advance(60000);
+    rs._captureAuto({ source: 'uncaught', severity: 'error', message: 'spend ' + letters[i] });
+  }
+  assert.equal(rs.stats.errorsCaptured, ERROR_CAPS.total);
+  let reads = 0;
+  const counted = { toString: () => ((reads += 1), 'late') };
+  clock.advance(60000);
+  rs._captureAuto({ source: 'uncaught', severity: 'error', message: counted, stack: counted, type: counted });
+  assert.equal(reads, 0, 'past the session cap the text is never read');
+  // The token bucket too: a fresh client, six at once, then a seventh.
+  const second = await startCapturing(t, dom, {}, { now: clock });
+  for (let i = 0; i < 6; i++) second.rs._captureAuto({ source: 'uncaught', severity: 'error', message: 'burst ' + letters[i] });
+  second.rs._captureAuto({ source: 'uncaught', severity: 'error', message: counted, stack: counted, type: counted });
+  assert.equal(reads, 0, 'with the bucket empty the text is never read');
+  // Sanity: the same object is read when it is captured.
+  clock.advance(60000);
+  second.rs._captureAuto({ source: 'uncaught', severity: 'error', message: counted });
+  assert.ok(reads > 0);
 });
 
 // --- Trail -------------------------------------------------------------------

@@ -1718,8 +1718,17 @@ class Ravensight {
     if (!this._errorHooked || !this.isActive) return false;
     if (!this._errorAnswered) {
       // Before the first answer: hold, unscrubbed caps applied later on release.
-      if (this._bootErrors.length < MAX_BOOT_ERRORS) this._bootErrors.push(capture);
-      else this.stats.errorsCapped += 1;
+      // Warnings (console lines, requests, dead clicks) never push a real
+      // error out: a full hold makes room for an error by dropping the
+      // oldest warning.
+      const held = this._bootErrors;
+      if (held.length >= MAX_BOOT_ERRORS) {
+        const at = capture.severity === 'error' ? held.findIndex((c) => c.severity !== 'error') : -1;
+        this.stats.errorsCapped += 1;
+        if (at < 0) return false;
+        held.splice(at, 1);
+      }
+      held.push(capture);
       return false;
     }
     const caps = this._errorCaps;

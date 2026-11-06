@@ -528,7 +528,8 @@ and `await rs.flush()` in its own handler.
   your code ignores is still reported as unhandled.
 * The SDK's own requests and log lines are never captured.
 * Hooks go in when the client is made, so errors during loading are caught.
-  At most 5 are held in memory until the first answer from Ravensight. If
+  At most 5 are held in memory until the first answer from Ravensight, and a
+  warning never pushes a real error out of them. If
   the game's error capture switch is on they are sent; if it is off they are
   discarded and the hooks come out. Nothing is installed without a key or
   before the player's yes under `consent: 'opt_in'`, and `setEnabled(false)`
