@@ -5,7 +5,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import Ravensight, { MemoryStorage, ERROR_CAPS, scrubText } from '../src/index.js';
+import { readFileSync } from 'node:fs';
 import { startMockServer, fakeClock } from './helpers/mock-server.js';
+
+const SCRUB_VECTORS = JSON.parse(readFileSync(new URL('./fixtures/scrub-vectors.json', import.meta.url), 'utf8'));
 
 const INGEST_KEY = 'gt_live_test_key';
 const REAL_FETCH = globalThis.fetch;
@@ -904,6 +907,11 @@ test('scrubText follows the contract rules', () => {
   ];
   for (const [input, expected] of cases) assert.equal(scrubText(input), expected, input);
   assert.equal(scrubText(null), '');
+});
+
+test('scrubText produces every shared contract vector', () => {
+  assert.ok(SCRUB_VECTORS.cases.length > 0);
+  for (const { name, in: input, out } of SCRUB_VECTORS.cases) assert.equal(scrubText(input), out, name);
 });
 
 test('the scrub runs before the cut, so a token past the limit cannot leak a prefix', async (t) => {

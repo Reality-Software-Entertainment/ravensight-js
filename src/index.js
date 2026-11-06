@@ -365,7 +365,8 @@ function unwrapFn(fn) {
  * a URL loses its query and fragment; bearer tokens, JWT-shaped strings,
  * `gt_` keys become [token]; emails become [email]; home directories become
  * ~; IPv4 and IPv6 addresses become [ip]; a run of 32 or more base64 or hex
- * characters with a digit in it becomes [token].
+ * characters with a digit in it becomes [token], unless it is a path of
+ * path words.
  */
 const SCRUB_RULES = [
   [/([a-z][a-z0-9+.-]*:\/\/[^\s?#'"<>()]+)[?#][^\s'"<>()]*/gi, '$1'],
@@ -380,10 +381,21 @@ const SCRUB_RULES = [
     /(^|[^0-9A-Za-z:.])((?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?|::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})(?![0-9A-Za-z:])/g,
     '$1[ip]',
   ],
-  // '/' is left out so a long file path is not mistaken for a token, and a
-  // run with no digit is an identifier, not a secret.
-  [/[A-Za-z0-9+=_-]{32,}/g, (run) => (/\d/.test(run) ? '[token]' : run)],
+  // A run with no digit is an identifier, not a secret. A run with '/' is
+  // kept only when every piece is a path word, so file paths survive and a
+  // secret with slashes does not.
+  [/[A-Za-z0-9+/=_-]{32,}/g, (run) => (/\d/.test(run) && !isPathRun(run) ? '[token]' : run)],
 ];
+
+const PATH_WORDS = [/^$/, /^[a-z0-9]+(?:[_-][a-z0-9]+)*$/, /^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$/, /^[A-Z0-9]{1,6}$/];
+
+/** True when a long run is a path: it has '/' and every piece is empty or a path word under 32 characters. */
+function isPathRun(run) {
+  return (
+    run.includes('/') &&
+    run.split('/').every((piece) => piece.length < 32 && PATH_WORDS.some((word) => word.test(piece)))
+  );
+}
 
 export function scrubText(value) {
   let text = String(value == null ? '' : value);
