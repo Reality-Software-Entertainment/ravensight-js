@@ -153,8 +153,11 @@ function withDom(t, { href = 'https://game.example.com/play/index.html' } = {}) 
 
   const consoleCalls = { error: [], warn: [] };
   const savedConsole = { error: console.error, warn: console.warn };
-  console.error = (...args) => consoleCalls.error.push(args);
-  console.warn = (...args) => consoleCalls.warn.push(args);
+  // Node may print its own process warning here the first time a global is
+  // touched; the tests count only the game's calls.
+  const fromNode = (args) => typeof args[0] === 'string' && args[0].startsWith('(node:');
+  console.error = (...args) => (fromNode(args) ? 0 : consoleCalls.error.push(args));
+  console.warn = (...args) => (fromNode(args) ? 0 : consoleCalls.warn.push(args));
   const errorSpy = console.error;
   const warnSpy = console.warn;
 
@@ -585,11 +588,14 @@ test("the SDK's own failing requests are never captured, wrapped fetch or not", 
   assert.equal(first.stats.errorsCaptured + second.stats.errorsCaptured, 0);
 });
 
-test("the SDK's own console lines are not captured or trailed", async (t) => {
+test("the SDK's own console lines and Node's process warnings are not captured or trailed", async (t) => {
   const dom = withDom(t);
   const { rs } = await startCapturing(t, dom, { errorCapture: { enabled: true, trail: true } });
   console.warn('[ravensight] something about the SDK');
   console.error('[ravensight] also the SDK');
+  console.error('(node:4242) ExperimentalWarning: localStorage is not available');
+  console.error('(node:4242) [DEP0040] DeprecationWarning: The punycode module is deprecated.');
+  console.warn('DeprecationWarning: Buffer() is deprecated');
   assert.equal(rs._trail.length, 0);
   assert.equal(errors(rs).length, 0);
 });
@@ -999,8 +1005,7 @@ test('a 200,000 character line is cut before the scrub, so capture stays fast', 
   dom.fire('window', 'error', { target: dom.win, error: Object.assign(new Error(huge), { stack: huge }) });
   const elapsed = performance.now() - started;
   assert.ok(elapsed < 50, 'took ' + elapsed.toFixed(1) + ' ms');
-  // Only ours: Node may print its own warning through console.error first.
-  const [fromConsole, uncaught] = errors(rs).filter((d) => d.rs_message.startsWith('aaa'));
+  const [fromConsole, uncaught] = errors(rs);
   assert.ok(fromConsole.rs_message.length <= 200);
   assert.ok(uncaught.rs_stack.length <= 2000);
   assert.ok(uncaught.rs_trail.length <= 1500);

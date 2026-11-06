@@ -728,6 +728,11 @@ function wrapConsole(undo) {
   }
 }
 
+/** A warning printed by Node itself, such as "(node:123) ExperimentalWarning: ...". */
+function isRuntimeWarning(text) {
+  return /^\(node:\d*\)/.test(text) || /\b(?:Experimental|Deprecation)Warning\b/.test(text);
+}
+
 function onConsole(level, args) {
   if (errorHooks.capturing) return;
   // Nothing is stringified unless a trail or a capture will use it.
@@ -747,8 +752,9 @@ function onConsole(level, args) {
     parts.push(preCut(describeValue(arg), MAX_STACK_CHARS));
   }
   const text = parts.join(' ');
-  // The SDK's own log lines are never captured.
-  if (text.startsWith('[ravensight]')) return;
+  // The SDK's own log lines are never captured, nor Node's own process
+  // warnings, which a game did not write.
+  if (text.startsWith('[ravensight]') || isRuntimeWarning(text)) return;
   eachErrorClient((client) => {
     client._trailLine(level, text);
     if (level === 'error') {
