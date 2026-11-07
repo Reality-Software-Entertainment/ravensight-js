@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 - 2026-11-06
 
 Follows the server's SDK delivery, ads and attribution, exposure and device
-contracts. The server releases for those contracts ship first; see "Server
-prerequisites" below.
+contracts. Needs a Ravensight server that accepts origins, signatures, gzip bodies,
+`rs_exposure` and the `rs_ad_*` and `rs_attr_*` keys; the hosted service at
+ravensight.io runs one.
 
 ### Changes for 0.6.0 games
 
@@ -55,7 +56,7 @@ prerequisites" below.
   secret is memory only. `signRequest` and `signedBeaconBody` are exported,
   and the shared delivery vectors run in `test/delivery.test.js`.
 * The 8,192 byte event check measures as the server does: a typed error's
-  message and stack count one byte a character (`eventDataBytes`).
+  message, stack and trail count one byte a character (`eventDataBytes`).
 * `trackAd`, `trackAdRevenue`, `microsFromDecimalString`, `microsFromRevenue`,
   `adFormatFrom` and `setAttribution`, sent once per device. UTM parameters
   are read on the first load of a new device id in a browser.
@@ -66,13 +67,6 @@ prerequisites" below.
 * The README states where the Node queue file lives (the home directory, or
   `queueDir`) and that browser storage cannot be kept out of backups.
 
-### Server prerequisites
-
-* `rs_exposure` must be accepted by public keys before this release: add it
-  to `SDK_AUTOMATIC_EVENTS` (it is not in the list on any server branch yet).
-* The Phase 2 delivery release (origin, signing, gzip, `index` on a 400) and
-  the Phase 5 `rs_ad_*` and `rs_attr_*` keys must be deployed first: a public
-  key refuses an unknown `rs_` key.
 
 ## 0.6.0 - 2026-11-06
 
