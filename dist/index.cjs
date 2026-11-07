@@ -41,6 +41,7 @@ const KNOWN_RS_KEYS = Object.freeze([
 
 const MAX_MESSAGE_CHARS = 200;
 const MAX_STACK_CHARS = 2000;
+const MAX_TRAIL_CHARS = 1500;
 const MAX_FPS_SAMPLES = 600;
 const SAMPLE_INTERVAL_MS = 1000;
 
@@ -180,12 +181,17 @@ function signedBeaconBody(sessionToken, secret, timestamp, body) {
 }
 
 /** Typed error text caps the server exempts from the byte ceiling (section 6). */
-const TYPED_TEXT_CAPS = Object.freeze({ rs_message: MAX_MESSAGE_CHARS, rs_stack: MAX_STACK_CHARS });
+const TYPED_TEXT_CAPS = Object.freeze({
+  rs_message: MAX_MESSAGE_CHARS,
+  rs_stack: MAX_STACK_CHARS,
+  rs_trail: MAX_TRAIL_CHARS,
+});
 
 /**
  * One event's data size as the server measures it: the UTF-8 bytes of its
- * JSON, except that a typed error's `rs_message` and `rs_stack`, within
- * their 200 and 2,000 character caps, count one byte a character.
+ * JSON, except that a typed error's `rs_message`, `rs_stack` and `rs_trail`,
+ * within their 200, 2,000 and 1,500 character caps, count one byte a
+ * character.
  */
 function eventDataBytes(data) {
   const json = JSON.stringify(data == null ? {} : data);
@@ -700,7 +706,6 @@ const ERROR_CAPS = Object.freeze({
   deadClick: 3,
 });
 const MAX_ERROR_TYPE_CHARS = 100;
-const MAX_TRAIL_CHARS = 1500;
 const MAX_TRAIL_LINE_CHARS = 120;
 const TRAIL_LINES = 20;
 const MAX_DEAD_CLICK_NAME_CHARS = 60;

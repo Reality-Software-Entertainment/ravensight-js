@@ -99,9 +99,9 @@ test('the 8 KB vectors through track(): a 2,000 character stack of control chara
   }
 });
 
-test('typed text vectors: the SDK cuts message to 200 and stack to 2,000, so an over-cap case conforms', () => {
+test('typed error vectors: the SDK cuts message to 200 and stack to 2,000, so an over-cap case conforms', () => {
   const rs = new Ravensight({ ingestKey: INGEST_KEY, storage: new MemoryStorage(), autoFlushMs: 0, deviceId: 'd', fetch: async () => { throw new Error('offline'); } });
-  for (const vector of VECTORS.publicKeyTypedText.cases) {
+  for (const vector of VECTORS.anyKeyEventSize.cases) {
     const data = expand(vector.data);
     if (data.rs_kind !== 'error') continue;
     assert.equal(rs.trackError({ severity: data.rs_severity, message: data.rs_message, stack: data.rs_stack }), true, vector.name);
