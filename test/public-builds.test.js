@@ -142,7 +142,7 @@ test('no key: inert, no storage writes, no fetch, no timer, no listeners, one wa
     await rs.resetDeviceId();
     assert.equal(rs.flushOnHidden(), false);
     assert.equal(rs.isEnabled(), false, 'setEnabled(true) does not start an inert client');
-    assert.deepEqual(await rs.dispose(), { sent: 0, dropped: 0 });
+    assert.deepEqual(await rs.dispose(), { sent: 0, dropped: 0, kept: 0 });
   }
 
   assert.deepEqual(storage.writes, [], 'nothing written to the injected storage');
@@ -171,13 +171,14 @@ test('a key and nothing else behaves as before: opt_out, no ravensight_optin, de
   const rs = makeClient(server, { storage });
   assert.equal(rs.consent, 'opt_out');
   assert.equal(rs.distribution, null);
-  assert.deepEqual(storage.writes, [['set', 'ravensight_device_id', rs.deviceId]]);
+  const own = () => storage.writes.filter((w) => !w[1].startsWith('ravensight_queue_'));
+  assert.deepEqual(own(), [['set', 'ravensight_device_id', rs.deviceId]]);
   const result = await rs.init();
   assert.deepEqual(result, { trackingEnabled: true, sessionReady: true, reason: null });
   assert.equal(rs.isEnabled(), true);
   rs.setEnabled(false);
   rs.setEnabled(true);
-  assert.deepEqual(storage.writes, [['set', 'ravensight_device_id', rs.deviceId]], 'opt-out is not stored');
+  assert.deepEqual(own(), [['set', 'ravensight_device_id', rs.deviceId]], 'opt-out is not stored');
   await rs.dispose();
 });
 
@@ -339,11 +340,11 @@ test('distribution is sent on POST /session, and validated', async (t) => {
 
 // --- Jitter --------------------------------------------------------------------
 
-test('backoff carries plus or minus 20 percent jitter; Retry-After stays exact', async (t) => {
+test('backoff carries a jitter factor in [0.5, 1); Retry-After stays exact', async (t) => {
   const cases = [
-    [0, 8000],
-    [0.5, 10000],
-    [0.999999, 12000],
+    [0, 5000],
+    [0.5, 7500],
+    [0.999999, 10000],
   ];
   for (const [r, expected] of cases) {
     const server = await startMockServer({ batchStatus: 503 });
@@ -382,7 +383,7 @@ test('a jittered wait never passes the 5 minute ceiling', async (t) => {
     await rs.flush();
     assert.ok(rs.retryInMs <= 300000, 'wait ' + rs.retryInMs);
   }
-  assert.equal(rs.retryInMs, 300000);
+  assert.equal(rs.retryInMs, 298500, 'the 300 second cap times the jitter factor');
   await rs.dispose({ flush: false });
 });
 
@@ -522,8 +523,9 @@ test('exact key sets: settings, session, batch, feedback, keepalive and beacon b
   assert.equal(settings.body, null, 'GET /settings has no body');
   assert.equal(settings.headers['content-type'], undefined);
 
-  const session = server.requestsTo('/api/v1/session')[0].body;
+  const { device, ...session } = server.requestsTo('/api/v1/session')[0].body;
   assert.deepEqual(keys(session), ['deviceId', 'gameVersion', 'platform', 'sdk']);
+  if (device) assert.ok(keys(device).every((k) => ['gpu', 'model', 'osVersion'].includes(k)), 'only the three device fields');
 
   rs.track('a', { level: 1 });
   rs.track('b');
@@ -558,7 +560,7 @@ test('exact key sets: settings, session, batch, feedback, keepalive and beacon b
 
   const full = makeClient(server, { distribution: 'native-release', deviceId: 'joined' });
   await full.joinSession('jt');
-  const joinedSession = server.requestsTo('/api/v1/session').at(-1).body;
+  const { device: _device, ...joinedSession } = server.requestsTo('/api/v1/session').at(-1).body;
   assert.deepEqual(keys(joinedSession), ['deviceId', 'distribution', 'gameVersion', 'joinToken', 'platform', 'sdk']);
   await full.dispose();
 });

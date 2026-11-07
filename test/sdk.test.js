@@ -155,7 +155,7 @@ test('an invalid key on POST /session ends the run: queue cleared, no retry, one
   assert.equal(server.requestsTo('/api/v1/settings').length, 1);
   assert.equal(warnings.filter((w) => w.includes('invalid_key')).length, 1, 'the warning fires once');
   const disposed = await rs.dispose();
-  assert.deepEqual(disposed, { sent: 0, dropped: 0 }, 'nothing is left to send at the end');
+  assert.deepEqual(disposed, { sent: 0, dropped: 0, kept: 0 }, 'nothing is left to send at the end');
 });
 
 test('a 401 or 403 on the settings check ends the run before any session', async (t) => {
@@ -324,7 +324,7 @@ test('events are batched at the 50 event server limit', async (t) => {
   assert.equal(server.state.events[0].event, 'tick');
   assert.equal(server.state.events[0].data.i, 0);
   assert.equal(typeof server.state.events[0].timestamp, 'number');
-  assert.ok(server.state.events[0].timestamp < 1e11, 'timestamps are unix seconds, not milliseconds');
+  assert.ok(server.state.events[0].timestamp > 1e11, 'timestamps are unix milliseconds');
   assert.equal(rs.queue.length, 0);
   rs.dispose();
 });
@@ -381,7 +381,7 @@ test('a 429 honors Retry-After and never drops the queued events', async (t) => 
 
   const attemptsAfterFirst = server.requestsTo('/api/v1/track/batch').length;
   const blocked = await rs.flush();
-  assert.equal(blocked.skipped, 'backoff');
+  assert.equal(blocked.skipped, 'retry_after', 'an explicit flush never cuts a Retry-After short');
   assert.equal(
     server.requestsTo('/api/v1/track/batch').length,
     attemptsAfterFirst,
@@ -411,11 +411,11 @@ test('a 429 without Retry-After falls back to exponential backoff', async (t) =>
   rs.track('a');
 
   await rs.flush();
-  assert.equal(rs.retryInMs, 10000, 'first backoff is the 10 second floor');
+  assert.equal(rs.retryInMs, 7500, 'first backoff is the 10 second floor times the jitter factor (0.75 here)');
 
   clock.advance(10001);
   await rs.flush();
-  assert.equal(rs.retryInMs, 20000, 'backoff doubles');
+  assert.equal(rs.retryInMs, 15000, 'backoff doubles');
   assert.equal(rs.queue.length, 1);
   rs.dispose();
 });
@@ -651,7 +651,7 @@ test('the generated CommonJS build exposes the same surface', () => {
   assert.equal(typeof cjs.Ravensight.prototype.setDeviceId, 'function');
   assert.equal(typeof cjs.Ravensight.prototype.resetDeviceId, 'function');
   assert.equal(cjs.MAX_BATCH_SIZE, 50);
-  assert.deepEqual(cjs.RS_KINDS, ['level_start', 'level_complete', 'death', 'none', 'purchase', 'resource', 'progression', 'error', 'health']);
+  assert.deepEqual(cjs.RS_KINDS, ['level_start', 'level_complete', 'death', 'none', 'purchase', 'resource', 'progression', 'error', 'health', 'ad', 'attribution']);
   assert.equal(typeof cjs.Ravensight.prototype.joinSession, 'function');
   assert.equal(typeof cjs.MemoryStorage, 'function');
   assert.equal(typeof cjs.RavensightError, 'function');
@@ -731,7 +731,7 @@ test('dispose flushes the queue by default and the server receives the events', 
   assert.equal(rs.isActive, false);
 
   const result = await pending;
-  assert.deepEqual(result, { sent: 3, dropped: 0 });
+  assert.deepEqual(result, { sent: 3, dropped: 0, kept: 0 });
   assert.deepEqual(
     server.state.events.map((e) => e.event),
     ['a', 'b', 'c'],
@@ -746,13 +746,13 @@ test('dispose({ flush: false }) sends nothing and counts the queue as dropped', 
   const server = await startMockServer();
   t.after(() => server.close());
 
-  const rs = makeClient(server);
+  const rs = makeClient(server, { persistQueue: false });
   await rs.init();
   rs.track('a');
   rs.track('b');
 
   const result = await rs.dispose({ flush: false });
-  assert.deepEqual(result, { sent: 0, dropped: 2 });
+  assert.deepEqual(result, { sent: 0, dropped: 2, kept: 0 });
   assert.equal(server.requestsTo('/api/v1/track/batch').length, 0);
   assert.equal(server.state.events.length, 0);
   assert.equal(rs.queue.length, 0);
@@ -763,13 +763,13 @@ test('dispose against a failing server reports the drop', async (t) => {
   const server = await startMockServer({ batchStatus: 503 });
   t.after(() => server.close());
 
-  const rs = makeClient(server);
+  const rs = makeClient(server, { persistQueue: false });
   await rs.init();
   rs.track('a');
   rs.track('b');
 
   const result = await rs.dispose();
-  assert.deepEqual(result, { sent: 0, dropped: 2 });
+  assert.deepEqual(result, { sent: 0, dropped: 2, kept: 0 });
   assert.equal(server.requestsTo('/api/v1/track/batch').length, 1, 'one attempt, no retry loop');
   assert.equal(rs.stats.dropped, 2);
 });
@@ -778,7 +778,7 @@ test('dispose against a hung server resolves within the timeout', async (t) => {
   const server = await startMockServer({ batchDelayMs: 5000 });
   t.after(() => server.close());
 
-  const rs = makeClient(server);
+  const rs = makeClient(server, { persistQueue: false });
   await rs.init();
   rs.track('a');
   rs.track('b');
@@ -789,7 +789,7 @@ test('dispose against a hung server resolves within the timeout', async (t) => {
   const elapsed = Date.now() - started;
 
   assert.ok(elapsed < 1000, 'resolved in ' + elapsed + 'ms, not after the server answered');
-  assert.deepEqual(result, { sent: 0, dropped: 3 });
+  assert.deepEqual(result, { sent: 0, dropped: 3, kept: 0 });
   assert.equal(rs.queue.length, 0);
   assert.equal(rs.stats.dropped, 3);
 });
@@ -817,7 +817,7 @@ test('dispose in a browser never re sends the batch a timed out flush still has 
   const server = await startMockServer({ batchDelayMs: 300 });
   t.after(() => server.close());
 
-  const rs = makeClient(server, { env: { hasFetchKeepalive: true, hasBeacon: false } });
+  const rs = makeClient(server, { env: { hasFetchKeepalive: true, hasBeacon: false }, persistQueue: false });
   await rs.init();
   // The 50th track starts a flush of the first 50, which hangs for 300ms.
   for (let i = 0; i < 70; i++) rs.track('e', { i });
@@ -825,7 +825,7 @@ test('dispose in a browser never re sends the batch a timed out flush still has 
   const result = await rs.dispose({ timeoutMs: 50 });
   assert.deepEqual(
     result,
-    { sent: 20, dropped: 50 },
+    { sent: 20, dropped: 50, kept: 0 },
     'the unload request carried only the 20 beyond the in flight batch, whose outcome is unknown',
   );
   assert.equal(rs.stats.dropped, 50);
@@ -843,13 +843,13 @@ test('dispose in a browser skips the unload request when the hung batch covers t
   const server = await startMockServer({ batchDelayMs: 300 });
   t.after(() => server.close());
 
-  const rs = makeClient(server, { env: { hasFetchKeepalive: true, hasBeacon: false } });
+  const rs = makeClient(server, { env: { hasFetchKeepalive: true, hasBeacon: false }, persistQueue: false });
   await rs.init();
   rs.track('a');
   rs.track('b');
 
   const result = await rs.dispose({ timeoutMs: 50 });
-  assert.deepEqual(result, { sent: 0, dropped: 2 }, 'a request that timed out counts as dropped');
+  assert.deepEqual(result, { sent: 0, dropped: 2, kept: 0 }, 'a request that timed out counts as dropped');
 
   await waitFor(() => server.state.events.length === 2);
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -861,11 +861,11 @@ test('a session that opens after dispose timed out is never used', async (t) => 
   const server = await startMockServer({ sessionDelayMs: 200 });
   t.after(() => server.close());
 
-  const rs = makeClient(server);
+  const rs = makeClient(server, { persistQueue: false });
   rs.track('a');
 
   const result = await rs.dispose({ timeoutMs: 50 });
-  assert.deepEqual(result, { sent: 0, dropped: 1 });
+  assert.deepEqual(result, { sent: 0, dropped: 1, kept: 0 });
 
   await waitFor(() => server.state.tokens.length === 1);
   await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1175,7 +1175,7 @@ test('dispose in a browser sends only the head run in its unload request', async
   rs.track('c', {}, { deviceId: 'p2' });
 
   const result = await rs.dispose();
-  assert.deepEqual(result, { sent: 2, dropped: 1 }, 'the p2 event had no session and was dropped');
+  assert.deepEqual(result, { sent: 2, dropped: 0, kept: 1 }, 'the p2 event had no session and stays stored for the next launch');
   await waitFor(() => server.requestsTo('/api/v1/track/batch').length === 2);
   const sizes = server.requestsTo('/api/v1/track/batch').map((r) => r.body.events.length);
   assert.deepEqual(sizes, [2, 2], 'one failed flush, then one unload request for the host run');
@@ -1210,7 +1210,8 @@ test('joinSession sends the join token on that device id\'s next session, once',
   await rs.flush();
 
   const sessions = server.requestsTo('/api/v1/session');
-  assert.deepEqual(sessions[1].body, {
+  const { device: _device, ...joinedBody } = sessions[1].body;
+  assert.deepEqual(joinedBody, {
     deviceId: 'p7',
     gameVersion: '1.2.3',
     platform: 'test',
@@ -1534,7 +1535,7 @@ test('a 403 playtest_job_closed is fatal: tracking stops and the timer with it',
 // --- Reserved rs_ keys ----------------------------------------------------
 
 test('RS_KINDS is every rs_kind value, frozen', () => {
-  assert.deepEqual(RS_KINDS, ['level_start', 'level_complete', 'death', 'none', 'purchase', 'resource', 'progression', 'error', 'health']);
+  assert.deepEqual(RS_KINDS, ['level_start', 'level_complete', 'death', 'none', 'purchase', 'resource', 'progression', 'error', 'health', 'ad', 'attribution']);
   assert.ok(Object.isFrozen(RS_KINDS));
 });
 
@@ -1896,7 +1897,7 @@ const lastEvent = (rs) => {
 test('RS_KINDS holds the level kinds and the five typed kinds, frozen', () => {
   assert.deepEqual(RS_KINDS, [
     'level_start', 'level_complete', 'death', 'none',
-    'purchase', 'resource', 'progression', 'error', 'health',
+    'purchase', 'resource', 'progression', 'error', 'health', 'ad', 'attribution',
   ]);
   assert.ok(Object.isFrozen(RS_KINDS));
 });
@@ -1985,12 +1986,12 @@ test('reserved keys win over caller data, the event name can be overridden, bad 
   assert.equal(e.data.rs_kind, 'purchase');
   assert.doesNotThrow(() => rs.trackPurchase({ amount: 4.99, currency: 7 }));
   assert.equal(lastEvent(rs).data.rs_amount, 4.99, 'passed through for the server to flag');
-  assert.doesNotThrow(() => rs.trackError());
   assert.doesNotThrow(() => rs.trackResource(null));
   rs.trackProgression({ status: 'weird', p1: 'x' });
   assert.equal(lastEvent(rs).event, 'progression_weird');
   rs.trackResource({ event: 'loot', flow: 'source', resource: 'g', amount: 1 });
   assert.equal(lastEvent(rs).event, 'loot');
+  assert.doesNotThrow(() => rs.trackError());
   await rs.dispose({ flush: false });
 });
 

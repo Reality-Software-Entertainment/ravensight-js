@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.7.0 - 2026-11-06
+
+Follows the server's SDK delivery, ads and attribution, exposure and device
+contracts. Needs a Ravensight server that accepts origins, signatures, gzip bodies,
+`rs_exposure` and the `rs_ad_*` and `rs_attr_*` keys; the hosted service at
+ravensight.io runs one.
+
+### Changes for 0.6.0 games
+
+* The queue is persisted by default: one `localStorage` entry per ingest key in
+  a browser, one file per key in Node (`~/.ravensight`, or `queueDir`),
+  written atomically and read back at start. Events survive a reload, a crash
+  or a lost network. At most 500 events, none older than 89 days.
+  `persistQueue: false` restores the in-memory queue.
+* `dispose()` keeps what it could not send in the persisted queue for the next
+  launch and reports it as `kept`; it is dropped only with
+  `persistQueue: false`.
+* Event timestamps are unix milliseconds (were seconds).
+* Retry waits are multiplied by a random factor between 0.5 and 1 (were plus
+  or minus 20 percent). `random: () => 0.5` now gives three quarters of the
+  step.
+* An explicit `flush()` cuts a backoff wait short. It never cuts a server
+  `Retry-After` short, and reports `skipped: 'retry_after'` inside one. The
+  flush timer and the 50 event threshold still wait out the backoff.
+* A `400` that names an event by `index` drops only that event. Only
+  `400 batch_too_large` halves the batch now; any other `400` drops the
+  request's events. A `403` on a batch keeps the events and stops sending
+  until the next launch (`skipped: 'refused'`). A second `401` in a row waits
+  for the backoff. `413` splits, `415` resends once uncompressed, and a `503`
+  with `Retry-After` waits exactly that long.
+* The error queue rules every SDK shares: gameplay events go ahead of queued
+  automatic captures (never inside a batch awaiting an answer; 0.6.0 kept
+  arrival order). In a full queue an incoming capture evicts the oldest
+  capture, or is dropped when there is none, and never evicts gameplay.
+  `trackError` is gameplay. The capture flag is stored with the queue,
+  `rs_trail` never is (a restored capture has none), a capture is written to
+  storage at once, and `resetDeviceId()` and an opt-out delete persisted
+  captures.
+* A `413` on a batch halves it as in 0.6.0; only a `400 batch_too_large`
+  halves it among the `400` answers.
+* Experiment tags follow the exposure contract: a config fetch alone tags
+  nothing. The first `getConfig` read in a session sends one `rs_exposure`
+  event and tags that session's later events. A well formed `rs_exp_<key>` of
+  the game's own is no longer overwritten.
+
+### Added
+
+* Each event remembers the `origin` of the session it was tracked under, and
+  an event sent from a later session carries it, so a replayed event is stored
+  under its own session, build and platform.
+* gzip for request bodies of 1,024 bytes or more.
+* Request signing when `POST /session` answers with `signing`: headers on
+  ordinary and keepalive sends, the signed body envelope on a beacon. The
+  secret is memory only. `signRequest` and `signedBeaconBody` are exported,
+  and the shared delivery vectors run in `test/delivery.test.js`.
+* The 8,192 byte event check measures as the server does: a typed error's
+  message, stack and trail count one byte a character (`eventDataBytes`).
+* `trackAd`, `trackAdRevenue`, `microsFromDecimalString`, `microsFromRevenue`,
+  `adFormatFrom` and `setAttribution`, sent once per device. UTM parameters
+  are read on the first load of a new device id in a browser.
+* `device` on `POST /session`: the WebGL renderer in a browser where it is
+  available without a prompt, the OS release in Node, or the game's own
+  `device` option.
+
+* The README states where the Node queue file lives (the home directory, or
+  `queueDir`) and that browser storage cannot be kept out of backups.
+
+
 ## 0.6.0 - 2026-11-06
 
 ### Added
