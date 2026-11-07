@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      # pretest regenerates dist/index.cjs, and the tests load it with require.
+      - run: npm test
+
+      - name: Committed CommonJS build is current
+        run: |
+          npm run build
+          if ! git diff --exit-code -- dist; then
+            echo "dist/index.cjs is stale: run npm run build and commit it"
+            exit 1
+          fi
+
+      - name: Package contents
+        run: npm pack --dry-run
