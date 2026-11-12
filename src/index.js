@@ -4326,7 +4326,12 @@ export class Ravensight {
     this._listenersBound = true;
   }
 
-  /** Sends `game_exited` once, on the first `pagehide`, through the hidden-flush path. */
+  /**
+   * Sends `game_exited` once for each start, on the first `pagehide` after it,
+   * through the hidden-flush path. A page restored from the back-forward cache
+   * is played again after its exit went out, so that restore is a new start:
+   * `game_started` is queued again and the next `pagehide` sends its own exit.
+   */
   _bindPageHide() {
     if (this._pageHideBound || typeof window === 'undefined' || !window) return;
     if (typeof window.addEventListener !== 'function') return;
@@ -4337,7 +4342,15 @@ export class Ravensight {
       if (!this.track('game_exited')) return;
       this._flushOnHidden(this._inflightSize);
     };
+    this._onPageShow = (event) => {
+      // Only a restore (`persisted`), and only after an exit this client sent:
+      // a first load fires pageshow too, and its start is already queued.
+      if (!event || !event.persisted || !this._exitSent) return;
+      this._exitSent = false;
+      this._startSent = this.track('game_started');
+    };
     window.addEventListener('pagehide', this._onPageHide);
+    window.addEventListener('pageshow', this._onPageShow);
     this._pageHideBound = true;
   }
 
@@ -4345,11 +4358,13 @@ export class Ravensight {
     if (!this._pageHideBound) return;
     try {
       window.removeEventListener('pagehide', this._onPageHide);
+      window.removeEventListener('pageshow', this._onPageShow);
     } catch (_err) {
       // ignore
     }
     this._pageHideBound = false;
     this._onPageHide = null;
+    this._onPageShow = null;
   }
 
   _unbindLifecycle() {

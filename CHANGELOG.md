@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+* A page restored from the back-forward cache sends `game_started` again, and
+  the next `pagehide` sends its own `game_exited`. Before, the restored page was
+  played with no start, and its exit was never sent because the first one
+  already had been, so the events after a restore followed a `game_exited`. A
+  first load, a plain `pageshow`, a client that sent no exit and an opted-out
+  player are unchanged. A game that counts `game_started` sees one more start
+  for each restore.
+
 ## 0.12.0 - 2026-11-19
 
 * Add `identify(accountId)` and `resetIdentity()` for games with their own

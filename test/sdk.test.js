@@ -1791,14 +1791,64 @@ test('game_exited is sent once on pagehide, even with two pagehide events', asyn
   await rs.dispose({ flush: false });
 });
 
+test('a page restored from the back-forward cache starts again, and exits again', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const b = withBrowser(t);
+  const rs = makeClient(server);
+  await rs.init();
+  await rs.flush();
+  await waitFor(() => rs.queue.length === 0);
+  b.fire('pageshow', { persisted: false });
+  b.fire('pageshow', { persisted: true });
+  assert.deepEqual(names(rs), [], 'a pageshow before any exit is the first load, not a restore');
+
+  b.fire('pagehide');
+  await waitFor(() => server.requestsTo('/api/v1/track/batch').length >= 2);
+  b.fire('pageshow', { persisted: false });
+  assert.deepEqual(names(rs), [], 'a plain pageshow is not a new start');
+  b.fire('pageshow', { persisted: true });
+  b.fire('pageshow', { persisted: true });
+  assert.deepEqual(names(rs), ['game_started'], 'one start for the restore, however many pageshow events fire');
+
+  b.fire('pagehide');
+  b.fire('pagehide');
+  await waitFor(() => server.requestsTo('/api/v1/track/batch').flatMap((r) => r.body.events).filter((e) => e.event === 'game_exited').length >= 2);
+  const sent = server.requestsTo('/api/v1/track/batch').flatMap((r) => r.body.events.map((e) => e.event));
+  assert.deepEqual(sent.filter((n) => n === 'game_started'), ['game_started', 'game_started']);
+  assert.deepEqual(sent.filter((n) => n === 'game_exited'), ['game_exited', 'game_exited']);
+  await rs.dispose({ flush: false });
+});
+
+test('a restored page sends no start after the player opted out, and no exit after that', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const b = withBrowser(t);
+  const rs = makeClient(server);
+  await rs.init();
+  await rs.flush();
+  await waitFor(() => rs.queue.length === 0);
+  b.fire('pagehide');
+  await waitFor(() => server.requestsTo('/api/v1/track/batch').length >= 2);
+  rs.setEnabled(false);
+  b.fire('pageshow', { persisted: true });
+  b.fire('pagehide');
+  assert.deepEqual(names(rs), []);
+  const sent = server.requestsTo('/api/v1/track/batch').flatMap((r) => r.body.events.map((e) => e.event));
+  assert.deepEqual(sent.filter((n) => n === 'game_started' || n === 'game_exited'), ['game_started', 'game_exited']);
+  await rs.dispose({ flush: false });
+});
+
 test('dispose removes the pagehide listener', async (t) => {
   const server = await startMockServer();
   t.after(() => server.close());
   const b = withBrowser(t);
   const rs = makeClient(server);
   assert.equal(b.count('pagehide'), 1);
+  assert.equal(b.count('pageshow'), 1);
   await rs.dispose({ flush: false });
   assert.equal(b.count('pagehide'), 0);
+  assert.equal(b.count('pageshow'), 0);
 });
 
 test('a client that starts disabled sends no game_exited after setEnabled(true)', async (t) => {

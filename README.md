@@ -541,9 +541,12 @@ them by hand:
   through the page hide flush (keepalive). It needs a session, so `init()` must
   have opened one first, otherwise it stays queued. It is only queued when this
   client queued `game_started`, so a client that starts disabled sends neither
-  automatic event. It is sent once, however many `pagehide` events fire, and
-  `dispose()` removes the listener. A page restored from the back-forward cache
-  sends no second `game_started`. A game that calls `dispose()` mid-page (for
+  automatic event. It is sent once for each start, however many `pagehide`
+  events fire, and `dispose()` removes the listener. A page restored from the
+  back-forward cache (the player comes back with the browser's back or forward
+  button after the exit went out) is a new start: `game_started` is queued
+  again, and the next `pagehide` sends its own `game_exited`, so starts and
+  exits stay paired. A game that calls `dispose()` mid-page (for
   example a single-page app unmounting the game) should track `game_exited`
   itself first, because `dispose()` unbinds the page hide listener and sends no
   exit.
