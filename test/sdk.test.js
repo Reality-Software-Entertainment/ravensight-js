@@ -1839,6 +1839,19 @@ test('a restored page sends no start after the player opted out, and no exit aft
   await rs.dispose({ flush: false });
 });
 
+test('two init() calls at once share one run: one settings read and one session', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  const first = rs.init();
+  const second = rs.init();
+  assert.equal(first, second, 'the second call gets the first call\'s promise');
+  assert.deepEqual(await first, await second);
+  assert.equal(server.requestsTo('/api/v1/session').length, 1);
+  assert.equal(server.requestsTo('/api/v1/settings').length, 1);
+  await rs.dispose({ flush: false });
+});
+
 test('dispose removes the pagehide listener', async (t) => {
   const server = await startMockServer();
   t.after(() => server.close());
