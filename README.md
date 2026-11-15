@@ -613,6 +613,21 @@ the creative, with source `utm`. No other parameter is read. An attribution
 partner's install callback names the device by `rs.deviceId`; pass it to the
 partner as its customer user id before the partner starts.
 
+### Campaign links
+
+A Ravensight campaign link (`https://go.ravensight.io/...`) that points at a
+web page adds `rs_link=<link id>` to the address it redirects to. When the SDK
+runs on that page, it reads `rs_link` from `location.search` once, when the
+client starts, and sends it as `campaignLink` with the first `POST /session`
+it opens. Later sessions of the same page do not send it, nothing is stored,
+and the page address is left exactly as it is. The server keeps it only when
+it names a link of the same game, and then counts the player and the session
+on the Campaign links page, by link. The id is one the studio created, not
+personal data. It follows the same consent as everything else: with
+`consent: 'opt_in'` it goes with the first session after the player's yes,
+and an opted out player sends nothing. Nothing to call; it needs SDK 0.8.0 or
+later.
+
 ## Public builds
 
 For a game anyone can download, fork or play in a browser: a demo, a game
@@ -707,8 +722,10 @@ events you send, the SDK sends:
   send your own values instead. The server derives the country itself; the SDK
   never sends one.
 * **Attribution**, once per install: the `utm_source`, `utm_campaign`,
-  `utm_term` and `utm_content` values of the landing URL when any is present,
-  and nothing else from the URL.
+  `utm_term` and `utm_content` values of the landing URL when any is present.
+* **Campaign link**, once per page load, on the first `POST /session`: the
+  `rs_link` value of the landing URL when it is a link id, and nothing else
+  from the URL.
 
 The persisted queue holds queued events and each session's opaque origin
 stamp in the same storage; never the session's signing secret.

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 - 2026-11-15
+
+* Campaign links: in a browser, `rs_link` on the landing address (added by a
+  Ravensight campaign link that points at a web page) is sent once, as
+  `campaignLink` on the first `POST /session` of the page, so the Campaign
+  links page can count the players and sessions each link brought. Only a
+  24 character link id is read; nothing is stored, the page address is not
+  changed, a playtest run and a joined session never send it, and consent and
+  opt out apply as to every other field. A server that does not know the field
+  ignores it.
+
 ## 0.7.0 - 2026-11-06
 
 Follows the server's SDK delivery, ads and attribution, exposure and device

@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -447,6 +447,19 @@ const EXPIRY_SKEW_MS = 5000;
  * track() and never sent.
  */
 const MAX_EVENT_BYTES = 8192;
+const CAMPAIGN_LINK_PATTERN = /^[a-f0-9]{24}$/i;
+
+/** A campaign link id from a landing query string (`rs_link`), or null. */
+function campaignLinkFrom(search) {
+  if (!search) return null;
+  try {
+    const value = new URLSearchParams(search).get('rs_link');
+    return value && CAMPAIGN_LINK_PATTERN.test(value) ? value.toLowerCase() : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 /** Written only with consent 'opt_in', once the player has said yes. */
 const OPTIN_KEY = 'ravensight_optin';
 const CONSENT_MODES = Object.freeze(['opt_out', 'opt_in']);
@@ -1536,6 +1549,13 @@ class Ravensight {
     } catch (_err) {
       // No location: no UTM attribution.
     }
+    /**
+     * The Ravensight campaign link this page was reached by: `rs_link` on the
+     * landing address, which a campaign link adds on its redirect. A link id the
+     * studio made, nothing personal. Sent once, on the first session this client
+     * opens; nothing is stored and the page address is left as it is.
+     */
+    this._campaignLink = campaignLinkFrom(this._landingSearch);
 
     // Never the error capture wrapper: the SDK's own requests are not observed.
     const nativeFetch = unwrapFn(opts.fetch || (typeof fetch === 'function' ? fetch : null));
@@ -3314,10 +3334,14 @@ class Ravensight {
     if (this.distribution) body.distribution = this.distribution;
     const device = this._deviceFields();
     if (device) body.device = device;
+    // The page's own player only, never a playtest run, and once.
+    const campaignLink = this._campaignLink && deviceId === this.deviceId && !this._playtestToken && !joinToken ? this._campaignLink : null;
+    if (campaignLink) body.campaignLink = campaignLink;
 
     const res = await this._request('POST', '/session', { headers, body });
 
     if (res.status === 201 && res.body && res.body.token) {
+      if (campaignLink) this._campaignLink = null;
       const token = String(res.body.token);
       if (this._disposed) {
         // dispose() finished while this was in flight. Do not store it.
