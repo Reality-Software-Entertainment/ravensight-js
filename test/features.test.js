@@ -294,3 +294,74 @@ test('no device field known: no device object', (t) => {
   assert.equal(rs._deviceFields(), null);
   rs.dispose({ flush: false });
 });
+
+// --- Campaign link -----------------------------------------------------------------
+
+const LINK_ID = '64b0000000000000000000a1';
+
+test('rs_link on the landing address goes once, as campaignLink on the first POST /session, and the address is left alone', async (t) => {
+  withPage(t, { search: `?lang=en&rs_link=${LINK_ID.toUpperCase()}&utm_source=x` });
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = new Ravensight({ ingestKey: INGEST_KEY, apiUrl: server.url, storage: new MemoryStorage(), autoFlushMs: 0, autoEvents: false });
+  await rs.init();
+  assert.equal(server.requestsTo('/api/v1/session')[0].body.campaignLink, LINK_ID);
+  // A later session of the same client (expiry, a new device id) carries none.
+  await rs._createSession(rs.deviceId, rs._sessionEntry(rs.deviceId));
+  assert.equal(server.requestsTo('/api/v1/session')[1].body.campaignLink, undefined);
+  assert.equal(globalThis.window.location.search, `?lang=en&rs_link=${LINK_ID.toUpperCase()}&utm_source=x`);
+  await rs.dispose();
+});
+
+test('no rs_link, or one that is not a link id: no campaignLink', async (t) => {
+  for (const search of ['?ref=x', '?rs_link=abc', '?rs_link=' + 'g'.repeat(24), '']) {
+    withPage(t, { search });
+    const server = await startMockServer();
+    const rs = new Ravensight({ ingestKey: INGEST_KEY, apiUrl: server.url, storage: new MemoryStorage(), autoFlushMs: 0, autoEvents: false });
+    await rs.init();
+    assert.equal(server.requestsTo('/api/v1/session')[0].body.campaignLink, undefined, search);
+    await rs.dispose();
+    await server.close();
+  }
+});
+
+test('an opt-in player sends the link only with the session after the yes, and an opted-out one never', async (t) => {
+  withPage(t, { search: `?rs_link=${LINK_ID}` });
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = new Ravensight({ ingestKey: INGEST_KEY, apiUrl: server.url, storage: new MemoryStorage(), consent: 'opt_in', autoFlushMs: 0, autoEvents: false });
+  await rs.init().catch(() => {});
+  assert.equal(server.requestsTo('/api/v1/session').length, 0, 'no session before the yes');
+  rs.setEnabled(true);
+  await rs.init();
+  assert.equal(server.requestsTo('/api/v1/session')[0].body.campaignLink, LINK_ID);
+  await rs.dispose();
+  const before = server.requestsTo('/api/v1/session').length;
+  const optedOut = new Ravensight({ ingestKey: INGEST_KEY, apiUrl: server.url, storage: new MemoryStorage(), enabled: false, autoFlushMs: 0, autoEvents: false });
+  await optedOut.init().catch(() => {});
+  assert.equal(server.requestsTo('/api/v1/session').length, before);
+  await optedOut.dispose();
+});
+
+test('a failed session keeps the link for the next attempt', async (t) => {
+  withPage(t, { search: `?rs_link=${LINK_ID}` });
+  const bodies = [];
+  let fail = true;
+  const fetchStub = async (url, init) => {
+    const path = new URL(url).pathname;
+    const reply = (status, body) => ({ status, headers: new Headers(), text: async () => JSON.stringify(body) });
+    if (path.endsWith('/session')) {
+      bodies.push(JSON.parse(init.body));
+      if (fail) return reply(500, { error: 'internal_error' });
+      return reply(201, { token: 'tok', expiresIn: 3600 });
+    }
+    if (path.endsWith('/settings')) return reply(200, { trackingEnabled: true });
+    return reply(200, {});
+  };
+  const rs = client({ deviceId: undefined, fetch: fetchStub, autoEvents: false });
+  await rs._ensureSession().catch(() => {});
+  fail = false;
+  await rs._ensureSession();
+  assert.deepEqual(bodies.map((body) => body.campaignLink), [LINK_ID, LINK_ID]);
+  rs.dispose({ flush: false });
+});
