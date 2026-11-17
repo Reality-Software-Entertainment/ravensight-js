@@ -78,6 +78,15 @@ test('network retry keeps IDs; authorization rejection drops permanently invalid
   await site.flush(); assert.equal(site._queue[0].eventId, id); site._retryAt = 0;
   site._fetch = async () => ({ status: 401, ok: false, json: async () => ({ error: 'invalid_site_key' }) }); await site.flush(); assert.equal(site._queue.length, 0);
 });
+test('fresh activity resumes after pause cooldown without billable probes or catch-up', async () => {
+  const win = browser(); let requests = 0;
+  const site = tracker({ fetch: async (_url, request) => { requests++; const events = JSON.parse(request.body).events; return { ok: false, status: 429, json: async () => ({ accepted: 0, duplicates: 0, dropped: 0, refused: events.length, acceptedIds: [], droppedIds: [], refusedIds: events.map(event => event.eventId), paused: true, reason: 'needs_funds' }) }; } });
+  await site.flush(); assert.equal(site._queue.length, 0); assert.equal(site.track('before_refill'), false);
+  site._pauseUntil = Date.now() - 1; await site.flush(); assert.equal(requests, 1); // no synthetic probe
+  site._fetch = async (_url, request) => { const events = JSON.parse(request.body).events; assert.equal(events.length, 1); assert.equal(events[0].name, 'after_refill'); return ok(events); };
+  assert.equal(site.track('after_refill'), true); await site.flush(); assert.equal(site._queue.length, 0);
+  win.navigator.globalPrivacyControl = true; assert.equal(site.track('private'), false); site.optOut(); win.navigator.globalPrivacyControl = false; assert.equal(site.track('denied'), false);
+});
 test('heatmaps capture structural selectors only, exclude form regions, combine scroll and stay bounded', () => {
   const win = browser(); const site = tracker({ heatmaps: true });
   assert.equal(site._summarize(), false);

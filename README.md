@@ -1052,7 +1052,9 @@ six summaries are emitted per page visit, and idle pages emit none.
 anonymous identity. Call `site.destroy()` when removing the tracker. Delivery
 retries preserve event IDs and acknowledge partial batches. A funding pause
 clears the queue and stops capture: it does not accumulate a later catch-up
-bill. After capacity is restored, `site.resume()` explicitly starts collection.
+bill. After a one-minute cooldown, fresh activity can try again without a page
+reload; the SDK sends no heartbeat or old events to probe capacity. Calling
+`site.resume()` explicitly starts collection sooner after capacity is restored.
 Each accepted page view, custom event, or combined heatmap summary consumes one
 event from the same account meter as gameplay and forms. The Website dashboard
 shows the last accepted event so you can verify installation.

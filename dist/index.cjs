@@ -4246,7 +4246,7 @@ class SiteTracker {
     try { if (this._storage.getItem(this._preferenceKey) === 'true') this._allowed = false; } catch {}
     this._heatmaps = options.heatmaps === true;
     this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null;
-    this._paused = false; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
+    this._paused = false; this._pauseUntil = 0; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
     this._lastLocation = null; this._page = null; this._clicks = new Map(); this._scroll = Array(10).fill(0);
     this._summaryCount = 0; this._summaryStart = Date.now(); this._pageActive = false;
     this._on(this._window, 'popstate', () => this._navigation());
@@ -4277,7 +4277,12 @@ class SiteTracker {
     this._listeners.push(() => target.removeEventListener(name, listener, options));
   }
   _privacyBlocked() { return this._navigator.globalPrivacyControl === true || this._navigator.doNotTrack === '1' || this._window?.doNotTrack === '1'; }
-  _enabled() { return this._allowed && !this._privacyBlocked() && !this._paused && !this._destroyed; }
+  _enabled() {
+    // Cooldown never creates an event. Only fresh activity can collect again;
+    // the refused queue was discarded at the pause and is never replayed.
+    if (this._paused && Date.now() >= this._pauseUntil) this._paused = false;
+    return this._allowed && !this._privacyBlocked() && !this._paused && !this._destroyed;
+  }
   _read() { try { return JSON.parse(this._storage.getItem(this._storageKey) || 'null'); } catch { return null; } }
   _write(value) { try { value ? this._storage.setItem(this._storageKey, JSON.stringify(value)) : this._storage.removeItem(this._storageKey); } catch {} }
   _session() {
@@ -4372,7 +4377,7 @@ class SiteTracker {
           const acknowledged = new Set([...body.acceptedIds, ...body.droppedIds]);
           this._queue = this._queue.filter(event => !acknowledged.has(event.eventId));
           if (body.paused === true && ['needs_funds', 'backstop'].includes(body.reason)) {
-            this._paused = true; this._queue = []; this._clicks.clear(); this._scroll.fill(0); this._pageActive = false;
+            this._paused = true; this._pauseUntil = Date.now() + 60000; this._queue = []; this._clicks.clear(); this._scroll.fill(0); this._pageActive = false;
           }
           this._attempts = 0; this._retryAt = body.refused && !this._paused ? Date.now() + 5000 : 0;
           return true;
