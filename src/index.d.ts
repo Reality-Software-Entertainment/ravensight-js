@@ -461,3 +461,25 @@ export type JoinResult =
     };
 
 export default Ravensight;
+/** Browser website mode uses a site key, without a game/player identity. */
+export interface SiteTrackerOptions {
+  key: string;
+  apiUrl?: string;
+  consent?: 'opt_in' | 'opt_out';
+  heatmaps?: boolean;
+  storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
+  fetch?: typeof fetch;
+}
+export class SiteTracker {
+  constructor(options: SiteTrackerOptions);
+  readonly paused: boolean;
+  track(name: string): boolean;
+  pageView(): boolean;
+  grantConsent(): boolean;
+  optOut(): void;
+  reset(): boolean;
+  resume(): boolean;
+  flush(options?: { keepalive?: boolean }): Promise<boolean>;
+  destroy(): void;
+}
+export function createSiteTracker(options: SiteTrackerOptions): SiteTracker;

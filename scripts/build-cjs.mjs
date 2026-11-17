@@ -43,6 +43,8 @@ const NAMED_EXPORTS = [
   'adFormatFrom',
   'ERROR_CAPS',
   'scrubText',
+  'SiteTracker',
+  'createSiteTracker',
 ];
 
 for (const name of NAMED_EXPORTS) {

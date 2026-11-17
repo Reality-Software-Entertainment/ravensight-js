@@ -1019,3 +1019,40 @@ The server must enable Player Reports and billing v2, configure private report
 storage and run the image-processing worker. Public ingest keys must explicitly
 allow `allow_reports`. Studio credentials never belong in the game. See the
 platform's held-release checklist before enabling this in production.
+# Website analytics (0.9.0)
+
+Create a website in Company or a title's Website page, add its allowed origins,
+and copy its website key. Website mode is independent of the game client:
+
+```js
+import { createSiteTracker } from 'ravensight';
+const site = createSiteTracker({
+  key: 'gt_site_YOUR_WEBSITE_KEY',
+  consent: 'opt_in',
+  heatmaps: false,
+});
+// Run after the visitor agrees in your consent UI:
+site.grantConsent();
+site.track('wishlist_click');
+```
+
+Initial loads and SPA history/hash navigation record page views. Custom events
+accept machine names only, without properties or personal text. Sessions expire
+after 30 minutes of inactivity. Website mode uses no cookies, honors Do Not
+Track and Global Privacy Control, and stores only random browser/session IDs in
+local storage (with memory fallback). Query strings are removed except bounded
+campaign parameters; referrers contain only their origin. Add
+`data-ravensight-private` or `data-ravensight-ignore` to sensitive regions.
+Forms, editable controls, element text, IDs, classes, and values are excluded
+from heatmap capture. Optional heatmaps combine clicks and scroll depth into one
+bounded summary, sent on navigation/hide or after five active minutes. At most
+six summaries are emitted per page visit, and idle pages emit none.
+
+`site.optOut()` clears queued events and identity; `site.reset()` starts a new
+anonymous identity. Call `site.destroy()` when removing the tracker. Delivery
+retries preserve event IDs and acknowledge partial batches. A funding pause
+clears the queue and stops capture: it does not accumulate a later catch-up
+bill. After capacity is restored, `site.resume()` explicitly starts collection.
+Each accepted page view, custom event, or combined heatmap summary consumes one
+event from the same account meter as gameplay and forms. The Website dashboard
+shows the last accepted event so you can verify installation.

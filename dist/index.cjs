@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -4198,6 +4198,202 @@ class Ravensight {
 
 
 
+// Website mode deliberately has no player authentication or arbitrary data.
+const SITE_ATTRIBUTION = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'gclid', 'fbclid', 'msclkid', 'rs_link'];
+const SITE_SESSION_MS = 30 * 60 * 1000;
+const SITE_MEMORY_STORAGE = new MemoryStorage();
+function siteAddress(value) {
+  try {
+    const url = new URL(value);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || /\/(?:auth\/sso|oauth\/callback|r\/|c\/|u\/)/i.test(url.pathname)) return null;
+    url.pathname = url.pathname.replace(/\/[^/]*(?:@|%40)[^/]*(?=\/|$)/gi, '/:private').replace(/\/[A-Za-z0-9_-]{48,}(?=\/|$)/g, '/:private');
+    const safe = new URL(url.origin + url.pathname);
+    for (const key of SITE_ATTRIBUTION) { const value_ = url.searchParams.get(key); if (value_ && /^[A-Za-z0-9 _.:~+-]{1,120}$/.test(value_)) safe.searchParams.set(key, value_); }
+    return safe.href;
+  } catch { return null; }
+}
+function siteSelector(target) {
+  if (!target || typeof target.closest !== 'function' || target.closest('form,input,textarea,select,option,[contenteditable],[data-ravensight-private],[data-ravensight-ignore]')) return null;
+  const parts = [];
+  let node = target;
+  while (node && parts.length < 6) {
+    const tag = String(node.tagName || '').toLowerCase();
+    if (!/^[a-z][a-z0-9-]{0,30}$/.test(tag)) break;
+    const siblings = node.parentElement ? Array.from(node.parentElement.children || []).filter(value => value.tagName === node.tagName) : [node];
+    parts.unshift(`${tag}:nth-of-type(${Math.max(1, siblings.indexOf(node) + 1)})`);
+    node = node.parentElement;
+  }
+  const selector = parts.join(' > ');
+  return selector && selector.length <= 240 ? selector : null;
+}
+
+/** Privacy-limited browser analytics. No cookies, text capture or player IDs. */
+class SiteTracker {
+  constructor(options = {}) {
+    if (!/^gt_site_[A-Za-z0-9_-]{16,128}$/.test(options.key || '')) throw new TypeError('A website key is required.');
+    if (options.consent !== undefined && !['opt_in', 'opt_out'].includes(options.consent)) throw new TypeError('Consent must be opt_in or opt_out.');
+    this.key = options.key;
+    this.apiUrl = normalizeApiUrl(options.apiUrl);
+    this._window = typeof window !== 'undefined' ? window : null;
+    this._document = this._window?.document || (typeof document !== 'undefined' ? document : null);
+    this._navigator = this._window?.navigator || (typeof navigator !== 'undefined' ? navigator : {});
+    this._fetch = options.fetch || globalThis.fetch?.bind(globalThis);
+    this._storage = options.storage || SITE_MEMORY_STORAGE;
+    if (!options.storage) { try { this._storage = this._window?.localStorage || this._storage; } catch {} }
+    this._storageKey = `ravensight_site_${queueKeyHash(this.key)}`;
+    this._preferenceKey = `${this._storageKey}_opt_out`;
+    this._allowed = options.consent !== 'opt_in';
+    try { if (this._storage.getItem(this._preferenceKey) === 'true') this._allowed = false; } catch {}
+    this._heatmaps = options.heatmaps === true;
+    this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null;
+    this._paused = false; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
+    this._lastLocation = null; this._page = null; this._clicks = new Map(); this._scroll = Array(10).fill(0);
+    this._summaryCount = 0; this._summaryStart = Date.now(); this._pageActive = false;
+    this._on(this._window, 'popstate', () => this._navigation());
+    this._on(this._window, 'hashchange', () => this._navigation());
+    this._on(this._window, 'pagehide', () => { this._summarize(); this.flush({ keepalive: true }); });
+    this._on(this._document, 'visibilitychange', () => { if (this._document.visibilityState === 'hidden') { this._summarize(); this.flush({ keepalive: true }); } });
+    this._on(this._document, 'click', event => this._click(event));
+    this._on(this._window, 'scroll', () => this._scrolled(), { passive: true });
+    const history = this._window?.history;
+    if (history) for (const method of ['pushState', 'replaceState']) {
+      const original = history[method];
+      if (typeof original !== 'function') continue;
+      const tracker = this;
+      const wrapped = function (...args) { const result = original.apply(this, args); tracker._navigation(); return result; };
+      history[method] = wrapped;
+      this._listeners.push(() => { if (history[method] === wrapped) history[method] = original; });
+    }
+    this._timer = setInterval(() => {
+      if (Date.now() - this._summaryStart >= 300000) this._summarize();
+      this.flush();
+    }, 5000);
+    this._timer?.unref?.();
+    this._navigation();
+  }
+  _on(target, name, listener, options) {
+    if (!target?.addEventListener) return;
+    target.addEventListener(name, listener, options);
+    this._listeners.push(() => target.removeEventListener(name, listener, options));
+  }
+  _privacyBlocked() { return this._navigator.globalPrivacyControl === true || this._navigator.doNotTrack === '1' || this._window?.doNotTrack === '1'; }
+  _enabled() { return this._allowed && !this._privacyBlocked() && !this._paused && !this._destroyed; }
+  _read() { try { return JSON.parse(this._storage.getItem(this._storageKey) || 'null'); } catch { return null; } }
+  _write(value) { try { value ? this._storage.setItem(this._storageKey, JSON.stringify(value)) : this._storage.removeItem(this._storageKey); } catch {} }
+  _session() {
+    const now = Date.now();
+    if (!this._identity) this._identity = this._read();
+    if (!this._identity || !/^[A-Za-z0-9_.:-]{8,128}$/.test(this._identity.visitorId || '')) this._identity = { visitorId: randomId(), sessionId: randomId(), last: now };
+    if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(this._identity.sessionId || '') || !Number.isFinite(this._identity.last) || now - this._identity.last >= SITE_SESSION_MS || this._identity.last > now) this._identity.sessionId = randomId();
+    this._identity.last = now; this._write(this._identity);
+    return this._identity;
+  }
+  _enqueue(type, extra = {}, address = this._page) {
+    if (!this._enabled() || !address) return false;
+    const identity = this._session();
+    let referrer = '';
+    try { referrer = this._document?.referrer ? new URL(this._document.referrer).origin : ''; } catch {}
+    const event = { eventId: randomId(), visitorId: identity.visitorId, sessionId: identity.sessionId, type, timestamp: Date.now(), url: address, referrer, webdriver: this._navigator.webdriver === true, ...extra };
+    if (this._queue.length >= 100) this._queue.shift();
+    this._queue.push(event); return true;
+  }
+  _navigation() {
+    const href = this._window?.location?.href;
+    if (!href || href === this._lastLocation || !this._enabled()) return false;
+    this._summarize(); this._lastLocation = href; this._page = siteAddress(href);
+    this._summaryCount = 0; this._summaryStart = Date.now(); this._pageActive = false;
+    return this._enqueue('page_view');
+  }
+  /** Track a machine-named action. Properties and free text are not accepted. */
+  track(name, properties) {
+    if (typeof name !== 'string' || !/^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(name) || properties !== undefined) throw new TypeError('Use an event name without properties or personal text.');
+    return this._enqueue('custom', { name });
+  }
+  pageView() { this._lastLocation = null; return this._navigation(); }
+  grantConsent() {
+    if (this._allowed) return false;
+    try { this._storage.removeItem(this._preferenceKey); } catch {}
+    this._allowed = true; this._lastLocation = null; return this._navigation();
+  }
+  optOut() {
+    this._allowed = false; this._queue = []; this._identity = null; this._page = null;
+    this._clicks.clear(); this._scroll.fill(0); this._write(null);
+    try { this._storage.setItem(this._preferenceKey, 'true'); } catch {}
+  }
+  reset() {
+    this._queue = []; this._identity = null; this._write(null); this._lastLocation = null;
+    this._clicks.clear(); this._scroll.fill(0); return this._navigation();
+  }
+  /** Explicitly resume after the website owner restores collection capacity. */
+  resume() { this._paused = false; this._retryAt = 0; this._lastLocation = null; return this._navigation(); }
+  get paused() { return this._paused; }
+  _viewport() { const width = this._window?.innerWidth || 1024; return width < 768 ? 'small' : width < 1200 ? 'medium' : 'large'; }
+  _click(event) {
+    if (!this._enabled() || !this._heatmaps || this._summaryCount >= 6 || event.isTrusted === false) return;
+    const selector = siteSelector(event.target);
+    if (!selector) return;
+    const width = Math.max(1, this._document?.documentElement?.scrollWidth || this._window?.innerWidth || 1);
+    const height = Math.max(1, this._document?.documentElement?.scrollHeight || this._window?.innerHeight || 1);
+    const x = Math.max(0, Math.min(99, Math.floor((event.pageX || 0) / width * 100)));
+    const y = Math.max(0, Math.min(99, Math.floor((event.pageY || 0) / height * 100)));
+    const key = `${x}/${y}/${selector}`;
+    if (!this._clicks.has(key) && this._clicks.size >= 200) return;
+    const previous = this._clicks.get(key);
+    this._clicks.set(key, { x, y, selector, count: Math.min(10000, (previous?.count || 0) + 1) }); this._pageActive = true;
+  }
+  _scrolled() {
+    if (!this._enabled() || !this._heatmaps || this._summaryCount >= 6) return;
+    const height = Math.max(1, this._document?.documentElement?.scrollHeight || 1);
+    const depth = Math.min(10, Math.ceil(((this._window?.scrollY || 0) + (this._window?.innerHeight || 0)) / height * 10));
+    for (let index = 0; index < depth; index++) this._scroll[index] = 1;
+    this._pageActive = true;
+  }
+  _summarize() {
+    if (!this._enabled() || !this._heatmaps || !this._pageActive || this._summaryCount >= 6) return false;
+    const accepted = this._enqueue('heatmap', { heatmap: { viewport: this._viewport(), clicks: [...this._clicks.values()], scroll: [...this._scroll] } });
+    this._clicks.clear(); this._scroll.fill(0); this._pageActive = false; this._summaryStart = Date.now();
+    if (accepted) this._summaryCount++;
+    return accepted;
+  }
+  async flush({ keepalive = false } = {}) {
+    if (this._inFlight) return this._inFlight;
+    if (!this._enabled() || !this._queue.length || !this._fetch || Date.now() < this._retryAt) return false;
+    const batch = this._queue.slice(0, 50);
+    // Keepalive has a browser-wide 64 KB budget. Reduce without changing IDs.
+    if (keepalive) while (batch.length > 1 && JSON.stringify(batch).length > 45000) batch.pop();
+    this._inFlight = (async () => {
+      try {
+        const response = await this._fetch(`${this.apiUrl}/site/collect`, { method: 'POST', credentials: 'omit', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: this.key, events: batch }), keepalive });
+        const body = await response.json().catch(() => null);
+        const ids = new Set(batch.map(event => event.eventId));
+        const validIds = value => Array.isArray(value) && value.every(id => typeof id === 'string' && ids.has(id)) && new Set(value).size === value.length;
+        const valid = body && ['accepted', 'duplicates', 'dropped', 'refused'].every(key => Number.isInteger(body[key]) && body[key] >= 0) && validIds(body.acceptedIds) && validIds(body.droppedIds) && validIds(body.refusedIds) && body.acceptedIds.length === body.accepted + body.duplicates && body.droppedIds.length === body.dropped && body.refusedIds.length === body.refused && new Set([...body.acceptedIds, ...body.droppedIds, ...body.refusedIds]).size === batch.length && body.accepted + body.duplicates + body.dropped + body.refused === batch.length;
+        if ((response.ok || response.status === 429) && valid) {
+          const acknowledged = new Set([...body.acceptedIds, ...body.droppedIds]);
+          this._queue = this._queue.filter(event => !acknowledged.has(event.eventId));
+          if (body.paused === true && ['needs_funds', 'backstop'].includes(body.reason)) {
+            this._paused = true; this._queue = []; this._clicks.clear(); this._scroll.fill(0); this._pageActive = false;
+          }
+          this._attempts = 0; this._retryAt = body.refused && !this._paused ? Date.now() + 5000 : 0;
+          return true;
+        }
+        // Permanent invalid-key/schema responses cannot be repaired by replay.
+        if ([400, 401, 403, 413].includes(response.status)) this._queue = this._queue.filter(event => !ids.has(event.eventId));
+        this._attempts++; this._retryAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6));
+        return false;
+      } catch { this._attempts++; this._retryAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)); return false; }
+      finally { this._inFlight = null; }
+    })();
+    return this._inFlight;
+  }
+  destroy() {
+    if (this._destroyed) return;
+    this._summarize(); this.flush({ keepalive: true }); this._destroyed = true;
+    clearInterval(this._timer); for (const remove of this._listeners.splice(0)) remove();
+  }
+}
+function createSiteTracker(options) { return new SiteTracker(options); }
+
 // --- CommonJS exports (generated by scripts/build-cjs.mjs) ---
 module.exports = Ravensight;
 module.exports.default = Ravensight;
@@ -4226,3 +4422,5 @@ module.exports.microsFromRevenue = microsFromRevenue;
 module.exports.adFormatFrom = adFormatFrom;
 module.exports.ERROR_CAPS = ERROR_CAPS;
 module.exports.scrubText = scrubText;
+module.exports.SiteTracker = SiteTracker;
+module.exports.createSiteTracker = createSiteTracker;
