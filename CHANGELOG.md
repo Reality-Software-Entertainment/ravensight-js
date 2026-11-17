@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.0 - Unreleased
+
+* Add `createSiteTracker` and typed `SiteTracker` browser APIs for website page
+  views, SPA navigation, machine-named custom events and optional bounded click
+  and scroll summaries. Existing game APIs remain unchanged.
+* Website mode uses no cookies, honors opt-in consent, persistent opt-out, DNT
+  and GPC, and excludes form controls, editable/private regions, element text,
+  IDs and classes. Query strings are stripped except bounded campaign tags.
+* Stable event IDs and partial acknowledgements prevent retry charges. Every
+  accepted page view, custom event or heatmap summary is one shared-meter
+  event. Funding pauses discard queued events; fresh activity may try after a
+  one-minute cooldown without billable heartbeat probes or catch-up traffic.
+* Local verification: all 261 SDK tests pass, including the existing 250 game
+  tests. CommonJS is rebuilt. This version has not been published.
+
 ## 0.8.0 - 2026-11-15
 
 * Campaign links: in a browser, `rs_link` on the landing address (added by a
