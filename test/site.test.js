@@ -17,7 +17,7 @@ function browser({ privateMode = false, navigator = {}, href = 'https://studio.e
 }
 const ok = events => ({ ok: true, status: 200, json: async () => ({ accepted: events.length, duplicates: 0, dropped: 0, refused: 0, acceptedIds: events.map(event => event.eventId), droppedIds: [], refusedIds: [], paused: false }) });
 function tracker(options = {}) { const value = createSiteTracker({ key, fetch: async (_url, request) => ok(JSON.parse(request.body).events), ...options }); trackers.push(value); return value; }
-afterEach(() => { for (const tracker of trackers.splice(0)) { tracker.optOut(); tracker.destroy(); try { tracker._storage.removeItem(tracker._preferenceKey); } catch {} } globalThis.window = previousWindow; });
+afterEach(() => { for (const tracker of trackers.splice(0)) { tracker.optOut(); tracker.destroy(); tracker.grantConsent(); } globalThis.window = previousWindow; });
 
 test('site mode validates options and leaves game identity separate', () => {
   browser(); assert.throws(() => new SiteTracker({ key: 'bad' }), TypeError);
@@ -41,6 +41,11 @@ test('explicit opt-out persists across tracker recreation and repeated consent i
   const next = tracker(); assert.equal(next._queue.length, 0); assert.equal(win.localStorage.getItem(next._storageKey), null);
   next.grantConsent(); assert.equal(next._queue.length, 1); next.grantConsent(); assert.equal(next._queue.length, 1);
   assert.equal(win.localStorage.getItem(next._preferenceKey), null);
+});
+test('storage methods that throw retain opt-out in memory for subsequent trackers', () => {
+  browser(); const storage = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); }, removeItem() { throw new Error('denied'); } };
+  const first = tracker({ storage }); first.optOut(); first.destroy();
+  const next = tracker({ storage }); assert.equal(next._queue.length, 0); next.grantConsent(); assert.equal(next._queue.length, 1);
 });
 test('SPA history and hash transitions de-duplicate and restore history on destroy', () => {
   const win = browser(), original = win.history.pushState, site = tracker();

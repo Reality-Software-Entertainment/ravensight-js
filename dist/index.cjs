@@ -4244,6 +4244,7 @@ class SiteTracker {
     this._preferenceKey = `${this._storageKey}_opt_out`;
     this._allowed = options.consent !== 'opt_in';
     try { if (this._storage.getItem(this._preferenceKey) === 'true') this._allowed = false; } catch {}
+    if (SITE_MEMORY_STORAGE.getItem(this._preferenceKey) === 'true') this._allowed = false;
     this._heatmaps = options.heatmaps === true;
     this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null;
     this._paused = false; this._pauseUntil = 0; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
@@ -4283,8 +4284,12 @@ class SiteTracker {
     if (this._paused && Date.now() >= this._pauseUntil) this._paused = false;
     return this._allowed && !this._privacyBlocked() && !this._paused && !this._destroyed;
   }
-  _read() { try { return JSON.parse(this._storage.getItem(this._storageKey) || 'null'); } catch { return null; } }
-  _write(value) { try { value ? this._storage.setItem(this._storageKey, JSON.stringify(value)) : this._storage.removeItem(this._storageKey); } catch {} }
+  _read() { try { return JSON.parse(this._storage.getItem(this._storageKey) || SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { try { return JSON.parse(SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { return null; } } }
+  _write(value) {
+    try { value ? this._storage.setItem(this._storageKey, JSON.stringify(value)) : this._storage.removeItem(this._storageKey); }
+    catch { if (value) SITE_MEMORY_STORAGE.setItem(this._storageKey, JSON.stringify(value)); }
+    if (!value) SITE_MEMORY_STORAGE.removeItem(this._storageKey);
+  }
   _session() {
     const now = Date.now();
     if (!this._identity) this._identity = this._read();
@@ -4318,12 +4323,13 @@ class SiteTracker {
   grantConsent() {
     if (this._allowed) return false;
     try { this._storage.removeItem(this._preferenceKey); } catch {}
+    SITE_MEMORY_STORAGE.removeItem(this._preferenceKey);
     this._allowed = true; this._lastLocation = null; return this._navigation();
   }
   optOut() {
     this._allowed = false; this._queue = []; this._identity = null; this._page = null;
     this._clicks.clear(); this._scroll.fill(0); this._write(null);
-    try { this._storage.setItem(this._preferenceKey, 'true'); } catch {}
+    try { this._storage.setItem(this._preferenceKey, 'true'); } catch { SITE_MEMORY_STORAGE.setItem(this._preferenceKey, 'true'); }
   }
   reset() {
     this._queue = []; this._identity = null; this._write(null); this._lastLocation = null;
