@@ -98,3 +98,10 @@ test('heatmaps capture structural selectors only, exclude form regions, combine 
   for (let n = 0; n < 20; n++) { win.dispatch('scroll'); site._summarize(); }
   assert.equal(site._queue.filter(event => event.type === 'heatmap').length, 6);
 });
+test('large summaries split under the collector body bound and rate limits respect Retry-After', async () => {
+  browser(); const site = tracker();
+  const selector = Array(6).fill('custom-element:nth-of-type(123)').join(' > ');
+  for (let n = 0; n < 25; n++) site._enqueue('heatmap', { heatmap: { viewport: 'small', clicks: Array.from({ length: 200 }, (_, x) => ({ x: x % 100, y: 2, selector, count: 1 })), scroll: Array(10).fill(1) } });
+  let size = 0; site._fetch = async (_url, request) => { size = request.body.length; return { status: 429, ok: false, headers: { get: () => '90' }, json: async () => ({ error: 'rate_limited' }) }; };
+  await site.flush(); assert.ok(size < 512 * 1024); assert.ok(site._retryAt - Date.now() > 85000); assert.equal(site._queue.length, 26);
+});

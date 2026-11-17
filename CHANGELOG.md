@@ -12,7 +12,7 @@
   accepted page view, custom event or heatmap summary is one shared-meter
   event. Funding pauses discard queued events; fresh activity may try after a
   one-minute cooldown without billable heartbeat probes or catch-up traffic.
-* Local verification: all 261 SDK tests pass, including the existing 250 game
+* Local verification: all 262 SDK tests pass, including the existing 250 game
   tests. CommonJS is rebuilt. This version has not been published.
 
 ## 0.8.0 - 2026-11-15

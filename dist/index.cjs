@@ -4364,6 +4364,7 @@ class SiteTracker {
     if (this._inFlight) return this._inFlight;
     if (!this._enabled() || !this._queue.length || !this._fetch || Date.now() < this._retryAt) return false;
     const batch = this._queue.slice(0, 50);
+    while (batch.length > 1 && JSON.stringify(batch).length > 400000) batch.pop();
     // Keepalive has a browser-wide 64 KB budget. Reduce without changing IDs.
     if (keepalive) while (batch.length > 1 && JSON.stringify(batch).length > 45000) batch.pop();
     this._inFlight = (async () => {
@@ -4384,7 +4385,7 @@ class SiteTracker {
         }
         // Permanent invalid-key/schema responses cannot be repaired by replay.
         if ([400, 401, 403, 413].includes(response.status)) this._queue = this._queue.filter(event => !ids.has(event.eventId));
-        this._attempts++; this._retryAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6));
+        this._attempts++; this._retryAt = Date.now() + Math.max(parseRetryAfterMs(response.headers?.get?.('Retry-After')) || 0, Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)));
         return false;
       } catch { this._attempts++; this._retryAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)); return false; }
       finally { this._inFlight = null; }
