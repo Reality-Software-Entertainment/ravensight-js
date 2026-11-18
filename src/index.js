@@ -4393,6 +4393,9 @@ export class SiteTracker {
       let timer;
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
       try {
+        // Consent/reset may change before this scheduled transport starts.
+        // A destroy keepalive still owns its queued batch and may finish.
+        if (!this._allowed || this._privacyBlocked() || !batch.some(event => this._queue.includes(event))) return false;
         const timeout = new Promise((_, reject) => {
           timer = setTimeout(() => { controller?.abort(); reject(new Error('Website collection timed out.')); }, 10000);
           timer?.unref?.();

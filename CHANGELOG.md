@@ -19,7 +19,7 @@
 * Website collection recovers from synchronous transport failures and bounds
   both the request and response-body read to ten seconds. Timed-out attempts
   keep their event IDs; late replies cannot change a later queue.
-* Local verification: all 269 SDK tests pass, including the existing game
+* Local verification: all 270 SDK tests pass, including the existing game
   tests. CommonJS is rebuilt. This version has not been published.
 
 ## 0.8.0 - 2026-11-15

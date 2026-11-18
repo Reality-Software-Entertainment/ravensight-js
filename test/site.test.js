@@ -93,6 +93,16 @@ test('a synchronous custom transport failure releases the latch and retries the 
   assert.equal(await site.flush(), false); site._retryAt = 0;
   assert.equal(await site.flush(), true); assert.equal(calls, 2); assert.equal(site._queue.length, 0);
 });
+test('scheduled collection honors withdrawal or identity reset before transport starts', async () => {
+  const win = browser(); let calls = 0, sent;
+  const site = tracker({ fetch: async (_url, request) => { calls++; sent = JSON.parse(request.body).events; return ok(sent); } });
+  const withdrawn = site.flush(); site.optOut(); assert.equal(await withdrawn, false); assert.equal(calls, 0);
+  site.grantConsent(); const beforeReset = site._queue[0].visitorId;
+  const reset = site.flush(); site.reset(); assert.equal(await reset, false); assert.equal(calls, 0);
+  const denied = site.flush(); win.navigator.globalPrivacyControl = true; assert.equal(await denied, false); assert.equal(calls, 0);
+  win.navigator.globalPrivacyControl = false;
+  assert.equal(await site.flush(), true); assert.equal(calls, 1); assert.notEqual(sent[0].visitorId, beforeReset);
+});
 test('a stalled transport times out even when it ignores abort, and late acceptance cannot discard new activity', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   browser(); let resolveFirst, firstEvents, signal;
