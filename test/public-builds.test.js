@@ -541,7 +541,7 @@ test('exact key sets: settings, session, batch, feedback, keepalive and beacon b
   await rs.submitFeedback('plain');
   await rs.submitFeedback('full', 'bug', 3);
   const feedback = server.requestsTo('/api/v1/feedback').map((r) => keys(r.body));
-  assert.deepEqual(feedback, [['message'], ['category', 'message', 'rating']]);
+  assert.deepEqual(feedback, [['message', 'submissionId'], ['category', 'message', 'rating', 'submissionId']]);
 
   rs.track('hidden');
   rs.flushOnHidden();

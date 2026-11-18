@@ -2,6 +2,10 @@
 
 ## 0.9.0 - Unreleased
 
+* Plain SDK feedback uses one shared event, with an optional stable submission
+  ID for explicit retries and a generated ID preserved across session renewal.
+  Existing three-argument feedback calls remain supported.
+
 * Add `createSiteTracker` and typed `SiteTracker` browser APIs for website page
   views, SPA navigation, machine-named custom events and optional bounded click
   and scroll summaries. Existing game APIs remain unchanged.
@@ -12,7 +16,7 @@
   accepted page view, custom event or heatmap summary is one shared-meter
   event. Funding pauses discard queued events; fresh activity may try after a
   one-minute cooldown without billable heartbeat probes or catch-up traffic.
-* Local verification: all 263 SDK tests pass, including the existing 250 game
+* Local verification: all 266 SDK tests pass, including the existing game
   tests. CommonJS is rebuilt. This version has not been published.
 
 ## 0.8.0 - 2026-11-15

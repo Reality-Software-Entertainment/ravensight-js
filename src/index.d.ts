@@ -401,7 +401,7 @@ export declare class Ravensight {
   submitReport(report: PreparedReport): Promise<PlayerReportResult>;
   getReportStatus(report: PreparedReport): Promise<PlayerReportResult>;
   cancelReport(report: PreparedReport): Promise<{ canceled: boolean }>;
-  submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null): Promise<{ ok: true }>;
+  submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null, options?: { submissionId?: string }): Promise<{ ok: true }>;
   fetchSuggestions(): Promise<unknown[]>;
   /** With consent 'opt_in', true is the player's yes (stored as ravensight_optin) and false removes it. */
   setEnabled(value: boolean): void;

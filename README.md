@@ -346,7 +346,16 @@ itself never sends. It does nothing in Node.
 
 Sends queued events now. Returns `{ sent, queued }`. Concurrent calls are safe.
 
-### `await rs.submitFeedback(message, category?, rating?)`
+### `await rs.submitFeedback(message, category?, rating?, options?)`
+
+An accepted text submission uses one event on the shared meter. Each call generates
+a stable submission ID that is reused if its session must be renewed. For an
+explicit retry after an uncertain response, pass the same
+`{ submissionId: 'your-stable-submission-id' }` as the fourth argument with the
+same message, category and rating. IDs contain 8 to 80 letters, digits,
+underscores or hyphens and are scoped to this game and device. Changed content
+under the same ID is refused. A new ID represents a new submission. Older
+clients that omit the ID remain supported as independent submissions.
 
 Posts to `POST /feedback`. `category` is optional and must be one of the values
 below, also exported as `FEEDBACK_CATEGORIES`. `rating` is optional and must be

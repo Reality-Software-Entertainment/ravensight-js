@@ -2858,7 +2858,7 @@ class Ravensight {
    * Submits player feedback. Requires an active session.
    * @throws {RavensightError}
    */
-  async submitFeedback(message, category, rating) {
+  async submitFeedback(message, category, rating, options = {}) {
     if (typeof message !== 'string' || message.trim() === '') {
       throw new RavensightError('feedback message is empty', 'empty_message');
     }
@@ -2879,12 +2879,24 @@ class Ravensight {
       throw new RavensightError('tracking is disabled', 'tracking_disabled');
     }
 
-    const payload = { message };
+    const submissionId = options?.submissionId ?? randomId();
+    if (typeof submissionId !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(submissionId)) {
+      throw new RavensightError('feedback submissionId must contain 8 to 80 letters, digits, underscores or hyphens', 'invalid_submission_id');
+    }
+    const payload = { message, submissionId };
     if (hasCategory) payload.category = category;
     if (hasRating) payload.rating = rating;
 
+    const deviceId = this.deviceId, generation = this._configGeneration;
+    const current = () => {
+      if (!this.isActive || this.deviceId !== deviceId || this._configGeneration !== generation) {
+        throw new RavensightError('feedback identity or consent changed', 'feedback_context_changed');
+      }
+    };
     const send = async () => {
-      const token = await this._ensureSession();
+      current();
+      const token = await this._ensureSession(deviceId);
+      current();
       return this._request('POST', '/feedback', {
         headers: { 'X-Session-Token': token },
         body: payload,
@@ -2893,7 +2905,8 @@ class Ravensight {
 
     let res = await send();
     if (res.status === 401) {
-      this._invalidateSession();
+      current();
+      this._invalidateSession(deviceId);
       res = await send();
     }
 
