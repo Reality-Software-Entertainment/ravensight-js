@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.0 - Unreleased
+## 0.9.0 - 2026-11-18
 
 * Plain SDK feedback uses one shared event, with an optional stable submission
   ID for explicit retries and a generated ID preserved across session renewal.
@@ -24,7 +24,7 @@
   preserves conversion events and concurrent additions without duplicate charges.
 * A compact browser module uses the same tracker implementation. CommonJS and
   browser-module parity, privacy, retries and existing game APIs are verified
-  together. This version has not been published.
+  together.
 
 ## 0.8.0 - 2026-11-15
 
