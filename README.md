@@ -346,7 +346,16 @@ itself never sends. It does nothing in Node.
 
 Sends queued events now. Returns `{ sent, queued }`. Concurrent calls are safe.
 
-### `await rs.submitFeedback(message, category?, rating?)`
+### `await rs.submitFeedback(message, category?, rating?, options?)`
+
+An accepted text submission uses one event on the shared meter. Each call generates
+a stable submission ID that is reused if its session must be renewed. For an
+explicit retry after an uncertain response, pass the same
+`{ submissionId: 'your-stable-submission-id' }` as the fourth argument with the
+same message, category and rating. IDs contain 8 to 80 letters, digits,
+underscores or hyphens and are scoped to this game and device. Changed content
+under the same ID is refused. A new ID represents a new submission. Older
+clients that omit the ID remain supported as independent submissions.
 
 Posts to `POST /feedback`. `category` is optional and must be one of the values
 below, also exported as `FEEDBACK_CATEGORIES`. `rating` is optional and must be
@@ -1019,3 +1028,64 @@ The server must enable Player Reports and billing v2, configure private report
 storage and run the image-processing worker. Public ingest keys must explicitly
 allow `allow_reports`. Studio credentials never belong in the game. See the
 platform's held-release checklist before enabling this in production.
+# Website analytics (0.9.0)
+
+Create a website in Company or a title's Website page, add its allowed origins,
+and copy its website key. Website mode is independent of the game client:
+
+```js
+import { createSiteTracker } from 'ravensight';
+const site = createSiteTracker({
+  key: 'gt_site_YOUR_WEBSITE_KEY',
+  consent: 'opt_in',
+  heatmaps: false,
+  engagement: false,
+});
+// Run after the visitor agrees in your consent UI:
+site.grantConsent();
+site.track('wishlist_click');
+```
+
+Initial loads and SPA history/hash navigation record page views. Set
+`autoPageviews: false` when your router calls `site.pageView()` after a completed
+navigation. Custom events accept machine names. Registered actions can carry
+their approved scalar dimensions, for example
+`site.track('cta_dashboard_clicked', { section: 'hero' })`. Unknown property
+names, free text, account details and form values are rejected. Sessions expire
+after 30 minutes of inactivity. Website mode uses no cookies, honors Do Not
+Track and Global Privacy Control, and stores only random browser/session IDs in
+local storage (with memory fallback), plus first-seen time and sanitized campaign
+snapshots. Query strings are removed except bounded
+campaign parameters; referrers contain only their origin. Add
+`data-ravensight-private` or `data-ravensight-ignore` to sensitive regions.
+Forms, editable controls, element text, IDs, classes, and values are excluded
+from heatmap capture. Optional heatmaps combine clicks and scroll depth into one
+bounded summary, sent on navigation/hide or after five active minutes. At most
+six summaries are emitted per page visit, and idle pages emit none.
+
+The core analytics extension requires a compatible server with
+`CORE_ANALYTICS_ENABLED=true`. `engagement: true` adds visible active time and
+elapsed duration to bounded summaries, combined with heatmap data when enabled.
+Each accepted combined summary is one event. Periodic summaries occur at most
+once per five minutes; the six-summary limit reserves a final page summary.
+Background time is excluded from active time, and an idle page stops accumulating
+active time after 30 seconds. Collection is an estimate and does not record
+screen contents, keystrokes, or a session replay. Engagement is off by default.
+
+Authentication, OAuth, account and receipt routes are excluded. Add any additional
+private route prefixes with `excludedPaths: ['/settings']`. All DNT variants and
+GPC are honored. `getAttribution()` returns sanitized first/last landing and
+campaign snapshots for an explicitly separate authenticated acquisition handoff;
+it never exposes browser/account identity. Direct revisits do not overwrite the
+last campaign. The static browser module is available at `dist/site.js`.
+
+`site.optOut()` clears queued events and identity; `site.reset()` starts a new
+anonymous identity. Call `site.destroy()` when removing the tracker. Delivery
+retries preserve event IDs and acknowledge partial batches. A funding pause
+clears the queue and stops capture: it does not accumulate a later catch-up
+bill. After a one-minute cooldown, fresh activity can try again without a page
+reload; the SDK sends no heartbeat or old events to probe capacity. Calling
+`site.resume()` explicitly starts collection sooner after capacity is restored.
+Each accepted page view, custom event, or combined engagement/heatmap summary consumes one
+event from the same account meter as gameplay and forms. The Website dashboard
+shows the last accepted event so you can verify installation.

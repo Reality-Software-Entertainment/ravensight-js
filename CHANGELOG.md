@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.0 - Unreleased
+
+* Plain SDK feedback uses one shared event, with an optional stable submission
+  ID for explicit retries and a generated ID preserved across session renewal.
+  Existing three-argument feedback calls remain supported.
+
+* Add `createSiteTracker` and typed `SiteTracker` browser APIs for website page
+  views, SPA navigation, machine-named custom events and optional bounded click
+  and scroll summaries. Existing game APIs remain unchanged.
+* Website mode uses no cookies, honors opt-in consent, persistent opt-out, DNT
+  and GPC, and excludes form controls, editable/private regions, element text,
+  IDs and classes. Query strings are stripped except bounded campaign tags.
+* Stable event IDs and partial acknowledgements prevent retry charges. Every
+  accepted page view, custom event or heatmap summary is one shared-meter
+  event. Funding pauses discard queued events; fresh activity may try after a
+  one-minute cooldown without billable heartbeat probes or catch-up traffic.
+* Website collection recovers from synchronous transport failures and bounds
+  both the request and response-body read to ten seconds. Timed-out attempts
+  keep their event IDs; late replies cannot change a later queue.
+* Add bounded custom properties, first/last campaign attribution, and optional
+  active engagement combined with heatmaps in one metered summary. Exit delivery
+  preserves conversion events and concurrent additions without duplicate charges.
+* A compact browser module uses the same tracker implementation. CommonJS and
+  browser-module parity, privacy, retries and existing game APIs are verified
+  together. This version has not been published.
+
 ## 0.8.0 - 2026-11-15
 
 * Campaign links: in a browser, `rs_link` on the landing address (added by a

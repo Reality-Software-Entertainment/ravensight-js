@@ -557,10 +557,12 @@ test('submitFeedback posts to /feedback with the session token', async (t) => {
   assert.deepEqual(result, { ok: true });
   assert.equal(server.state.feedback.length, 1);
   assert.deepEqual(server.state.feedback[0], {
+    submissionId: server.state.feedback[0].submissionId,
     message: 'the boss fight is too long',
     category: 'suggestion',
     rating: 4,
   });
+  assert.match(server.state.feedback[0].submissionId, /^[A-Za-z0-9_-]{8,80}$/);
 
   const req = server.requestsTo('/api/v1/feedback')[0];
   assert.equal(req.headers['x-session-token'], server.state.tokens[0]);
@@ -571,6 +573,9 @@ test('submitFeedback posts to /feedback with the session token', async (t) => {
   server.expireSession();
   await rs.submitFeedback('second note');
   assert.equal(server.state.feedback.length, 2);
+  const retried = server.requestsTo('/api/v1/feedback').slice(-2);
+  assert.equal(retried[0].body.submissionId, retried[1].body.submissionId);
+  assert.notEqual(server.state.feedback[0].submissionId, server.state.feedback[1].submissionId);
   rs.dispose();
 });
 
@@ -589,6 +594,48 @@ test('fetchSuggestions uses the ingest key and returns the array', async (t) => 
   await assert.rejects(() => bad.fetchSuggestions(), RavensightError);
   rs.dispose();
   bad.dispose();
+});
+
+test('feedback explicit retry identity is stable and invalid IDs make no request', async t => {
+  const server = await startMockServer(); t.after(() => server.close());
+  const rs = makeClient(server); t.after(() => rs.dispose({ flush: false })); await rs.init();
+  await rs.submitFeedback('same text', 'bug', 2, { submissionId: 'caller-retry-001' });
+  await rs.submitFeedback('same text', 'bug', 2, { submissionId: 'caller-retry-001' });
+  assert.equal(server.state.feedback[0].submissionId, 'caller-retry-001');
+  assert.deepEqual(server.state.feedback[0], server.state.feedback[1]);
+  for (const submissionId of ['', 'short', 'x'.repeat(81), {}, 'unsafe space']) {
+    await assert.rejects(rs.submitFeedback('text', undefined, undefined, { submissionId }), e => e.code === 'invalid_submission_id');
+  }
+  assert.equal(server.requestsTo('/api/v1/feedback').length, 2);
+});
+
+test('feedback refuses to resend under changed identity or consent after an expired response', async t => {
+  const server = await startMockServer(); t.after(() => server.close());
+  for (const change of ['identity', 'consent']) {
+    let rs, seen = 0;
+    rs = makeClient(server, { fetch: async (url, init) => {
+      if (String(url).endsWith('/feedback')) {
+        seen++;
+        if (change === 'identity') await rs.setDeviceId('new-player'); else rs.setEnabled(false);
+        return new Response(JSON.stringify({ error: 'expired_session' }), { status: 401 });
+      }
+      return fetch(url, init);
+    } });
+    await rs.init();
+    await assert.rejects(rs.submitFeedback('private message'), e => e.code === 'feedback_context_changed');
+    assert.equal(seen, 1); await rs.dispose({ flush: false });
+  }
+});
+
+test('feedback funding refusal is exposed without queueing or automatic replay', async t => {
+  const server = await startMockServer(); t.after(() => server.close());
+  let attempts = 0;
+  const rs = makeClient(server, { fetch: async (url, init) => {
+    if (String(url).endsWith('/feedback')) { attempts++; return new Response(JSON.stringify({ error: 'quota_exceeded', reason: 'needs_funds' }), { status: 429 }); }
+    return fetch(url, init);
+  } });
+  await rs.init(); await assert.rejects(rs.submitFeedback('message'), e => e.code === 'quota_exceeded' && e.status === 429);
+  assert.equal(attempts, 1); assert.equal(rs.queue.length, 0); await rs.dispose({ flush: false });
 });
 
 // --- Local opt out and disposal ------------------------------------------
@@ -702,14 +749,14 @@ test('submitFeedback rejects an unknown category or a bad rating before any requ
   }
   await rs.submitFeedback('no category or rating');
   await rs.submitFeedback('rating only', undefined, 1);
-  assert.deepEqual(server.state.feedback.at(-1), { message: 'rating only', rating: 1 });
+  assert.deepEqual(server.state.feedback.at(-1), { message: 'rating only', rating: 1, submissionId: server.state.feedback.at(-1).submissionId });
   // An empty string means "not given" for both, and is left out of the payload.
   await rs.submitFeedback('empty category', '', 2);
-  assert.deepEqual(server.state.feedback.at(-1), { message: 'empty category', rating: 2 });
+  assert.deepEqual(server.state.feedback.at(-1), { message: 'empty category', rating: 2, submissionId: server.state.feedback.at(-1).submissionId });
   await rs.submitFeedback('empty rating', 'bug', '');
-  assert.deepEqual(server.state.feedback.at(-1), { message: 'empty rating', category: 'bug' });
+  assert.deepEqual(server.state.feedback.at(-1), { message: 'empty rating', category: 'bug', submissionId: server.state.feedback.at(-1).submissionId });
   await rs.submitFeedback('null both', null, null);
-  assert.deepEqual(server.state.feedback.at(-1), { message: 'null both' });
+  assert.deepEqual(server.state.feedback.at(-1), { message: 'null both', submissionId: server.state.feedback.at(-1).submissionId });
   assert.equal(server.state.feedback.length, FEEDBACK_CATEGORIES.length + 5);
   await rs.dispose();
 });

@@ -401,7 +401,7 @@ export declare class Ravensight {
   submitReport(report: PreparedReport): Promise<PlayerReportResult>;
   getReportStatus(report: PreparedReport): Promise<PlayerReportResult>;
   cancelReport(report: PreparedReport): Promise<{ canceled: boolean }>;
-  submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null): Promise<{ ok: true }>;
+  submitFeedback(message: string, category?: FeedbackCategory | null, rating?: number | null, options?: { submissionId?: string }): Promise<{ ok: true }>;
   fetchSuggestions(): Promise<unknown[]>;
   /** With consent 'opt_in', true is the player's yes (stored as ravensight_optin) and false removes it. */
   setEnabled(value: boolean): void;
@@ -461,3 +461,36 @@ export type JoinResult =
     };
 
 export default Ravensight;
+/** Browser website mode uses a site key, without a game/player identity. */
+export interface SiteTrackerOptions {
+  key: string;
+  apiUrl?: string;
+  consent?: 'opt_in' | 'opt_out';
+  heatmaps?: boolean;
+  /** Extra bounded engagement summaries consume one event each. Off by default. */
+  engagement?: boolean;
+  /** Disable automatic initial/history pageviews when a router calls pageView(). */
+  autoPageviews?: boolean;
+  excludedPaths?: string[];
+  storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
+  fetch?: typeof fetch;
+}
+export class SiteTracker {
+  constructor(options: SiteTrackerOptions);
+  readonly paused: boolean;
+  track(name: string, properties?: Record<string, string | number | boolean>): boolean;
+  getAttribution(): { first: SiteAttributionTouch; last: SiteAttributionTouch } | null;
+  pageView(): boolean;
+  grantConsent(): boolean;
+  optOut(): void;
+  reset(): boolean;
+  resume(): boolean;
+  flush(options?: { keepalive?: boolean }): Promise<boolean>;
+  destroy(): void;
+}
+export function createSiteTracker(options: SiteTrackerOptions): SiteTracker;
+export interface SiteAttributionTouch {
+  landingPage: string;
+  referrer: string;
+  campaign: Partial<Record<'utm_source' | 'utm_medium' | 'utm_campaign' | 'utm_content' | 'utm_term' | 'utm_id' | 'utm_source_platform' | 'gclid' | 'gbraid' | 'wbraid' | 'fbclid' | 'msclkid' | 'ttclid' | 'rs_link', string>>;
+}
