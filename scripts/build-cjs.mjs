@@ -69,8 +69,22 @@ const footer = [
 
 mkdirSync(join(root, 'dist'), { recursive: true });
 writeFileSync(join(root, 'dist', 'index.cjs'), body + footer, 'utf8');
-// Direct browser-module distribution for static marketing pages. No bundler,
-// remote imports, cookies, or tracking initialization are introduced by loading it.
-writeFileSync(join(root, 'dist', 'site.js'), source, 'utf8');
+// Small browser-only distribution, using the exact same source implementation.
+// Helpers follow this repository's top-level closing-brace convention. Fail
+// closed on a missing helper rather than silently emitting an incomplete asset.
+function declaration(name) {
+  const match = source.match(new RegExp('^(?:export )?(?:function|class) ' + name + '\\b[\\s\\S]*?^}', 'm'));
+  if (!match) throw new Error('build-cjs: missing website dependency ' + name);
+  return match[0];
+}
+const siteStart = source.indexOf('// Website mode deliberately');
+if (siteStart < 0) throw new Error('build-cjs: missing website source marker');
+const siteModule = [
+  '// Generated from src/index.js. No external imports or automatic initialization.',
+  source.match(/^export const DEFAULT_API_URL = .*$/m)[0],
+  ...['utf8Bytes', 'utf8Length', 'queueKeyHash', 'randomId', 'MemoryStorage', 'normalizeApiUrl', 'parseRetryAfterMs'].map(declaration),
+  source.slice(siteStart),
+].join('\n\n');
+writeFileSync(join(root, 'dist', 'site.js'), siteModule, 'utf8');
 
 console.log('built dist/index.cjs and dist/site.js');

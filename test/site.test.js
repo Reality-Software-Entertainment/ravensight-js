@@ -1,6 +1,6 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { createSiteTracker, SiteTracker, MemoryStorage } from '../src/index.js';
+const { createSiteTracker, SiteTracker, MemoryStorage } = await import(process.env.SITE_TEST_BUNDLE === '1' ? '../dist/site.js' : '../src/index.js');
 const key = 'gt_site_abcdefghijklmnopqrstuvwx';
 const trackers = [];
 const previousWindow = globalThis.window;
