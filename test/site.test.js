@@ -320,3 +320,21 @@ test('concurrent keepalive requests share a bounded lane and honor consent withd
   site.track('pending'); const withdrawn = site.flush({ keepalive: true }); site.optOut();
   assert.equal(await withdrawn, false); assert.equal(calls.length, 1);
 });
+
+
+test('a new outcome after visibilityhide is sent on pagehide without waiting for the earlier keepalive', async () => {
+  const win = browser(); const calls = []; const complete = [];
+  const site = tracker({ fetch(_url, request) {
+    const events = JSON.parse(request.body).events; calls.push({ request, events });
+    return new Promise(resolve => complete.push(() => resolve(ok(events))));
+  } });
+  win.document.visibilityState = 'hidden'; win.document.dispatch('visibilitychange'); await Promise.resolve();
+  const first = site._exitFlight;
+  site.track('form_submit_success', { form: 'contact' }); const successId = site._queue.at(-1).eventId;
+  win.dispatch('pagehide'); await Promise.resolve(); const last = site._exitFlight;
+  assert.equal(calls.length, 2); assert.ok(calls.every(call => call.request.keepalive));
+  assert.deepEqual(calls[1].events.map(event => event.eventId), [successId]);
+  assert.ok(calls.reduce((sum, call) => sum + Buffer.byteLength(call.request.body), 0) <= 45000);
+  complete[1](); await last; complete[0](); await first;
+  assert.equal(site._queue.length, 0); assert.equal(site._exitRequests.size, 0);
+});

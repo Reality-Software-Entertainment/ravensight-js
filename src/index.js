@@ -4309,7 +4309,7 @@ export class SiteTracker {
     this._engagement = options.engagement === true;
     this._excludedPaths = options.excludedPaths || [];
     this._autoPageviews = options.autoPageviews !== false;
-    this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null; this._exitFlight = null;
+    this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null; this._exitFlight = null; this._exitRequests = new Set();
     this._paused = false; this._pauseUntil = 0; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
     this._lastLocation = null; this._page = null; this._clicks = new Map(); this._scroll = Array(10).fill(0);
     this._summaryCount = 0; this._summaryStart = Date.now(); this._pageActive = false;
@@ -4503,19 +4503,24 @@ export class SiteTracker {
     // collector receipts make that replay idempotent. Waiting for the first
     // fetch would lose actions queued just before the page closes.
     const lane = keepalive ? '_exitFlight' : '_inFlight';
-    if (this[lane]) return this[lane];
+    if (!keepalive && this._inFlight) return this._inFlight;
     if (!this._enabled() || !this._queue.length || !this._fetch || Date.now() < this._retryAt) return false;
-    const batch = this._queue.slice(0, 50);
+    const activeExitIds = new Set([...this._exitRequests].flatMap(request => [...request.ids]));
+    const batch = this._queue.filter(event => !keepalive || !activeExitIds.has(event.eventId)).slice(0, 50);
+    if (!batch.length) return this._exitFlight || false;
     while (batch.length > 1 && JSON.stringify(batch).length > 400000) batch.pop();
     // Keepalive has a browser-wide 64 KB budget. Reduce without changing IDs.
     if (keepalive) {
-      while (batch.length && utf8Length(JSON.stringify({ key: this.key, events: batch })) > 45000) batch.pop();
+      const available = Math.max(0, 45000 - [...this._exitRequests].reduce((total, request) => total + request.bytes, 0));
+      while (batch.length && utf8Length(JSON.stringify({ key: this.key, events: batch })) > available) batch.pop();
       if (!batch.length) return false;
     }
+    const exitRequest = keepalive ? { ids: new Set(batch.map(event => event.eventId)), bytes: utf8Length(JSON.stringify({ key: this.key, events: batch })) } : null;
+    if (exitRequest) this._exitRequests.add(exitRequest);
     // Assign the latch before invoking an injected transport, which may throw
     // synchronously. Bound the body read too; abort alone is not enough for
     // custom transports that ignore its signal.
-    this[lane] = Promise.resolve().then(async () => {
+    const pending = Promise.resolve().then(async () => {
       let timer;
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
       try {
@@ -4550,9 +4555,14 @@ export class SiteTracker {
         this._attempts++; this._retryAt = Date.now() + Math.max(parseRetryAfterMs(response.headers?.get?.('Retry-After')) || 0, Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)));
         return false;
       } catch { this._attempts++; this._retryAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)); return false; }
-      finally { clearTimeout(timer); this[lane] = null; }
+      finally {
+        clearTimeout(timer);
+        if (exitRequest) this._exitRequests.delete(exitRequest);
+        if (this[lane] === pending) this[lane] = null;
+      }
     });
-    return this[lane];
+    this[lane] = pending;
+    return pending;
   }
   destroy() {
     if (this._destroyed) return;
