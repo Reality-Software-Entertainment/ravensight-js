@@ -1028,7 +1028,7 @@ The server must enable Player Reports and billing v2, configure private report
 storage and run the image-processing worker. Public ingest keys must explicitly
 allow `allow_reports`. Studio credentials never belong in the game. See the
 platform's held-release checklist before enabling this in production.
-# Website analytics (0.9.1)
+# Website analytics (0.10.0)
 
 Create your company website from Company Home, or a title's separate site in
 Game Website. Add the exact allowed origins (including www when used) and copy
@@ -1114,3 +1114,41 @@ permission in the selected company or project. MCP calls use the programmatic
 meter separately from one-event website collection. See the current
 [website documentation](https://ravensight.io/docs/websites/) and
 [MCP documentation](https://ravensight.io/docs/mcp/) for deployed tools.
+
+### Explicit signup and checkout outcomes
+
+A compatible server can record a few explicitly named outcomes without recording
+an authentication page. Use a separate tracker only when your integration needs
+these counts, and retain the same consent policy. Destroy the normal public-page
+tracker before entering private routes.
+
+```js
+const outcomes = createSiteTracker({
+  key: 'gt_site_YOUR_WEBSITE_KEY',
+  outcomesOnly: true,
+  consent: 'opt_in',
+});
+// Only after your consent UI has established visitor permission:
+outcomes.grantConsent();
+outcomes.trackOutcome('signup_form_viewed');
+// Map an application failure to an approved category; never pass a raw error.
+outcomes.trackOutcome('signup_failed', { code: 'network' });
+await outcomes.flush({ keepalive: true });
+```
+
+This mode installs no navigation, click, keyboard or scroll observers. It sends
+only the website origin for validation, a fixed signup/checkout context, the
+registered outcome fields and the website's anonymous session IDs. Collector
+requests explicitly omit HTTP referrers and credentials. Reports store
+no page address for these outcomes; no homepage view is invented. Lifecycle
+listeners only flush queued outcomes on hide/exit. DNT, GPC, opt-out, funding
+pauses and stable retry IDs apply. Do not copy authenticated identity into it.
+
+Supported names are `signup_form_viewed`, `signup_failed` and `checkout_failed`.
+Signup codes: `email_unconfirmed`, `invalid_input`, `email_in_use`, `rate_limited`,
+`network`, `unavailable`, `unknown`. Checkout codes: `billing_disabled`,
+`billing_misconfigured`, `already_subscribed`, `invalid_plan`, `rate_limited`,
+`network`, `unavailable`, `unknown`; its optional `plan` is `monthly` or `annual`.
+These are explicit funnel steps/failures, not proof of a completed account or
+purchase. Successful authenticated outcomes remain in your gameplay integration.
+Destroy this tracker before returning to ordinary public tracking.

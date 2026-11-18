@@ -399,3 +399,69 @@ test('long legitimate advertising IDs survive while recognizable credentials are
   assert.equal(new URL(site._queue[0].url).searchParams.get('gclid'), clickId);
   assert.deepEqual(site.getAttribution().first.campaign, { utm_source: 'paid_search', gclid: clickId });
 });
+
+test('website transport suppresses automatic HTTP referrers in ordinary and outcome modes', async () => {
+  const win = browser(); win.location.origin = 'https://studio.example';
+  for (const outcomesOnly of [false, true]) {
+    let request;
+    const site = tracker({ outcomesOnly, fetch: async (_url, value) => { request = value; return ok(JSON.parse(value.body).events); } });
+    if (outcomesOnly) site.trackOutcome('signup_form_viewed');
+    await site.flush({ keepalive: true });
+    assert.equal(request.referrerPolicy, 'no-referrer');
+    assert.equal(request.credentials, 'omit');
+    assert.equal(request.keepalive, true);
+  }
+});
+
+test('explicit outcome-only mode never observes auth URLs, referrers, fields or navigation', async () => {
+  const win = browser({ href: 'https://studio.example/register?token=private&email=private' });
+  win.location = { origin: 'https://studio.example', get href() { throw Error('must not read auth address'); } };
+  Object.defineProperty(win.document, 'referrer', { get() { throw Error('must not read auth referrer'); } });
+  const push = win.history.pushState, replace = win.history.replaceState;
+  const site = tracker({ outcomesOnly: true });
+  assert.equal(site._queue.length, 0);
+  assert.equal(win.localStorage._map.size, 0);
+  assert.equal(win.history.pushState, push); assert.equal(win.history.replaceState, replace);
+  assert.equal(site.pageView(), false); assert.equal(site.getAttribution(), null);
+  assert.equal(site.trackOutcome('signup_form_viewed'), true);
+  assert.equal(site.trackOutcome('signup_failed', { code: 'network' }), true);
+  assert.equal(site.trackOutcome('checkout_failed', { plan: 'annual', code: 'billing_disabled' }), true);
+  for (const event of site._queue) {
+    assert.equal(event.type, 'custom'); assert.equal(event.url, 'https://studio.example');
+    assert.ok(['signup', 'checkout'].includes(event.context));
+    for (const key of ['referrer', 'attribution', 'pageViewId', 'engagement', 'heatmap']) assert.equal(Object.hasOwn(event, key), false);
+  }
+  assert.equal(new Set(site._queue.map(event => event.sessionId)).size, 1);
+  for (const name of ['click', 'scroll', 'keydown']) win.document.dispatch(name, { isTrusted: true });
+  assert.equal(site._queue.length, 3);
+  assert.throws(() => site.track('cta_docs_clicked'), TypeError);
+  assert.throws(() => site.trackOutcome('cta_docs_clicked'), TypeError);
+  assert.throws(() => site.trackOutcome('signup_failed', { code: 'private email' }), TypeError);
+  assert.throws(() => site.trackOutcome('signup_failed', { code: 'network', product: 'realityse' }), TypeError);
+  assert.throws(() => tracker({ outcomesOnly: true, heatmaps: true }), TypeError);
+  assert.throws(() => tracker({ outcomesOnly: 'true' }), TypeError);
+  win.document.visibilityState = 'hidden'; win.document.dispatch('visibilitychange');
+  await site.flush(); assert.equal(site._queue.length, 0);
+});
+
+test('outcomes honor opt-in, privacy signals, withdrawal and funding without capturing pages', async () => {
+  const win = browser(); win.location.origin = 'https://studio.example';
+  const site = tracker({ outcomesOnly: true, consent: 'opt_in' });
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  assert.equal(win.localStorage._map.size, 0);
+  site.grantConsent(); assert.equal(site._queue.length, 0);
+  win.navigator.globalPrivacyControl = true;
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  win.navigator.globalPrivacyControl = false; win.navigator.doNotTrack = '1';
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  win.navigator.doNotTrack = '0';
+  assert.equal(site.trackOutcome('signup_form_viewed'), true);
+  site._paused = true; site._pauseUntil = Date.now() + 60000;
+  assert.equal(site.trackOutcome('signup_failed', { code: 'network' }), false);
+  site.optOut(); assert.equal(site._queue.length, 0);
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  site.resume(); assert.equal(site._queue.length, 0);
+  const ordinary = tracker();
+  assert.throws(() => ordinary.trackOutcome('signup_form_viewed'), TypeError);
+  assert.throws(() => ordinary.track('signup_form_viewed'), TypeError);
+});

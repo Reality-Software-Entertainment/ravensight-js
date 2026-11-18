@@ -1,7 +1,13 @@
 # Changelog
 
-## 0.9.1 - 2026-11-18
+## 0.10.0 - 2026-11-18
 
+* Add explicit outcome-only tracking for registered signup and checkout events.
+  It records no authentication page, referrer, form contents, attribution,
+  heatmap or engagement, and keeps normal consent, privacy and funding controls.
+  It requires the matching server context-event contract.
+* Website collector requests suppress automatic HTTP referrers, including when
+  the embedding page uses a permissive referrer policy.
 * Record heatmap clicks before application navigation handlers, so a button that
   changes routes or destroys the tracker retains its click on the originating page.
 * Preserve approved public marketing dimensions for school-search outcomes,
