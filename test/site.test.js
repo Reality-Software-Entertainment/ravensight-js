@@ -351,3 +351,12 @@ test('an oversized optional summary cannot block a small accepted conversion dur
   assert.deepEqual(JSON.parse(requests[0].body).events.map(event => event.name), ['form_submit_success']);
   assert.equal(site._queue.length, 1); assert.equal(site._queue[0].type, 'heatmap');
 });
+
+
+test('long legitimate advertising IDs survive while recognizable credentials are omitted', () => {
+  const clickId = 'testAdClick' + 'aZ09_-'.repeat(30);
+  browser({ href: 'https://studio.example/?gclid=' + clickId + '&utm_source=paid_search&utm_content=gt_ingest_private&fbclid=eyJhbGciOiJIUzI1NiJ9.secret.payload' });
+  const site = tracker();
+  assert.equal(new URL(site._queue[0].url).searchParams.get('gclid'), clickId);
+  assert.deepEqual(site.getAttribution().first.campaign, { utm_source: 'paid_search', gclid: clickId });
+});

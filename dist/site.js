@@ -93,6 +93,12 @@ const SITE_ATTRIBUTION = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_conte
 const SITE_PUBLIC_EVENTS = {"version":1,"limits":{"properties":24,"propertyBytes":4096,"batch":50,"engagementSummariesPerPage":6,"periodicSummaryMs":300000},"types":{"token":{"type":"string","max":80,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"slug":{"type":"string","max":120,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"catalog":{"type":"string","max":24,"pattern":"^[0-9]+$"},"path":{"type":"string","max":500,"pattern":"^/[^?#@\\\\]*$"},"count":{"type":"number","integer":true,"min":0,"max":1000000},"position":{"type":"number","integer":true,"min":1,"max":100},"flag":{"type":"boolean"},"location":{"type":"enum","values":["header","footer","body","hero","sidebar","inline","bottom","nav"]},"form":{"type":"enum","values":["newsletter","contact","careers","support"]},"failure":{"type":"enum","values":["rejected","network","validation","unavailable"]},"error":{"type":"enum","values":["type_error","range_error","syntax_error","reference_error","network","unknown"]},"component":{"type":"enum","values":["runtime","promise","auth","play_catalog","play_transport","form"]},"product":{"type":"enum","values":["realityse","ravensight"]},"surface":{"type":"enum","values":["marketing","website","docs","blog"]}},"common":{"product":"product","surface":"surface","landing_page":"token","landing_version":"token"},"events":{"navigation_click":{"location":"location","route":"token"},"game_link_click":{"catalog_id":"catalog","action":{"type":"enum","values":["play","learn_more","catalog","store","website"]},"destination":{"type":"enum","values":["apple","google_play","steam","game_site"]}},"external_link_click":{"destination":"token","location":"location"},"promotion_action":{"action":{"type":"enum","values":["dismiss","open"]}},"content_filter_change":{"section":{"type":"enum","values":["games","shop","play","accordion"]},"value":"slug"},"content_link_click":{"content_id":"slug","section":{"type":"enum","values":["blog","news","press","play"]},"action":{"type":"enum","values":["open","cta"]}},"form_submit_attempt":{"form":"form"},"form_submit_success":{"form":"form"},"form_submit_failure":{"form":"form","error_code":"failure"},"page_not_found":{"route":{"type":"enum","values":["not_found"]},"referrer":{"type":"enum","values":["internal","external","none"]}},"diagnostic":{"error_code":"error","component":"component"},"website_error":{"fingerprint":"token","error_code":"error","component":"component"},"cta_dashboard_clicked":{"section":"token","cta_location":"token"},"cta_docs_clicked":{"section":"token"},"sdk_repo_clicked":{"repo":"slug"},"pricing_viewed":{},"landing_page_viewed":{},"landing_cta_clicked":{"cta_location":"token","destination":"path"},"landing_stage_selected":{"stage":"token","stage_number":"position"},"landing_faq_opened":{"question_number":"position"},"landing_section_viewed":{"section":"token"},"download":{"catalog_id":"catalog","destination":"token"},"outbound_click":{"destination":"token","location":"location"}}};
 const SITE_SESSION_MS = 30 * 60 * 1000;
 const SITE_MEMORY_STORAGE = new MemoryStorage();
+// Advertising click IDs are often long opaque strings. Length alone is not a
+// secret detector for these explicitly permitted attribution fields.
+function siteCampaignValue(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9 _.:~+-]{1,256}$/.test(value)
+    && !/(?:bearer|password|secret|token|authorization)[=:]|^Bearer\s|^(?:gt_(?:ingest|site)_|ph[ctx]_|sk-(?:live|test)-)|^eyJ[A-Za-z0-9_-]+\./i.test(value);
+}
 function siteAddress(value, excludedPaths = []) {
   try {
     const url = new URL(value);
@@ -102,7 +108,7 @@ function siteAddress(value, excludedPaths = []) {
     if (excludedPaths.some(path => url.pathname === path || url.pathname.startsWith(path.replace(/\/$/, '') + '/'))) return null;
     url.pathname = url.pathname.replace(/\/[^/]*(?:@|%40)[^/]*(?=\/|$)/gi, '/:private').replace(/\/[A-Za-z0-9_-]{48,}(?=\/|$)/g, '/:private');
     const safe = new URL(url.origin + url.pathname);
-    for (const key of SITE_ATTRIBUTION) { const value_ = url.searchParams.get(key); if (value_ && /^[A-Za-z0-9 _.:~+-]{1,256}$/.test(value_)) safe.searchParams.set(key, value_); }
+    for (const key of SITE_ATTRIBUTION) { const value_ = url.searchParams.get(key); if (siteCampaignValue(value_)) safe.searchParams.set(key, value_); }
     return safe.href;
   } catch { return null; }
 }
@@ -123,7 +129,7 @@ function siteSelector(target) {
 function siteCampaign(value) {
   const result = {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
-  for (const key of SITE_ATTRIBUTION) if (typeof value[key] === 'string' && /^[A-Za-z0-9 _.:~+-]{1,256}$/.test(value[key])) result[key] = value[key];
+  for (const key of SITE_ATTRIBUTION) if (siteCampaignValue(value[key])) result[key] = value[key];
   return result;
 }
 function siteTouch(value) {
