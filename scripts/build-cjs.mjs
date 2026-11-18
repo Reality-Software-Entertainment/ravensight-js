@@ -69,5 +69,8 @@ const footer = [
 
 mkdirSync(join(root, 'dist'), { recursive: true });
 writeFileSync(join(root, 'dist', 'index.cjs'), body + footer, 'utf8');
+// Direct browser-module distribution for static marketing pages. No bundler,
+// remote imports, cookies, or tracking initialization are introduced by loading it.
+writeFileSync(join(root, 'dist', 'site.js'), source, 'utf8');
 
-console.log('built dist/index.cjs');
+console.log('built dist/index.cjs and dist/site.js');

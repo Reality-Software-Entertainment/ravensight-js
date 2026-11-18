@@ -1039,23 +1039,45 @@ const site = createSiteTracker({
   key: 'gt_site_YOUR_WEBSITE_KEY',
   consent: 'opt_in',
   heatmaps: false,
+  engagement: false,
 });
 // Run after the visitor agrees in your consent UI:
 site.grantConsent();
 site.track('wishlist_click');
 ```
 
-Initial loads and SPA history/hash navigation record page views. Custom events
-accept machine names only, without properties or personal text. Sessions expire
+Initial loads and SPA history/hash navigation record page views. Set
+`autoPageviews: false` when your router calls `site.pageView()` after a completed
+navigation. Custom events accept machine names. Registered actions can carry
+their approved scalar dimensions, for example
+`site.track('cta_dashboard_clicked', { section: 'hero' })`. Unknown property
+names, free text, account details and form values are rejected. Sessions expire
 after 30 minutes of inactivity. Website mode uses no cookies, honors Do Not
 Track and Global Privacy Control, and stores only random browser/session IDs in
-local storage (with memory fallback). Query strings are removed except bounded
+local storage (with memory fallback), plus first-seen time and sanitized campaign
+snapshots. Query strings are removed except bounded
 campaign parameters; referrers contain only their origin. Add
 `data-ravensight-private` or `data-ravensight-ignore` to sensitive regions.
 Forms, editable controls, element text, IDs, classes, and values are excluded
 from heatmap capture. Optional heatmaps combine clicks and scroll depth into one
 bounded summary, sent on navigation/hide or after five active minutes. At most
 six summaries are emitted per page visit, and idle pages emit none.
+
+The core analytics extension requires a compatible server with
+`CORE_ANALYTICS_ENABLED=true`. `engagement: true` adds visible active time and
+elapsed duration to bounded summaries, combined with heatmap data when enabled.
+Each accepted combined summary is one event. Periodic summaries occur at most
+once per five minutes; the six-summary limit reserves a final page summary.
+Background time is excluded from active time, and an idle page stops accumulating
+active time after 30 seconds. Collection is an estimate and does not record
+screen contents, keystrokes, or a session replay. Engagement is off by default.
+
+Authentication, OAuth, account and receipt routes are excluded. Add any additional
+private route prefixes with `excludedPaths: ['/settings']`. All DNT variants and
+GPC are honored. `getAttribution()` returns sanitized first/last landing and
+campaign snapshots for an explicitly separate authenticated acquisition handoff;
+it never exposes browser/account identity. Direct revisits do not overwrite the
+last campaign. The static browser module is available at `dist/site.js`.
 
 `site.optOut()` clears queued events and identity; `site.reset()` starts a new
 anonymous identity. Call `site.destroy()` when removing the tracker. Delivery
@@ -1064,6 +1086,6 @@ clears the queue and stops capture: it does not accumulate a later catch-up
 bill. After a one-minute cooldown, fresh activity can try again without a page
 reload; the SDK sends no heartbeat or old events to probe capacity. Calling
 `site.resume()` explicitly starts collection sooner after capacity is restored.
-Each accepted page view, custom event, or combined heatmap summary consumes one
+Each accepted page view, custom event, or combined engagement/heatmap summary consumes one
 event from the same account meter as gameplay and forms. The Website dashboard
 shows the last accepted event so you can verify installation.

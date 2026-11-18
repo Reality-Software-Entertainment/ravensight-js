@@ -162,3 +162,120 @@ test('large summaries split under the collector body bound and rate limits respe
   let size = 0; site._fetch = async (_url, request) => { size = request.body.length; return { status: 429, ok: false, headers: { get: () => '90' }, json: async () => ({ error: 'rate_limited' }) }; };
   await site.flush(); assert.ok(size < 512 * 1024); assert.ok(site._retryAt - Date.now() > 85000); assert.equal(site._queue.length, 26);
 });
+
+test('registered public properties retain dimensions without accepting identity or free text', () => {
+  browser(); const site = tracker();
+  assert.equal(site.track('cta_dashboard_clicked', { section: 'hero', product: 'ravensight', surface: 'marketing' }), true);
+  assert.deepEqual(site._queue.at(-1).properties, { section: 'hero', product: 'ravensight', surface: 'marketing' });
+  assert.equal(site.track('custom_named_action'), true);
+  for (const [name, properties] of [
+    ['custom_named_action', { section: 'hero' }], ['cta_dashboard_clicked', { email: 'private@example.test' }],
+    ['cta_dashboard_clicked', { section: 'typed personal text' }], ['cta_dashboard_clicked', { section: { text: 'secret' } }],
+    ['landing_stage_selected', { stage_number: NaN }], ['landing_stage_selected', { stage_number: 0 }],
+    ['landing_cta_clicked', { destination: '/auth/reset/secret' }], ['landing_cta_clicked', { destination: '/profile/person%40mail.test' }],
+    ['landing_cta_clicked', { destination: '/signup?token=private' }], ['cta_dashboard_clicked', { section: 'gt_ingest_secret' }],
+  ]) assert.throws(() => site.track(name, properties), TypeError);
+  assert.throws(() => site.track('cta_dashboard_clicked', JSON.parse('{"__proto__":"bad"}')), TypeError);
+  const fields = { repo: 'ravensight-js' }; site.track('sdk_repo_clicked', fields); fields.repo = 'mutated';
+  assert.equal(site._queue.at(-1).properties.repo, 'ravensight-js');
+});
+
+test('attribution keeps all approved campaign fields, first touch, and latest tagged snapshot', () => {
+  const win = browser({ href: 'https://studio.example/?utm_source=first&utm_id=campaign1&utm_source_platform=ads&gbraid=gb&wbraid=wb&ttclid=tt&email=private' });
+  const site = tracker(), first = site.getAttribution();
+  assert.deepEqual(first.first.campaign, { utm_source: 'first', utm_id: 'campaign1', utm_source_platform: 'ads', gbraid: 'gb', wbraid: 'wb', ttclid: 'tt' });
+  assert.equal(first.first.landingPage, 'https://studio.example/');
+  assert.equal(first.first.referrer, 'search.example');
+  win.history.pushState({}, '', '/pricing?utm_source=second&utm_medium=email');
+  assert.deepEqual(site.getAttribution().first, first.first);
+  assert.deepEqual(site.getAttribution().last.campaign, { utm_source: 'second', utm_medium: 'email' });
+  win.history.pushState({}, '', '/direct'); assert.equal(site.getAttribution().last.campaign.utm_source, 'second');
+  const copy = site.getAttribution(); copy.first.campaign.utm_source = 'changed';
+  assert.equal(site.getAttribution().first.campaign.utm_source, 'first');
+  assert.equal(JSON.stringify(first).includes('visitorId'), false);
+  site.optOut(); assert.equal(site.getAttribution(), null);
+});
+
+test('campaign values retain the existing 256 character bound and reject email/query payloads', () => {
+  browser({ href: 'https://studio.example/?utm_campaign=' + 'a'.repeat(256) + '&utm_source=x%40example.test&utm_medium=' + 'z'.repeat(257) });
+  const site = tracker(); assert.deepEqual(site.getAttribution().first.campaign, { utm_campaign: 'a'.repeat(256) });
+  assert.equal(new URL(site._queue[0].url).searchParams.get('utm_campaign').length, 256);
+});
+
+test('returning browser retains first touch and first seen without inventing an account identity', () => {
+  const win = browser({ href: 'https://studio.example/?utm_source=campaign' }); const site = tracker();
+  const storage = win.localStorage, id = site._identity.visitorId, firstSeen = site._identity.firstSeenAt;
+  site.destroy(); browser({ href: 'https://studio.example/' }).document.referrer = '';
+  const returning = tracker({ storage });
+  assert.equal(returning._identity.visitorId, id); assert.equal(returning._identity.firstSeenAt, firstSeen);
+  assert.equal(returning.getAttribution().first.campaign.utm_source, 'campaign');
+  assert.equal(returning.getAttribution().last.campaign.utm_source, 'campaign');
+  assert.equal('userId' in returning._queue[0], false);
+});
+
+test('all protected auth and account paths and OAuth consent redirects suppress public capture', () => {
+  for (const path of ['/auth', '/auth/reset?token=abc', '/oauth/authorize', '/oauth/consent', '/account/dashboard', '/login?redirect=%2Foauth%2Fconsent']) {
+    const win = browser({ href: 'https://studio.example' + path }); const site = tracker({ autoPageviews: false, heatmaps: true });
+    site.pageView(); assert.equal(site._queue.length, 0, path); assert.equal(site.track('click'), false);
+    win.document.dispatch('click', { target: { closest: () => null, tagName: 'BUTTON' }, pageX: 1, pageY: 1 });
+    assert.equal(site._clicks.size, 0);
+  }
+});
+
+test('manual router mode counts only explicit completed routes and extra excluded paths', () => {
+  const win = browser(); const site = tracker({ autoPageviews: false, excludedPaths: ['/settings'] });
+  assert.equal(site._queue.length, 0); win.history.pushState({}, '', '/pricing'); assert.equal(site._queue.length, 0);
+  site.pageView(); assert.equal(site._queue.length, 1);
+  win.history.pushState({}, '', '/settings/team'); site.pageView(); assert.equal(site._queue.length, 1);
+  assert.throws(() => tracker({ excludedPaths: ['not/absolute'] }), TypeError);
+});
+
+test('legacy DNT values and global privacy control block collection before storage', () => {
+  for (const navigator of [{ doNotTrack: 'yes' }, { msDoNotTrack: '1' }, { msDoNotTrack: 'yes' }, { globalPrivacyControl: true }]) {
+    const win = browser({ navigator }); const site = tracker({ engagement: true });
+    assert.equal(site._queue.length, 0); assert.equal(win.localStorage._map.size, 0);
+  }
+});
+
+test('engagement and heatmap activity share one bounded event joined to its pageview', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1800000000000 });
+  const win = browser(); const site = tracker({ engagement: true, heatmaps: true });
+  const view = site._queue[0]; t.mock.timers.tick(12000);
+  win.document.dispatch('click', { target: { closest: () => null, tagName: 'BUTTON' }, pageX: 100, pageY: 100 });
+  site._summarize('hidden'); const summary = site._queue.at(-1);
+  assert.equal(site._queue.length, 2); assert.equal(summary.type, 'engagement');
+  assert.deepEqual(summary.engagement, { activeMs: 12000, durationMs: 12000, pageViewId: view.pageViewId, reason: 'hidden' });
+  assert.equal(summary.heatmap.clicks.length, 1); assert.equal(summary.sessionId, view.sessionId);
+  assert.equal(site._summarize('hidden'), false);
+});
+
+test('engagement stops in background and after inactivity; each delta is disjoint', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1800000000000 });
+  const win = browser(); const site = tracker({ engagement: true });
+  t.mock.timers.tick(10000); win.document.visibilityState = 'hidden'; win.document.dispatch('visibilitychange');
+  assert.equal(site._queue.at(-1).engagement.activeMs, 10000);
+  t.mock.timers.tick(120000); site._accrue(); assert.equal(site._activeMs, 0);
+  win.document.visibilityState = 'visible'; win.document.dispatch('visibilitychange');
+  t.mock.timers.tick(60000); site._summarize('interval');
+  assert.equal(site._queue.at(-1).engagement.activeMs, 30000);
+  assert.equal(site._summarize('interval'), false);
+});
+
+test('periodic summaries reserve a final slot and never exceed six per page', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1800000000000 });
+  browser(); const site = tracker({ engagement: true });
+  for (let n = 0; n < 8; n++) { site._activity(); t.mock.timers.tick(300000); site._summarize('interval'); }
+  assert.equal(site._queue.filter(x => x.type === 'engagement').length, 5);
+  site._summarize('pagehide'); assert.equal(site._queue.filter(x => x.type === 'engagement').length, 6);
+  site._activity(); t.mock.timers.tick(10000); site._summarize('hidden');
+  assert.equal(site._queue.filter(x => x.type === 'engagement').length, 6);
+});
+
+test('a delayed old-page summary cannot move into the next session', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1800000000000 });
+  const win = browser(); const site = tracker({ engagement: true }); const view = site._queue[0];
+  t.mock.timers.tick(31 * 60000); win.history.pushState({}, '', '/next');
+  const summary = site._queue.find(x => x.type === 'engagement'), next = site._queue.at(-1);
+  assert.equal(summary.sessionId, view.sessionId); assert.equal(summary.engagement.pageViewId, view.pageViewId);
+  assert.notEqual(next.sessionId, view.sessionId);
+});
