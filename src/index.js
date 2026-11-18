@@ -4309,7 +4309,7 @@ export class SiteTracker {
     this._engagement = options.engagement === true;
     this._excludedPaths = options.excludedPaths || [];
     this._autoPageviews = options.autoPageviews !== false;
-    this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null;
+    this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null; this._exitFlight = null;
     this._paused = false; this._pauseUntil = 0; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
     this._lastLocation = null; this._page = null; this._clicks = new Map(); this._scroll = Array(10).fill(0);
     this._summaryCount = 0; this._summaryStart = Date.now(); this._pageActive = false;
@@ -4498,16 +4498,24 @@ export class SiteTracker {
     return accepted;
   }
   async flush({ keepalive = false } = {}) {
-    if (this._inFlight) return this._inFlight;
+    // An ordinary fetch can be cancelled by navigation. A separate bounded
+    // keepalive sends pending work immediately, including any active IDs;
+    // collector receipts make that replay idempotent. Waiting for the first
+    // fetch would lose actions queued just before the page closes.
+    const lane = keepalive ? '_exitFlight' : '_inFlight';
+    if (this[lane]) return this[lane];
     if (!this._enabled() || !this._queue.length || !this._fetch || Date.now() < this._retryAt) return false;
     const batch = this._queue.slice(0, 50);
     while (batch.length > 1 && JSON.stringify(batch).length > 400000) batch.pop();
     // Keepalive has a browser-wide 64 KB budget. Reduce without changing IDs.
-    if (keepalive) while (batch.length > 1 && JSON.stringify(batch).length > 45000) batch.pop();
+    if (keepalive) {
+      while (batch.length && utf8Length(JSON.stringify({ key: this.key, events: batch })) > 45000) batch.pop();
+      if (!batch.length) return false;
+    }
     // Assign the latch before invoking an injected transport, which may throw
     // synchronously. Bound the body read too; abort alone is not enough for
     // custom transports that ignore its signal.
-    this._inFlight = Promise.resolve().then(async () => {
+    this[lane] = Promise.resolve().then(async () => {
       let timer;
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
       try {
@@ -4531,7 +4539,7 @@ export class SiteTracker {
         if ((response.ok || response.status === 429) && valid) {
           const acknowledged = new Set([...body.acceptedIds, ...body.droppedIds]);
           this._queue = this._queue.filter(event => !acknowledged.has(event.eventId));
-          if (body.paused === true && ['needs_funds', 'backstop'].includes(body.reason)) {
+          if (body.paused === true && ['needs_funds', 'backstop', 'internal_capacity'].includes(body.reason)) {
             this._paused = true; this._pauseUntil = Date.now() + 60000; this._queue = []; this._clicks.clear(); this._scroll.fill(0); this._pageActive = false;
           }
           this._attempts = 0; this._retryAt = body.refused && !this._paused ? Date.now() + 5000 : 0;
@@ -4542,9 +4550,9 @@ export class SiteTracker {
         this._attempts++; this._retryAt = Date.now() + Math.max(parseRetryAfterMs(response.headers?.get?.('Retry-After')) || 0, Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)));
         return false;
       } catch { this._attempts++; this._retryAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)); return false; }
-      finally { clearTimeout(timer); this._inFlight = null; }
+      finally { clearTimeout(timer); this[lane] = null; }
     });
-    return this._inFlight;
+    return this[lane];
   }
   destroy() {
     if (this._destroyed) return;

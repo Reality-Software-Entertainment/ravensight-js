@@ -279,3 +279,44 @@ test('a delayed old-page summary cannot move into the next session', t => {
   assert.equal(summary.sessionId, view.sessionId); assert.equal(summary.engagement.pageViewId, view.pageViewId);
   assert.notEqual(next.sessionId, view.sessionId);
 });
+test('a platform internal-budget pause discards refused work with the same no-catch-up contract', async () => {
+  browser(); const site = tracker({ fetch: async (_url, request) => {
+    const events = JSON.parse(request.body).events;
+    return { ok: false, status: 429, json: async () => ({ accepted: 0, duplicates: 0, dropped: 0, refused: events.length, acceptedIds: [], droppedIds: [], refusedIds: events.map(event => event.eventId), paused: true, reason: 'internal_capacity' }) };
+  } });
+  assert.equal(await site.flush(), true); assert.equal(site.paused, true); assert.equal(site._queue.length, 0);
+  assert.equal(site.track('more_activity'), false); site.resume(); assert.equal(site._queue.length, 1);
+});
+
+
+test('pagehide sends new actions immediately while an ordinary request is still in flight', async () => {
+  const win = browser(); let finishFirst; const calls = [];
+  const site = tracker({ fetch(_url, request) {
+    const events = JSON.parse(request.body).events; calls.push({ request, events });
+    if (calls.length === 1) return new Promise(resolve => { finishFirst = () => resolve(ok(events)); });
+    return Promise.resolve(ok(events));
+  } });
+  const first = site.flush(); await Promise.resolve();
+  site.track('form_submit_success', { form: 'contact' }); const successId = site._queue.at(-1).eventId;
+  win.dispatch('pagehide'); await site._exitFlight;
+  assert.equal(calls.length, 2); assert.equal(calls[0].request.keepalive, false); assert.equal(calls[1].request.keepalive, true);
+  assert.equal(calls[1].events[0].eventId, calls[0].events[0].eventId);
+  assert.ok(calls[1].events.some(event => event.eventId === successId));
+  assert.equal(site._queue.length, 0);
+  site.track('after_unload_ack'); const remainingId = site._queue[0].eventId;
+  finishFirst(); await first;
+  assert.deepEqual(site._queue.map(event => event.eventId), [remainingId]);
+});
+
+test('concurrent keepalive requests share a bounded lane and honor consent withdrawal', async () => {
+  browser(); const calls = []; let finish;
+  const site = tracker({ fetch(_url, request) {
+    calls.push(request); const events = JSON.parse(request.body).events;
+    return new Promise(resolve => { finish = () => resolve(ok(events)); });
+  } });
+  const first = site.flush({ keepalive: true }); const next = site.flush({ keepalive: true });
+  await Promise.resolve(); assert.equal(calls.length, 1);
+  finish(); await Promise.all([first, next]);
+  site.track('pending'); const withdrawn = site.flush({ keepalive: true }); site.optOut();
+  assert.equal(await withdrawn, false); assert.equal(calls.length, 1);
+});
