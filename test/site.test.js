@@ -83,6 +83,48 @@ test('network retry keeps IDs; authorization rejection drops permanently invalid
   await site.flush(); assert.equal(site._queue[0].eventId, id); site._retryAt = 0;
   site._fetch = async () => ({ status: 401, ok: false, json: async () => ({ error: 'invalid_site_key' }) }); await site.flush(); assert.equal(site._queue.length, 0);
 });
+test('a synchronous custom transport failure releases the latch and retries the same event', async () => {
+  browser(); let calls = 0, first;
+  const site = tracker({ fetch(_url, request) {
+    const events = JSON.parse(request.body).events; calls++;
+    if (calls === 1) { first = events[0].eventId; throw new Error('synchronous network adapter failure'); }
+    assert.equal(events[0].eventId, first); return Promise.resolve(ok(events));
+  } });
+  assert.equal(await site.flush(), false); site._retryAt = 0;
+  assert.equal(await site.flush(), true); assert.equal(calls, 2); assert.equal(site._queue.length, 0);
+});
+test('a stalled transport times out even when it ignores abort, and late acceptance cannot discard new activity', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  browser(); let resolveFirst, firstEvents, signal;
+  const site = tracker({ fetch(_url, request) {
+    firstEvents = JSON.parse(request.body).events; signal = request.signal;
+    return new Promise(resolve => { resolveFirst = resolve; });
+  } });
+  const pending = site.flush(); await Promise.resolve();
+  t.mock.timers.tick(10000); assert.equal(await pending, false); assert.equal(signal.aborted, true);
+  site.track('fresh_activity'); const queued = site._queue.map(event => event.eventId);
+  resolveFirst(ok(firstEvents)); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(site._queue.map(event => event.eventId), queued);
+  site._retryAt = 0;
+  site._fetch = async (_url, request) => { const events = JSON.parse(request.body).events; assert.deepEqual(events.map(event => event.eventId), queued); return ok(events); };
+  assert.equal(await site.flush(), true); assert.equal(site._queue.length, 0);
+});
+test('a stalled response body has the same deadline and cannot change the queue after a successful retry', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  browser(); let resolveBody, firstEvents, signal;
+  const site = tracker({ fetch: async (_url, request) => {
+    firstEvents = JSON.parse(request.body).events; signal = request.signal;
+    return { status: 200, ok: true, json: () => new Promise(resolve => { resolveBody = resolve; }) };
+  } });
+  const pending = site.flush(); await Promise.resolve(); await Promise.resolve();
+  t.mock.timers.tick(10000); assert.equal(await pending, false); assert.equal(signal.aborted, true);
+  site._retryAt = 0; site._fetch = async (_url, request) => {
+    const events = JSON.parse(request.body).events; assert.deepEqual(events, firstEvents); return ok(events);
+  };
+  assert.equal(await site.flush(), true); site.track('after_retry'); const queued = site._queue.map(event => event.eventId);
+  resolveBody(await ok(firstEvents).json()); await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(site._queue.map(event => event.eventId), queued);
+});
 test('fresh activity resumes after pause cooldown without billable probes or catch-up', async () => {
   const win = browser(); let requests = 0;
   const site = tracker({ fetch: async (_url, request) => { requests++; const events = JSON.parse(request.body).events; return { ok: false, status: 429, json: async () => ({ accepted: 0, duplicates: 0, dropped: 0, refused: events.length, acceptedIds: [], droppedIds: [], refusedIds: events.map(event => event.eventId), paused: true, reason: 'needs_funds' }) }; } });

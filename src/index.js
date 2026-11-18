@@ -4386,10 +4386,24 @@ export class SiteTracker {
     while (batch.length > 1 && JSON.stringify(batch).length > 400000) batch.pop();
     // Keepalive has a browser-wide 64 KB budget. Reduce without changing IDs.
     if (keepalive) while (batch.length > 1 && JSON.stringify(batch).length > 45000) batch.pop();
-    this._inFlight = (async () => {
+    // Assign the latch before invoking an injected transport, which may throw
+    // synchronously. Bound the body read too; abort alone is not enough for
+    // custom transports that ignore its signal.
+    this._inFlight = Promise.resolve().then(async () => {
+      let timer;
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
       try {
-        const response = await this._fetch(`${this.apiUrl}/site/collect`, { method: 'POST', credentials: 'omit', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: this.key, events: batch }), keepalive });
-        const body = await response.json().catch(() => null);
+        const timeout = new Promise((_, reject) => {
+          timer = setTimeout(() => { controller?.abort(); reject(new Error('Website collection timed out.')); }, 10000);
+          timer?.unref?.();
+        });
+        const { response, body } = await Promise.race([
+          (async () => {
+            const response = await this._fetch(`${this.apiUrl}/site/collect`, { method: 'POST', credentials: 'omit', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: this.key, events: batch }), keepalive, ...(controller ? { signal: controller.signal } : {}) });
+            const body = await response.json().catch(() => null);
+            return { response, body };
+          })(), timeout,
+        ]);
         const ids = new Set(batch.map(event => event.eventId));
         const validIds = value => Array.isArray(value) && value.every(id => typeof id === 'string' && ids.has(id)) && new Set(value).size === value.length;
         const valid = body && ['accepted', 'duplicates', 'dropped', 'refused'].every(key => Number.isInteger(body[key]) && body[key] >= 0) && validIds(body.acceptedIds) && validIds(body.droppedIds) && validIds(body.refusedIds) && body.acceptedIds.length === body.accepted + body.duplicates && body.droppedIds.length === body.dropped && body.refusedIds.length === body.refused && new Set([...body.acceptedIds, ...body.droppedIds, ...body.refusedIds]).size === batch.length && body.accepted + body.duplicates + body.dropped + body.refused === batch.length;
@@ -4407,8 +4421,8 @@ export class SiteTracker {
         this._attempts++; this._retryAt = Date.now() + Math.max(parseRetryAfterMs(response.headers?.get?.('Retry-After')) || 0, Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)));
         return false;
       } catch { this._attempts++; this._retryAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(this._attempts, 6)); return false; }
-      finally { this._inFlight = null; }
-    })();
+      finally { clearTimeout(timer); this._inFlight = null; }
+    });
     return this._inFlight;
   }
   destroy() {
