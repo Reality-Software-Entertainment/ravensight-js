@@ -471,6 +471,8 @@ export interface SiteTrackerOptions {
   engagement?: boolean;
   /** Disable automatic initial/history pageviews when a router calls pageView(). */
   autoPageviews?: boolean;
+  /** Explicit registered signup/checkout outcomes only. No page, DOM or attribution capture. */
+  outcomesOnly?: boolean;
   excludedPaths?: string[];
   storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
   fetch?: typeof fetch;
@@ -479,6 +481,7 @@ export class SiteTracker {
   constructor(options: SiteTrackerOptions);
   readonly paused: boolean;
   track(name: string, properties?: Record<string, string | number | boolean>): boolean;
+  trackOutcome(name: 'signup_form_viewed' | 'signup_failed' | 'checkout_failed', properties?: Record<string, string | number | boolean>): boolean;
   getAttribution(): { first: SiteAttributionTouch; last: SiteAttributionTouch } | null;
   pageView(): boolean;
   grantConsent(): boolean;

@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.9.0';
+const VERSION = '0.10.0';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -4213,8 +4213,8 @@ class Ravensight {
 
 // Website mode deliberately has no player authentication or free-form data.
 const SITE_ATTRIBUTION = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'utm_id', 'utm_source_platform', 'gclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'ttclid', 'rs_link'];
-// Mirrored from the platform public-events.json contract, version 1.
-const SITE_PUBLIC_EVENTS = {"version":1,"limits":{"properties":24,"propertyBytes":4096,"batch":50,"engagementSummariesPerPage":6,"periodicSummaryMs":300000},"types":{"token":{"type":"string","max":80,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"slug":{"type":"string","max":120,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"catalog":{"type":"string","max":24,"pattern":"^[0-9]+$"},"path":{"type":"string","max":500,"pattern":"^/[^?#@\\\\]*$"},"count":{"type":"number","integer":true,"min":0,"max":1000000},"position":{"type":"number","integer":true,"min":1,"max":100},"flag":{"type":"boolean"},"location":{"type":"enum","values":["header","footer","body","hero","sidebar","inline","bottom","nav"]},"form":{"type":"enum","values":["newsletter","contact","careers","support"]},"failure":{"type":"enum","values":["rejected","network","validation","unavailable"]},"error":{"type":"enum","values":["type_error","range_error","syntax_error","reference_error","network","unknown"]},"component":{"type":"enum","values":["runtime","promise","auth","play_catalog","play_transport","form"]},"product":{"type":"enum","values":["realityse","ravensight"]},"surface":{"type":"enum","values":["marketing","website","docs","blog"]}},"common":{"product":"product","surface":"surface","landing_page":"token","landing_version":"token"},"events":{"navigation_click":{"location":"location","route":"token"},"game_link_click":{"catalog_id":"catalog","action":{"type":"enum","values":["play","learn_more","catalog","store","website"]},"destination":{"type":"enum","values":["apple","google_play","steam","game_site"]}},"external_link_click":{"destination":"token","location":"location"},"promotion_action":{"action":{"type":"enum","values":["dismiss","open"]}},"content_filter_change":{"section":{"type":"enum","values":["games","shop","play","accordion"]},"value":"slug"},"content_link_click":{"content_id":"slug","section":{"type":"enum","values":["blog","news","press","play"]},"action":{"type":"enum","values":["open","cta"]}},"form_submit_attempt":{"form":"form"},"form_submit_success":{"form":"form"},"form_submit_failure":{"form":"form","error_code":"failure"},"page_not_found":{"route":{"type":"enum","values":["not_found"]},"referrer":{"type":"enum","values":["internal","external","none"]}},"diagnostic":{"error_code":"error","component":"component"},"website_error":{"fingerprint":"token","error_code":"error","component":"component"},"cta_dashboard_clicked":{"section":"token","cta_location":"token"},"cta_docs_clicked":{"section":"token"},"sdk_repo_clicked":{"repo":"slug"},"pricing_viewed":{},"landing_page_viewed":{},"landing_cta_clicked":{"cta_location":"token","destination":"path"},"landing_stage_selected":{"stage":"token","stage_number":"position"},"landing_faq_opened":{"question_number":"position"},"landing_section_viewed":{"section":"token"},"download":{"catalog_id":"catalog","destination":"token"},"outbound_click":{"destination":"token","location":"location"}}};
+// Mirrored from the platform public-events.json contract, version 3.
+const SITE_PUBLIC_EVENTS = {"version":3,"limits":{"properties":24,"propertyBytes":4096,"batch":50,"engagementSummariesPerPage":6,"periodicSummaryMs":300000},"types":{"token":{"type":"string","max":80,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"slug":{"type":"string","max":120,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"catalog":{"type":"string","max":24,"pattern":"^[0-9]+$"},"path":{"type":"string","max":500,"pattern":"^/[^?#@\\\\]*$"},"count":{"type":"number","integer":true,"min":0,"max":1000000},"position":{"type":"number","integer":true,"min":1,"max":100},"flag":{"type":"boolean"},"campaign_tag":{"type":"string","max":60,"pattern":"^[a-z0-9_.-]{1,60}$"},"location":{"type":"enum","values":["header","footer","body","hero","sidebar","inline","bottom","nav"]},"form":{"type":"enum","values":["newsletter","contact","careers","support"]},"failure":{"type":"enum","values":["rejected","network","validation","unavailable"]},"error":{"type":"enum","values":["type_error","range_error","syntax_error","reference_error","network","unknown"]},"component":{"type":"enum","values":["runtime","promise","auth","play_catalog","play_transport","form"]},"product":{"type":"enum","values":["realityse","ravensight"]},"surface":{"type":"enum","values":["marketing","website","docs","blog"]}},"common":{"product":"product","surface":"surface","landing_page":"token","landing_version":"token"},"contextEvents":{"signup_form_viewed":"signup","signup_failed":"signup","checkout_failed":"checkout"},"events":{"signup_form_viewed":{},"signup_failed":{"code":{"type":"enum","values":["email_unconfirmed","invalid_input","email_in_use","rate_limited","network","unavailable","unknown"]}},"checkout_failed":{"plan":{"type":"enum","values":["monthly","annual"]},"code":{"type":"enum","values":["billing_disabled","billing_misconfigured","already_subscribed","invalid_plan","rate_limited","network","unavailable","unknown"]}},"navigation_click":{"location":"location","route":"token"},"game_link_click":{"catalog_id":"catalog","action":{"type":"enum","values":["play","learn_more","catalog","store","website"]},"destination":{"type":"enum","values":["apple","google_play","steam","game_site"]}},"external_link_click":{"destination":"token","location":"location"},"promotion_action":{"action":{"type":"enum","values":["dismiss","open"]}},"content_filter_change":{"section":{"type":"enum","values":["games","shop","play","accordion"]},"value":"slug"},"content_link_click":{"content_id":"slug","section":{"type":"enum","values":["blog","news","press","play"]},"action":{"type":"enum","values":["open","cta"]}},"form_submit_attempt":{"form":"form"},"form_submit_success":{"form":"form"},"form_submit_failure":{"form":"form","error_code":"failure"},"page_not_found":{"route":{"type":"enum","values":["not_found"]},"referrer":{"type":"enum","values":["internal","external","none"]}},"diagnostic":{"error_code":"error","component":"component"},"website_error":{"fingerprint":"token","error_code":"error","component":"component"},"cta_dashboard_clicked":{"section":"token","cta_location":"token"},"cta_docs_clicked":{"section":"token"},"sdk_repo_clicked":{"repo":"slug"},"pricing_viewed":{},"landing_page_viewed":{},"landing_cta_clicked":{"cta_location":"token","destination":"path"},"landing_stage_selected":{"stage":"token","stage_number":"position"},"landing_faq_opened":{"question_number":"position"},"landing_section_viewed":{"section":"token"},"ad_school_searched":{"found":"flag"},"ad_school_picked":{"classification":{"type":"enum","values":["1A","2A","3A","4A","5A","6A"]},"locked":"flag"},"ad_cta_clicked":{"placement":{"type":"enum","values":["hero","job_card_free","job_card","job_card_subscribe","finish","sticky"]},"picked":"flag","locked":"flag"},"ad_landing_viewed":{"source":"campaign_tag","medium":"campaign_tag","campaign":"campaign_tag","content":"campaign_tag"},"download":{"catalog_id":"catalog","destination":"token"},"outbound_click":{"destination":"token","location":"location"}}};
 const SITE_SESSION_MS = 30 * 60 * 1000;
 const SITE_MEMORY_STORAGE = new MemoryStorage();
 // Advertising click IDs are often long opaque strings. Length alone is not a
@@ -4298,6 +4298,9 @@ class SiteTracker {
     if (!/^gt_site_[A-Za-z0-9_-]{16,128}$/.test(options.key || '')) throw new TypeError('A website key is required.');
     if (options.consent !== undefined && !['opt_in', 'opt_out'].includes(options.consent)) throw new TypeError('Consent must be opt_in or opt_out.');
     if (options.excludedPaths !== undefined && (!Array.isArray(options.excludedPaths) || options.excludedPaths.length > 40 || options.excludedPaths.some(path => typeof path !== 'string' || !/^\/[A-Za-z0-9_/-]{0,180}$/.test(path)))) throw new TypeError('Excluded paths must be bounded absolute paths.');
+    if (options.outcomesOnly !== undefined && typeof options.outcomesOnly !== 'boolean') throw new TypeError('outcomesOnly must be a boolean.');
+    if (options.outcomesOnly && (options.heatmaps || options.engagement || options.autoPageviews === true)) throw new TypeError('Outcome-only mode cannot capture pages, engagement or heatmaps.');
+    this._outcomesOnly = options.outcomesOnly === true;
     this.key = options.key;
     this.apiUrl = normalizeApiUrl(options.apiUrl);
     this._window = typeof window !== 'undefined' ? window : null;
@@ -4314,7 +4317,7 @@ class SiteTracker {
     this._heatmaps = options.heatmaps === true;
     this._engagement = options.engagement === true;
     this._excludedPaths = options.excludedPaths || [];
-    this._autoPageviews = options.autoPageviews !== false;
+    this._autoPageviews = !this._outcomesOnly && options.autoPageviews !== false;
     this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null; this._exitFlight = null; this._exitRequests = new Set();
     this._paused = false; this._pauseUntil = 0; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
     this._lastLocation = null; this._page = null; this._clicks = new Map(); this._scroll = Array(10).fill(0);
@@ -4322,6 +4325,15 @@ class SiteTracker {
     this._pageViewId = null; this._pageSessionId = null; this._activeMs = 0; this._engagementTick = Date.now(); this._lastActivity = Date.now();
     this._visible = this._document?.visibilityState !== 'hidden'; this._focused = true;
     this._firstNavigation = true;
+    if (this._outcomesOnly) {
+      // Lifecycle delivery only: no navigation, clicks, scroll, key activity or
+      // attribution observation. Applications explicitly name each safe outcome.
+      this._on(this._window, 'pagehide', () => this.flush({ keepalive: true }));
+      this._on(this._document, 'visibilitychange', () => { if (this._document?.visibilityState === 'hidden') this.flush({ keepalive: true }); });
+      this._timer = setInterval(() => this.flush(), 5000);
+      this._timer?.unref?.();
+      return;
+    }
     this._on(this._window, 'popstate', () => { if (this._autoPageviews) this._navigation(); });
     this._on(this._window, 'hashchange', () => { if (this._autoPageviews) this._navigation(); });
     this._on(this._window, 'pagehide', () => { this._summarize('pagehide'); this._visible = false; this.flush({ keepalive: true }); });
@@ -4335,7 +4347,9 @@ class SiteTracker {
     this._on(this._window, 'blur', () => { this._accrue(); this._focused = false; });
     // Only activity time is observed. Keyboard values/text are never read.
     this._on(this._document, 'keydown', () => this._activity());
-    this._on(this._document, 'click', event => this._click(event));
+    // Record the public click before an application handler changes route or
+    // destroys the tracker. Navigation then flushes it with the old page.
+    this._on(this._document, 'click', event => this._click(event), { capture: true });
     this._on(this._window, 'scroll', () => this._scrolled(), { passive: true });
     const history = this._window?.history;
     if (history) for (const method of ['pushState', 'replaceState']) {
@@ -4396,7 +4410,7 @@ class SiteTracker {
   }
   /** Sanitized attribution for a separate authenticated acquisition handoff. */
   getAttribution() {
-    if (!this._enabled() || !this._identity) return null;
+    if (this._outcomesOnly || !this._enabled() || !this._identity) return null;
     const first = siteTouch(this._identity.attribution?.first), last = siteTouch(this._identity.attribution?.last);
     return first && last ? { first, last } : null;
   }
@@ -4405,13 +4419,14 @@ class SiteTracker {
     const summary = type === 'engagement' || type === 'heatmap';
     const identity = summary && this._identity ? this._identity : this._session();
     let referrer = '';
-    try { referrer = this._document?.referrer ? new URL(this._document.referrer).origin : ''; } catch {}
-    const attribution = this.getAttribution();
-    const event = { eventId: randomId(), visitorId: identity.visitorId, sessionId: summary && this._pageSessionId ? this._pageSessionId : identity.sessionId, type, timestamp: Date.now(), url: address, referrer, webdriver: this._navigator.webdriver === true, firstSeenAt: identity.firstSeenAt, ...(attribution ? { attribution } : {}), ...extra };
+    if (!extra.context) { try { referrer = this._document?.referrer ? new URL(this._document.referrer).origin : ''; } catch {} }
+    const attribution = extra.context ? null : this.getAttribution();
+    const event = { eventId: randomId(), visitorId: identity.visitorId, sessionId: summary && this._pageSessionId ? this._pageSessionId : identity.sessionId, type, timestamp: Date.now(), url: address, ...(extra.context ? {} : { referrer }), webdriver: this._navigator.webdriver === true, firstSeenAt: identity.firstSeenAt, ...(attribution ? { attribution } : {}), ...extra };
     if (this._queue.length >= 100) this._queue.shift();
     this._queue.push(event); return true;
   }
   _navigation() {
+    if (this._outcomesOnly) return false;
     const href = this._window?.location?.href;
     if (!href || href === this._lastLocation || !this._enabled()) return false;
     this._summarize('navigation'); this._lastLocation = href; this._page = siteAddress(href, this._excludedPaths);
@@ -4424,11 +4439,32 @@ class SiteTracker {
   }
   /** Track a machine-named action with its registered, bounded scalar fields. */
   track(name, properties) {
+    if (this._outcomesOnly) throw new TypeError('Use trackOutcome in outcome-only mode.');
+    if (SITE_PUBLIC_EVENTS.contextEvents?.[name]) throw new TypeError('This outcome needs a dedicated outcome-only tracker.');
     if (typeof name !== 'string' || !/^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(name)) throw new TypeError('Use a machine event name without personal text.');
     const fields = siteProperties(name, properties);
     if (!siteAddress(this._window?.location?.href, this._excludedPaths)) return false;
     this._activity();
     return this._enqueue('custom', { name, ...(fields === undefined ? {} : { properties: fields }) });
+  }
+  /** Explicit registered outcome, without recording an authentication page. */
+  trackOutcome(name, properties) {
+    if (!this._outcomesOnly) throw new TypeError('Create a dedicated tracker with outcomesOnly: true.');
+    const context = SITE_PUBLIC_EVENTS.contextEvents?.[name];
+    if (!['signup', 'checkout'].includes(context)) throw new TypeError('Use a registered website outcome.');
+    const fields = siteProperties(name, properties);
+    // Context events cannot inherit common page/marketing tags.
+    if (Object.keys(fields || {}).some(key => !Object.hasOwn(SITE_PUBLIC_EVENTS.events[name], key))) throw new TypeError('Unexpected outcome property.');
+    if (!this._enabled()) return false;
+    let origin;
+    try {
+      // Read only the origin. Never read or serialize the path, query, fragment,
+      // form contents, referrer, or authenticated game/account identity.
+      origin = this._window?.location?.origin;
+      const parsed = new URL(origin);
+      if (!['https:', 'http:'].includes(parsed.protocol) || parsed.origin !== origin) return false;
+    } catch { return false; }
+    return this._enqueue('custom', { name, context, ...(fields === undefined ? {} : { properties: fields }) }, origin);
   }
   pageView() { this._lastLocation = null; return this._navigation(); }
   grantConsent() {
@@ -4546,7 +4582,7 @@ class SiteTracker {
         });
         const { response, body } = await Promise.race([
           (async () => {
-            const response = await this._fetch(`${this.apiUrl}/site/collect`, { method: 'POST', credentials: 'omit', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: this.key, events: batch }), keepalive, ...(controller ? { signal: controller.signal } : {}) });
+            const response = await this._fetch(`${this.apiUrl}/site/collect`, { method: 'POST', credentials: 'omit', referrerPolicy: 'no-referrer', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: this.key, events: batch }), keepalive, ...(controller ? { signal: controller.signal } : {}) });
             const body = await response.json().catch(() => null);
             return { response, body };
           })(), timeout,

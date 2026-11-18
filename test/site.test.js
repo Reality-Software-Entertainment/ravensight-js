@@ -6,7 +6,12 @@ const trackers = [];
 const previousWindow = globalThis.window;
 function target(extra = {}) {
   const listeners = new Map();
-  return { ...extra, addEventListener(name, fn) { const rows = listeners.get(name) || []; rows.push(fn); listeners.set(name, rows); }, removeEventListener(name, fn) { listeners.set(name, (listeners.get(name) || []).filter(value => value !== fn)); }, dispatch(name, event = {}) { for (const fn of listeners.get(name) || []) fn(event); } };
+  const capture = options => options === true || options?.capture === true;
+  return { ...extra,
+    addEventListener(name, fn, options) { const rows = listeners.get(name) || []; rows.push({ fn, capture: capture(options) }); listeners.set(name, rows); },
+    removeEventListener(name, fn, options) { listeners.set(name, (listeners.get(name) || []).filter(value => value.fn !== fn || value.capture !== capture(options))); },
+    dispatch(name, event = {}, phase) { for (const listener of listeners.get(name) || []) if (!phase || listener.capture === (phase === 'capture')) listener.fn(event); }
+  };
 }
 function browser({ privateMode = false, navigator = {}, href = 'https://studio.example/?email=secret%40example.com&utm_source=newsletter' } = {}) {
   const document = target({ referrer: 'https://search.example/find?secret=1', visibilityState: 'visible', documentElement: { scrollWidth: 1000, scrollHeight: 2000 } });
@@ -27,6 +32,40 @@ test('site mode validates options and leaves game identity separate', () => {
   assert.equal(site._queue[0].referrer, 'https://search.example');
   assert.equal(site._queue[0].timestamp > 1000000000000, true);
   assert.throws(() => site.track('typed text'), TypeError); assert.throws(() => site.track('click', { email: 'private' }), TypeError);
+});
+test('public marketing events preserve bounded campaign and decision dimensions without accepting personal fields', () => {
+  browser(); const site = tracker();
+  const cases = [
+    ['ad_school_searched', { found: true }],
+    ['ad_school_picked', { classification: '6A', locked: false }],
+    ['ad_cta_clicked', { placement: 'job_card_subscribe', picked: true, locked: true }],
+    ['ad_landing_viewed', { source: 'direct', medium: 'cpc', campaign: 'launch-2026', content: 'coach_ad.2' }],
+  ];
+  for (const [name, properties] of cases) {
+    assert.equal(site.track(name, properties), true);
+    assert.deepEqual(site._queue.at(-1).properties, properties);
+  }
+  for (const [name, properties] of [
+    ['ad_school_searched', { query: 'private search' }],
+    ['ad_school_picked', { classification: '7A', locked: false }],
+    ['ad_cta_clicked', { placement: 'unregistered' }],
+    ['ad_landing_viewed', { campaign: 'person@example.test' }],
+    ['ad_landing_viewed', { source: 'phc_private' }],
+    ['ad_landing_viewed', { content: 'x'.repeat(61) }],
+  ]) assert.throws(() => site.track(name, properties), TypeError);
+});
+test('a navigation click belongs to the departing page even when its handler changes route before bubbling', () => {
+  const win = browser(), site = tracker({ heatmaps: true });
+  const button = { tagName: 'BUTTON', closest: () => null, parentElement: null };
+  const event = { target: button, pageX: 250, pageY: 400, isTrusted: true };
+  win.document.dispatch('click', event, 'capture');
+  win.history.pushState({}, '', '/pricing');
+  win.document.dispatch('click', event, 'bubble');
+  assert.deepEqual(site._queue.map(value => value.type), ['page_view', 'heatmap', 'page_view']);
+  const heatmap = site._queue[1];
+  assert.equal(new URL(heatmap.url).pathname, '/');
+  assert.deepEqual(heatmap.heatmap.clicks, [{ x: 25, y: 20, selector: 'button:nth-of-type(1)', count: 1 }]);
+  assert.equal(site._clicks.size, 0, 'the old click must not be attached to the new page');
 });
 test('consent, GPC, DNT and reset avoid capture before consent or after withdrawal', () => {
   const win = browser(); const site = tracker({ consent: 'opt_in' });
@@ -359,4 +398,70 @@ test('long legitimate advertising IDs survive while recognizable credentials are
   const site = tracker();
   assert.equal(new URL(site._queue[0].url).searchParams.get('gclid'), clickId);
   assert.deepEqual(site.getAttribution().first.campaign, { utm_source: 'paid_search', gclid: clickId });
+});
+
+test('website transport suppresses automatic HTTP referrers in ordinary and outcome modes', async () => {
+  const win = browser(); win.location.origin = 'https://studio.example';
+  for (const outcomesOnly of [false, true]) {
+    let request;
+    const site = tracker({ outcomesOnly, fetch: async (_url, value) => { request = value; return ok(JSON.parse(value.body).events); } });
+    if (outcomesOnly) site.trackOutcome('signup_form_viewed');
+    await site.flush({ keepalive: true });
+    assert.equal(request.referrerPolicy, 'no-referrer');
+    assert.equal(request.credentials, 'omit');
+    assert.equal(request.keepalive, true);
+  }
+});
+
+test('explicit outcome-only mode never observes auth URLs, referrers, fields or navigation', async () => {
+  const win = browser({ href: 'https://studio.example/register?token=private&email=private' });
+  win.location = { origin: 'https://studio.example', get href() { throw Error('must not read auth address'); } };
+  Object.defineProperty(win.document, 'referrer', { get() { throw Error('must not read auth referrer'); } });
+  const push = win.history.pushState, replace = win.history.replaceState;
+  const site = tracker({ outcomesOnly: true });
+  assert.equal(site._queue.length, 0);
+  assert.equal(win.localStorage._map.size, 0);
+  assert.equal(win.history.pushState, push); assert.equal(win.history.replaceState, replace);
+  assert.equal(site.pageView(), false); assert.equal(site.getAttribution(), null);
+  assert.equal(site.trackOutcome('signup_form_viewed'), true);
+  assert.equal(site.trackOutcome('signup_failed', { code: 'network' }), true);
+  assert.equal(site.trackOutcome('checkout_failed', { plan: 'annual', code: 'billing_disabled' }), true);
+  for (const event of site._queue) {
+    assert.equal(event.type, 'custom'); assert.equal(event.url, 'https://studio.example');
+    assert.ok(['signup', 'checkout'].includes(event.context));
+    for (const key of ['referrer', 'attribution', 'pageViewId', 'engagement', 'heatmap']) assert.equal(Object.hasOwn(event, key), false);
+  }
+  assert.equal(new Set(site._queue.map(event => event.sessionId)).size, 1);
+  for (const name of ['click', 'scroll', 'keydown']) win.document.dispatch(name, { isTrusted: true });
+  assert.equal(site._queue.length, 3);
+  assert.throws(() => site.track('cta_docs_clicked'), TypeError);
+  assert.throws(() => site.trackOutcome('cta_docs_clicked'), TypeError);
+  assert.throws(() => site.trackOutcome('signup_failed', { code: 'private email' }), TypeError);
+  assert.throws(() => site.trackOutcome('signup_failed', { code: 'network', product: 'realityse' }), TypeError);
+  assert.throws(() => tracker({ outcomesOnly: true, heatmaps: true }), TypeError);
+  assert.throws(() => tracker({ outcomesOnly: 'true' }), TypeError);
+  win.document.visibilityState = 'hidden'; win.document.dispatch('visibilitychange');
+  await site.flush(); assert.equal(site._queue.length, 0);
+});
+
+test('outcomes honor opt-in, privacy signals, withdrawal and funding without capturing pages', async () => {
+  const win = browser(); win.location.origin = 'https://studio.example';
+  const site = tracker({ outcomesOnly: true, consent: 'opt_in' });
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  assert.equal(win.localStorage._map.size, 0);
+  site.grantConsent(); assert.equal(site._queue.length, 0);
+  win.navigator.globalPrivacyControl = true;
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  win.navigator.globalPrivacyControl = false; win.navigator.doNotTrack = '1';
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  win.navigator.doNotTrack = '0';
+  assert.equal(site.trackOutcome('signup_form_viewed'), true);
+  site._paused = true; site._pauseUntil = Date.now() + 60000;
+  assert.equal(site.trackOutcome('signup_failed', { code: 'network' }), false);
+  site.optOut(); assert.equal(site._queue.length, 0);
+  assert.equal(site.trackOutcome('signup_form_viewed'), false);
+  site.resume(); assert.equal(site._queue.length, 0);
+  const ordinary = tracker();
+  assert.throws(() => ordinary.trackOutcome('signup_form_viewed'), TypeError);
+  assert.throws(() => ordinary.track('signup_form_viewed'), TypeError);
 });
