@@ -382,13 +382,20 @@ export class SiteTracker {
     if (!keepalive && this._inFlight) return this._inFlight;
     if (!this._enabled() || !this._queue.length || !this._fetch || Date.now() < this._retryAt) return false;
     const activeExitIds = new Set([...this._exitRequests].flatMap(request => [...request.ids]));
-    const batch = this._queue.filter(event => !keepalive || !activeExitIds.has(event.eventId)).slice(0, 50);
+    const candidates = this._queue.filter(event => !keepalive || !activeExitIds.has(event.eventId));
+    const batch = candidates.slice(0, 50);
     if (!batch.length) return this._exitFlight || false;
     while (batch.length > 1 && JSON.stringify(batch).length > 400000) batch.pop();
     // Keepalive has a browser-wide 64 KB budget. Reduce without changing IDs.
     if (keepalive) {
       const available = Math.max(0, 45000 - [...this._exitRequests].reduce((total, request) => total + request.bytes, 0));
-      while (batch.length && utf8Length(JSON.stringify({ key: this.key, events: batch })) > available) batch.pop();
+      batch.length = 0;
+      // A large optional summary must not block a small conversion behind it.
+      // Leave anything that cannot fit queued for an ordinary foreground flush.
+      for (const event of candidates) {
+        if (batch.length >= 50) break;
+        if (utf8Length(JSON.stringify({ key: this.key, events: [...batch, event] })) <= available) batch.push(event);
+      }
       if (!batch.length) return false;
     }
     const exitRequest = keepalive ? { ids: new Set(batch.map(event => event.eventId)), bytes: utf8Length(JSON.stringify({ key: this.key, events: batch })) } : null;

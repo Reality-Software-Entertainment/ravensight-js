@@ -338,3 +338,16 @@ test('a new outcome after visibilityhide is sent on pagehide without waiting for
   complete[1](); await last; complete[0](); await first;
   assert.equal(site._queue.length, 0); assert.equal(site._exitRequests.size, 0);
 });
+
+
+test('an oversized optional summary cannot block a small accepted conversion during exit', async () => {
+  browser(); const requests = []; const site = tracker({ fetch: async (_url, request) => { requests.push(request); return ok(JSON.parse(request.body).events); } });
+  await site.flush(); requests.length = 0;
+  const selector = Array(6).fill('custom-long-element:nth-of-type(123)').join(' > ');
+  site._enqueue('heatmap', { heatmap: { viewport: 'large', clicks: Array.from({ length: 200 }, (_, x) => ({ x: x % 100, y: 2, selector, count: 1 })), scroll: Array(10).fill(1) } });
+  site.track('form_submit_success', { form: 'contact' });
+  await site.flush({ keepalive: true });
+  assert.equal(requests.length, 1); assert.ok(Buffer.byteLength(requests[0].body) <= 45000);
+  assert.deepEqual(JSON.parse(requests[0].body).events.map(event => event.name), ['form_submit_success']);
+  assert.equal(site._queue.length, 1); assert.equal(site._queue[0].type, 'heatmap');
+});
