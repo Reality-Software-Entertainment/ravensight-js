@@ -19,8 +19,12 @@
 * Website collection recovers from synchronous transport failures and bounds
   both the request and response-body read to ten seconds. Timed-out attempts
   keep their event IDs; late replies cannot change a later queue.
-* Local verification: all 270 SDK tests pass, including the existing game
-  tests. CommonJS is rebuilt. This version has not been published.
+* Add bounded custom properties, first/last campaign attribution, and optional
+  active engagement combined with heatmaps in one metered summary. Exit delivery
+  preserves conversion events and concurrent additions without duplicate charges.
+* A compact browser module uses the same tracker implementation. CommonJS and
+  browser-module parity, privacy, retries and existing game APIs are verified
+  together. This version has not been published.
 
 ## 0.8.0 - 2026-11-15
 
