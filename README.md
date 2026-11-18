@@ -1028,10 +1028,13 @@ The server must enable Player Reports and billing v2, configure private report
 storage and run the image-processing worker. Public ingest keys must explicitly
 allow `allow_reports`. Studio credentials never belong in the game. See the
 platform's held-release checklist before enabling this in production.
-# Website analytics (0.9.0)
+# Website analytics (0.9.1)
 
-Create a website in Company or a title's Website page, add its allowed origins,
-and copy its website key. Website mode is independent of the game client:
+Create your company website from Company Home, or a title's separate site in
+Game Website. Add the exact allowed origins (including www when used) and copy
+that website's key. A title has one website across its gameplay environments;
+its website key is separate from every gameplay ingest key. Website mode is
+independent of the game client:
 
 ```js
 import { createSiteTracker } from 'ravensight';
@@ -1089,3 +1092,25 @@ reload; the SDK sends no heartbeat or old events to probe capacity. Calling
 Each accepted page view, custom event, or combined engagement/heatmap summary consumes one
 event from the same account meter as gameplay and forms. The Website dashboard
 shows the last accepted event so you can verify installation.
+
+Heatmap collection requires `heatmaps: true`; it does not require an uploaded
+image. The website report discovers recorded pages and screen sizes and draws
+normalized click density with scroll-depth summaries. A reference image is
+optional context, not a screenshot taken from a visitor. Enable `engagement: true`
+when you also want active-time and engagement metrics. Navigation clicks are
+recorded before application route handlers.
+
+For an app with both public marketing and private gameplay, mount the website
+tracker only on the intended public routes and destroy it before entering private
+routes. Keep authenticated signup, purchase and gameplay outcomes in the existing
+game client. A public signup click is an intent, not a completed signup.
+
+With a scoped account MCP connection, discover the deployed tool schemas first.
+Website setup uses `create_site`, `update_site` and `get_site_installation`;
+`verify_site` checks received activity. `get_site_report` reads website reports,
+including `heatmap_pages` to discover recorded page/screen pairs and `heatmaps`
+for their click and scroll data. Website installation access requires write
+permission in the selected company or project. MCP calls use the programmatic
+meter separately from one-event website collection. See the current
+[website documentation](https://ravensight.io/docs/websites/) and
+[MCP documentation](https://ravensight.io/docs/mcp/) for deployed tools.

@@ -6,7 +6,12 @@ const trackers = [];
 const previousWindow = globalThis.window;
 function target(extra = {}) {
   const listeners = new Map();
-  return { ...extra, addEventListener(name, fn) { const rows = listeners.get(name) || []; rows.push(fn); listeners.set(name, rows); }, removeEventListener(name, fn) { listeners.set(name, (listeners.get(name) || []).filter(value => value !== fn)); }, dispatch(name, event = {}) { for (const fn of listeners.get(name) || []) fn(event); } };
+  const capture = options => options === true || options?.capture === true;
+  return { ...extra,
+    addEventListener(name, fn, options) { const rows = listeners.get(name) || []; rows.push({ fn, capture: capture(options) }); listeners.set(name, rows); },
+    removeEventListener(name, fn, options) { listeners.set(name, (listeners.get(name) || []).filter(value => value.fn !== fn || value.capture !== capture(options))); },
+    dispatch(name, event = {}, phase) { for (const listener of listeners.get(name) || []) if (!phase || listener.capture === (phase === 'capture')) listener.fn(event); }
+  };
 }
 function browser({ privateMode = false, navigator = {}, href = 'https://studio.example/?email=secret%40example.com&utm_source=newsletter' } = {}) {
   const document = target({ referrer: 'https://search.example/find?secret=1', visibilityState: 'visible', documentElement: { scrollWidth: 1000, scrollHeight: 2000 } });
@@ -27,6 +32,40 @@ test('site mode validates options and leaves game identity separate', () => {
   assert.equal(site._queue[0].referrer, 'https://search.example');
   assert.equal(site._queue[0].timestamp > 1000000000000, true);
   assert.throws(() => site.track('typed text'), TypeError); assert.throws(() => site.track('click', { email: 'private' }), TypeError);
+});
+test('public marketing events preserve bounded campaign and decision dimensions without accepting personal fields', () => {
+  browser(); const site = tracker();
+  const cases = [
+    ['ad_school_searched', { found: true }],
+    ['ad_school_picked', { classification: '6A', locked: false }],
+    ['ad_cta_clicked', { placement: 'job_card_subscribe', picked: true, locked: true }],
+    ['ad_landing_viewed', { source: 'direct', medium: 'cpc', campaign: 'launch-2026', content: 'coach_ad.2' }],
+  ];
+  for (const [name, properties] of cases) {
+    assert.equal(site.track(name, properties), true);
+    assert.deepEqual(site._queue.at(-1).properties, properties);
+  }
+  for (const [name, properties] of [
+    ['ad_school_searched', { query: 'private search' }],
+    ['ad_school_picked', { classification: '7A', locked: false }],
+    ['ad_cta_clicked', { placement: 'unregistered' }],
+    ['ad_landing_viewed', { campaign: 'person@example.test' }],
+    ['ad_landing_viewed', { source: 'phc_private' }],
+    ['ad_landing_viewed', { content: 'x'.repeat(61) }],
+  ]) assert.throws(() => site.track(name, properties), TypeError);
+});
+test('a navigation click belongs to the departing page even when its handler changes route before bubbling', () => {
+  const win = browser(), site = tracker({ heatmaps: true });
+  const button = { tagName: 'BUTTON', closest: () => null, parentElement: null };
+  const event = { target: button, pageX: 250, pageY: 400, isTrusted: true };
+  win.document.dispatch('click', event, 'capture');
+  win.history.pushState({}, '', '/pricing');
+  win.document.dispatch('click', event, 'bubble');
+  assert.deepEqual(site._queue.map(value => value.type), ['page_view', 'heatmap', 'page_view']);
+  const heatmap = site._queue[1];
+  assert.equal(new URL(heatmap.url).pathname, '/');
+  assert.deepEqual(heatmap.heatmap.clicks, [{ x: 25, y: 20, selector: 'button:nth-of-type(1)', count: 1 }]);
+  assert.equal(site._clicks.size, 0, 'the old click must not be attached to the new page');
 });
 test('consent, GPC, DNT and reset avoid capture before consent or after withdrawal', () => {
   const win = browser(); const site = tracker({ consent: 'opt_in' });

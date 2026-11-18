@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.1 - 2026-11-18
+
+* Record heatmap clicks before application navigation handlers, so a button that
+  changes routes or destroys the tracker retains its click on the originating page.
+* Preserve approved public marketing dimensions for school-search outcomes,
+  classifications, CTA placements and sanitized campaign tags. Free text, school
+  names, account details and arbitrary properties remain excluded. These new
+  dimensions require the matching server public-event catalog.
+
 ## 0.9.0 - 2026-11-18
 
 * Plain SDK feedback uses one shared event, with an optional stable submission
