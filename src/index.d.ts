@@ -464,8 +464,10 @@ export declare class Ravensight {
    */
   setCampaignLink(linkId: string): boolean;
   /**
-   * Links this device to the game's own account after sign-in. Pass an opaque internal id (a
-   * database key or a UUID), or a whole number used as its decimal digits. Only a salted hash
+   * Links this device to the game's own account after sign-in. Pass a random, high-entropy id
+   * (a random UUID or analytics id stored with the account), never a sequential database key:
+   * the salt reaches every client, so a guessable id can be matched. A whole number is used as
+   * its decimal digits. The hash is a pseudonymous identifier to declare in your privacy notice. Only a salted hash
    * leaves the device, once per session; the raw id is held in memory only until the session
    * answer gives the game's salt. A different account first does resetIdentity(). The request is
    * not awaited. Rejects with a TypeError whose code is not_text, empty, too_long (over 256 UTF-8

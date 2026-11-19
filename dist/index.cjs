@@ -3196,8 +3196,11 @@ class Ravensight {
   /**
    * Links this device to the game's own account once the player signs in, so
    * one person on two devices, or before and after sign-in, counts as one
-   * player. Pass an opaque internal id (a database key or a UUID), never an
-   * email, a name or a handle.
+   * player. Pass a random, high-entropy id (a random UUID or analytics id
+   * stored with the account), never a sequential database key, an email, a
+   * name or a handle: the salt reaches every client, so a guessable id can be
+   * matched. The hash is a pseudonymous identifier to declare in the game's
+   * privacy notice.
    *
    * Only `accountHash`, an HMAC-SHA256 of the id keyed with the game's
    * identify salt from the session answer, ever leaves the device or is
