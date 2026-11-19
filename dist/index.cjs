@@ -1638,8 +1638,10 @@ class Ravensight {
     this._identifySalt = undefined;
     /** Bumped whenever the identity is replaced or forgotten, so a late answer changes nothing. */
     this._identifyGeneration = 0;
-    /** The session token identify was last sent on: never sent twice on one session. */
-    this._identifySentOn = null;
+    /** Session tokens identify was sent on for the current identity: never twice on one session. */
+    this._identifySentOn = new Set();
+    /** Counts identify() calls, so the last of several un-awaited calls wins. */
+    this._identifyCalls = 0;
     /** A 404 or invalid_account_hash: no more tries this launch. */
     this._identifyStopped = false;
     this._identifyNoSessionRetried = false;
@@ -1700,6 +1702,8 @@ class Ravensight {
       errorsCaptured: 0,
       /** Automatic captures dropped on the device by the caps. */
       errorsCapped: 0,
+      /** identify(): requests sent and the last refused or failed answer, { code, status, at }. */
+      identify: { sent: 0, lastError: null },
     };
 
     // Automatic error capture. Installed at construction with a key and
@@ -3065,6 +3069,7 @@ class Ravensight {
     if (next) {
       this._writeIdentity();
       this._hashHeldAccount();
+      this._sendIdentify();
     }
     if (!next) {
       this._configGeneration += 1;
@@ -3134,6 +3139,8 @@ class Ravensight {
     if (id !== previousId) {
       this.deviceId = id;
       this._persistDeviceId(id);
+      // Back on a device whose open session was never identified.
+      this._sendIdentify();
     }
     return { previousId, queuedUnderPreviousId };
   }
@@ -3180,15 +3187,21 @@ class Ravensight {
   async identify(accountId) {
     if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
     const id = identifyAccountText(accountId);
+    const call = ++this._identifyCalls;
     // A different account than the one stored or held: a sign-out first.
-    if (!this._isSameAccount(id)) await this.resetIdentity();
+    if (!this._isSameAccount(id)) {
+      await this.resetIdentity();
+      // A later identify() ran meanwhile: the last call wins.
+      if (call !== this._identifyCalls) return;
+    }
     if (this._identifySalt === null) {
       this._log('identify is not offered by this server, nothing is sent this launch');
       return;
     }
     if (this._identifySalt === undefined || !this._identityAllowed) {
-      // No salt yet, or no key or consent: hold the id in memory only.
-      if (!this._identity) this._heldAccountId = id;
+      // No salt this launch yet, or no key or consent: hold the id in memory
+      // only, and hash it under whichever salt the session answer brings.
+      this._heldAccountId = id;
       return;
     }
     if (!this._identity) {
@@ -3197,7 +3210,13 @@ class Ravensight {
     }
     this._heldAccountId = null;
     if (this.sessionTokenFor(this.deviceId)) this._sendIdentify();
-    else if (this.initialized && this._canSend) this._ensureSession(this.deviceId).catch(noop);
+    else if (this.initialized && this._canSend && this._mayOpenSessionNow()) this._ensureSession(this.deviceId).catch(noop);
+  }
+
+  /** No backoff, no server Retry-After and no blocked send: a session may be opened now. */
+  _mayOpenSessionNow() {
+    const now = this._clock();
+    return !this._sendBlocked && now >= this._nextAttemptAt && now >= this._retryAfterUntil;
   }
 
   /**
@@ -3211,9 +3230,19 @@ class Ravensight {
    */
   async resetIdentity() {
     if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
-    if (!this._identity && this._heldAccountId == null) return;
+    if (!this._identity && this._heldAccountId == null && !this._hasIdentityOnDisk()) return;
     this._forgetIdentity();
     await this.resetDeviceId();
+  }
+
+  /** An identity saved by an earlier launch, read even before the opt-in yes (only to delete it). */
+  _hasIdentityOnDisk() {
+    if (!this._hasKey || this._playtestToken) return false;
+    try {
+      return Boolean(this._storage.getItem(IDENTITY_KEY));
+    } catch (_err) {
+      return false;
+    }
   }
 
   /** True while an account is stored or held by identify(). The account id itself is never readable. */
@@ -3235,11 +3264,16 @@ class Ravensight {
 
   _forgetIdentity() {
     this._identifyGeneration += 1;
-    this._identifySentOn = null;
+    this._identifySentOn.clear();
+    this._identifyNoSessionRetried = false;
     this._heldAccountId = null;
-    if (!this._identity) return;
     this._identity = null;
+    // Also an identity on disk this launch never loaded (before the opt-in
+    // yes). Never the player's storage in a playtest, never while inert.
+    if (!this._hasKey || this._playtestToken) return;
     try {
+      // Only when there is one: an opt-out with nothing saved writes nothing.
+      if (this._storage.getItem(IDENTITY_KEY) == null) return;
       if (typeof this._storage.removeItem === 'function') this._storage.removeItem(IDENTITY_KEY);
       else this._storage.setItem(IDENTITY_KEY, '');
     } catch (_err) {
@@ -3307,13 +3341,17 @@ class Ravensight {
    * Sends the identity on the current device's open session, once per
    * session. Never awaited by a caller, never queued, never throws.
    */
-  _sendIdentify() {
+  _sendIdentify(freshToken) {
     const identity = this._identity;
     if (!identity || identity.salt !== this._identifySalt || this._identifyStopped) return;
     if (!this._canSend || this._disposing) return;
-    const token = this.sessionTokenFor(this.deviceId);
-    if (!token || this._identifySentOn === token) return;
-    this._identifySentOn = token;
+    // A session that just opened is used as answered, whatever the device
+    // clock says about its expiry.
+    const token = freshToken || this.sessionTokenFor(this.deviceId);
+    if (!token || this._identifySentOn.has(token)) return;
+    this._identifySentOn.add(token);
+    if (this._identifySentOn.size > 256) this._identifySentOn.delete(this._identifySentOn.values().next().value);
+    this.stats.identify.sent += 1;
     const generation = this._identifyGeneration;
     const options = {
       headers: { 'X-API-Key': this.ingestKey, 'X-Session-Token': token },
@@ -3333,6 +3371,10 @@ class Ravensight {
 
   _identifyAnswered(res, generation) {
     const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
+    if (res.status !== 200) {
+      // Its own stat: never the delivery error in stats.lastError.
+      this.stats.identify.lastError = { code: this._failureCode(res, 'identify_failed'), status: res.status, at: this._clock() };
+    }
     // The server does not offer identify, or calls the hash malformed (a bug):
     // whatever identity is current, retrying this launch cannot help.
     if (res.status === 404) {
@@ -3363,7 +3405,7 @@ class Ravensight {
     // 409 session_taken or synthetic_session, 429 identify_limited, rate_limited
     // or needs_funds, 5xx, timeout, offline: the identity is kept and this
     // session is not tried again; the next session tries once more.
-    this._recordError(this._failureCode(res, 'identify_failed'), res.status);
+    this._identifyNoSessionRetried = false;
   }
 
   /**
@@ -3688,7 +3730,7 @@ class Ravensight {
       this._readErrorCapture(res.body);
       this._readIdentifySalt(res.body);
       // Never awaited: identify does not hold back the session or any event.
-      if (deviceId === this.deviceId) this._sendIdentify();
+      if (deviceId === this.deviceId) this._sendIdentify(token);
       await this.fetchConfig(deviceId);
       return token;
     }
