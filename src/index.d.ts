@@ -453,6 +453,22 @@ export declare class Ravensight {
   isSynthetic(deviceId?: string): boolean | null;
   /** Switches to a fresh random device id. Same semantics as setDeviceId. Resolves with the new id. */
   resetDeviceId(): Promise<string>;
+  /**
+   * Links this device to the game's own account after sign-in. Pass an opaque internal id (a
+   * database key or a UUID), or a whole number used as its decimal digits. Only a salted hash
+   * leaves the device, once per session; the raw id is held in memory only until the session
+   * answer gives the game's salt. A different account first does resetIdentity(). The request is
+   * not awaited. Rejects with a TypeError whose code is not_text, empty, too_long (over 256 UTF-8
+   * bytes) or looks_like_email (any @), and with a RavensightError code disposed after dispose().
+   */
+  identify(accountId: string | number | bigint): Promise<void>;
+  /**
+   * For sign-out: forgets the stored or held account and switches to a fresh device id as
+   * resetDeviceId() does. Sends nothing. Does nothing when no account is stored or held.
+   */
+  resetIdentity(): Promise<void>;
+  /** True while an account is stored or held by identify(). The account id is never readable. */
+  readonly isIdentified: boolean;
   dispose(options?: DisposeOptions): Promise<DisposeResult>;
 }
 

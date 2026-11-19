@@ -444,6 +444,39 @@ changes nothing.
 `resetDeviceId()` does the same with a fresh random id and resolves with it.
 Use it for a "reset analytics id" button.
 
+### Identify players who sign in
+
+If your game has its own login, call `identify` once the player signs in and
+`resetIdentity` when they sign out. One person on two devices, or before and
+after signing in, then counts as one player.
+
+```js
+await rs.identify(account.id);   // after your own sign-in
+await rs.resetIdentity();        // on sign-out
+```
+
+* **What is sent:** a salted hash of the id (`accountHash`, 64 hex
+  characters, keyed with your game's own salt from the session answer) and
+  the session token, once per session. The raw account id, an email or a
+  name is never sent and never stored; until the first session answer the
+  id is held in memory only.
+* **Pass an opaque internal id**, such as a database key or a UUID. Any value
+  containing `@` is refused, as are empty values and values over 256 bytes of
+  UTF-8. A refusal rejects with a `TypeError` whose `code` is `not_text`,
+  `empty`, `too_long` or `looks_like_email`, and changes nothing. A whole
+  number is used as its decimal digits.
+* **One event per identified session** on your usage balance. The same
+  account again in the same session sends nothing; a refused or failed
+  request is tried once more at the next session, never in a loop.
+* **A different account** on the same device first does `resetIdentity()`.
+  `resetIdentity()` forgets the stored hash and switches to a fresh device id
+  (as `resetDeviceId()` does), so the next player is not linked to the last
+  one. `resetDeviceId()` alone keeps the identity.
+* The hash is stored beside the device id under `ravensight_identity`. It
+  never enters the event queue and never delays an event. Without a key, or
+  before the opt-in yes, it is held in memory only; `setEnabled(false)`
+  deletes it. `rs.isIdentified` says whether an account is set.
+
 ### `rs.session(deviceId?)` and `rs.sessionTokenFor(deviceId?)`
 
 `session()` resolves with `{ token, expiresAt }` once the device (default: the
