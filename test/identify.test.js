@@ -634,3 +634,170 @@ test('identify and resetIdentity after dispose are refused as disposed', async (
   await assert.rejects(() => rs.identify('u1'), (err) => err.code === 'disposed');
   await assert.rejects(() => rs.resetIdentity(), (err) => err.code === 'disposed');
 });
+
+// --- Review fixes ------------------------------------------------------------
+
+test('F1: identify never opens a session through a server Retry-After or a blocked send', async (t) => {
+  const server = await saltedServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  server.state.batchOverrides.push({ status: 429, body: { error: 'rate_limited' }, headers: { 'Retry-After': '60' } });
+  rs.track('a');
+  await rs.flush();
+  const holdUntil = rs._retryAfterUntil;
+  assert.ok(holdUntil > Date.now(), 'a server wait holds');
+  await rs.resetDeviceId();
+  const sessionsBefore = server.requestsTo('/api/v1/session').length;
+  await rs.identify('u1');
+  await settle();
+  assert.equal(server.requestsTo('/api/v1/session').length, sessionsBefore, 'no session opened during the wait');
+  assert.equal(rs._retryAfterUntil, holdUntil, 'the server wait is kept');
+  assert.equal(server.state.identifies.length, 0);
+  await rs.dispose({ flush: false });
+
+  const blocked = makeClient(server);
+  await blocked.init();
+  server.state.batchOverrides.push({ status: 403, body: { error: 'forbidden' } });
+  blocked.track('a');
+  await blocked.flush();
+  assert.equal(blocked._sendBlocked, true);
+  await blocked.resetDeviceId();
+  const before = server.requestsTo('/api/v1/session').length;
+  await blocked.identify('u1');
+  await settle();
+  assert.equal(server.requestsTo('/api/v1/session').length, before, 'no session opened while sending is blocked');
+  await blocked.dispose({ flush: false });
+});
+
+test('F2: the same account before the salt is re-hashed under a new salt, never lost', async (t) => {
+  const d = VECTORS.salts_differ;
+  const server = await startMockServer({ identifySalt: d.salt_a });
+  t.after(() => server.close());
+  const storage = new MemoryStorage();
+  const first = makeClient(server, { storage });
+  await first.init();
+  await first.identify(d.accountId);
+  await waitFor(() => server.state.identifies.length === 1);
+  assert.equal(server.state.identifies[0].body.accountHash, d.wire_a);
+  await first.dispose();
+  server.state.identifySalt = d.salt_b;
+  const rs = makeClient(server, { storage });
+  await rs.identify(d.accountId);
+  await rs.init();
+  await waitFor(() => server.state.identifies.length === 2);
+  assert.equal(server.state.identifies[1].body.accountHash, d.wire_b, 'hashed under the new salt');
+  assert.deepEqual(stored(storage), { salt: d.salt_b, accountHash: d.wire_b });
+  assert.equal(rs.isIdentified, true);
+  await rs.dispose();
+});
+
+test('F3: a consent yes inside an open session sends the identity', async (t) => {
+  const server = await saltedServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  rs.setEnabled(false);
+  await rs.identify('u1');
+  assert.equal(server.state.identifies.length, 0);
+  rs.setEnabled(true);
+  await waitFor(() => server.state.identifies.length === 1);
+  assert.equal(server.state.identifies[0].body.accountHash, U1);
+  await rs.dispose();
+});
+
+test('F4: before the opt-in yes a decline or resetIdentity removes an identity on disk', async (t) => {
+  const server = await saltedServer();
+  t.after(() => server.close());
+  const saved = JSON.stringify({ salt: SALT, accountHash: U1 });
+
+  const declined = new MemoryStorage();
+  declined.setItem(IDENTITY_KEY, saved);
+  const a = makeClient(server, { storage: declined, consent: 'opt_in' });
+  a.setEnabled(false);
+  assert.equal(declined.getItem(IDENTITY_KEY), null, 'a decline deletes it');
+  await a.dispose();
+
+  const signedOut = new MemoryStorage();
+  signedOut.setItem(IDENTITY_KEY, saved);
+  signedOut.setItem('ravensight_device_id', 'dev_old');
+  const b = makeClient(server, { storage: signedOut, consent: 'opt_in' });
+  await b.resetIdentity();
+  assert.equal(signedOut.getItem(IDENTITY_KEY), null, 'a sign-out deletes it');
+  b.setEnabled(true);
+  await settle();
+  assert.notEqual(b.deviceId, 'dev_old', 'the device is rotated');
+  assert.equal(server.state.identifies.length, 0, 'the signed-out hash is never sent');
+  await b.dispose();
+});
+
+test('F5: switching back to a device whose open session was never identified identifies it', async (t) => {
+  const server = await saltedServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  const first = rs.deviceId;
+  const firstToken = rs.sessionToken;
+  await rs.resetDeviceId();
+  await rs.identify('u1');
+  await waitFor(() => server.state.identifies.length === 1);
+  const second = rs.deviceId;
+  await rs.setDeviceId(first);
+  await waitFor(() => server.state.identifies.length === 2);
+  assert.equal(server.state.identifies[1].token, firstToken);
+  await rs.setDeviceId(second);
+  await settle();
+  assert.equal(server.state.identifies.length, 2, 'a session already identified is not sent again');
+  await rs.dispose();
+});
+
+test('F6: of two identify calls before the salt, the last one wins', async (t) => {
+  const server = await saltedServer();
+  t.after(() => server.close());
+  const storage = new MemoryStorage();
+  storage.setItem(IDENTITY_KEY, JSON.stringify({ salt: SALT, accountHash: U1 }));
+  const rs = makeClient(server, { storage });
+  const a = rs.identify('u3');
+  const b = rs.identify('u2');
+  await Promise.all([a, b]);
+  await rs.init();
+  await waitFor(() => server.state.identifies.length === 1);
+  assert.equal(server.state.identifies[0].body.accountHash, SEQ[5].expect.stored.accountHash);
+  await rs.dispose();
+});
+
+test('F7: a session answer is identified even when the device clock runs days ahead', async (t) => {
+  const server = await saltedServer();
+  t.after(() => server.close());
+  const ahead = 3 * 86400 * 1000;
+  const rs = makeClient(server, { now: () => Date.now() + ahead });
+  await rs.identify('u1');
+  await rs.init();
+  await waitFor(() => server.state.identifies.length >= 1);
+  assert.equal(server.state.identifies[0].body.accountHash, U1);
+  await rs.dispose({ flush: false });
+});
+
+test('F8: no_session counts only in a row, and identify failures keep their own stat', async (t) => {
+  const noSession = { status: 400, body: { error: 'no_session' } };
+  const server = await saltedServer({ identifyOverrides: [noSession, { status: 503 }, noSession] });
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  await rs.identify('u1');
+  await waitFor(() => server.state.identifies.length === 1);
+  await settle();
+  await nextSession(server, rs);
+  await waitFor(() => server.state.identifies.length === 2);
+  await settle();
+  assert.equal(rs.stats.lastError, null, 'identify failures never overwrite the delivery error');
+  assert.equal(rs.stats.identify.lastError.status, 503);
+  await nextSession(server, rs);
+  await waitFor(() => server.state.identifies.length === 3);
+  await settle();
+  // A 503 came between the two no_session answers: not in a row, so one more try.
+  await nextSession(server, rs);
+  await waitFor(() => server.state.identifies.length === 4);
+  assert.equal(rs.stats.identify.lastError.code, 'no_session');
+  await rs.dispose();
+});
