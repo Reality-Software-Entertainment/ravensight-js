@@ -2079,6 +2079,94 @@ test('the session request names the SDK', async (t) => {
   await rs.dispose({ flush: false });
 });
 
+// --- Positions for Level heatmaps ---------------------------------------------
+
+test('trackAt sets rs_x and rs_y on a copy of data and calls track', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  const data = { level: 'cave_2', rs_kind: 'death' };
+  assert.equal(rs.trackAt('player_died', { x: 12.5, y: -3 }, data), true);
+  const e = lastEvent(rs);
+  assert.equal(e.event, 'player_died');
+  assert.deepEqual(e.data, { level: 'cave_2', rs_kind: 'death', rs_x: 12.5, rs_y: -3 });
+  assert.deepEqual(data, { level: 'cave_2', rs_kind: 'death' }, 'the caller object is not changed');
+  rs.trackAt('spawn', { x: 0, y: 0 });
+  assert.deepEqual(lastEvent(rs).data, { rs_x: 0, rs_y: 0 }, 'zero is a position; data is optional');
+  await rs.dispose({ flush: false });
+});
+
+test('trackAt: the reserved keys win over data', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  rs.trackAt('hit', { x: 4, y: 5 }, { rs_x: 99, rs_y: 98, hp: 3 });
+  assert.deepEqual(lastEvent(rs).data, { hp: 3, rs_x: 4, rs_y: 5 });
+  await rs.dispose({ flush: false });
+});
+
+test('trackAt sends the event without a position when a coordinate is not a finite number', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  const bad = [
+    undefined, null, 7, 'here', {}, { x: 1 }, { y: 1 },
+    { x: NaN, y: 1 }, { x: 1, y: Infinity }, { x: -Infinity, y: 0 },
+    { x: '1', y: '2' }, { x: 1n, y: 2 }, { x: null, y: 0 },
+  ];
+  for (const [i, position] of bad.entries()) {
+    assert.doesNotThrow(() => rs.trackAt('step', position, { level: 'a', rs_x: 1, rs_y: 2 }));
+    assert.deepEqual(lastEvent(rs).data, { level: 'a' }, 'no position for bad case ' + i);
+  }
+  const throwing = { get x() { throw new Error('boom'); }, y: 1 };
+  assert.doesNotThrow(() => rs.trackAt('step', throwing));
+  assert.deepEqual(lastEvent(rs).data, {});
+  assert.equal(rs.queue.length, bad.length + 1, 'every event is still queued');
+  await rs.dispose({ flush: false });
+});
+
+test('trackAt follows track: event name rules, deviceId option and opt out', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  assert.throws(() => rs.trackAt('', { x: 1, y: 2 }), TypeError);
+  assert.throws(() => rs.trackAt('x', { x: 1, y: 2 }, {}, { deviceId: '' }), TypeError);
+  rs.trackAt('x', { x: 1, y: 2 }, null, { deviceId: 'p1' });
+  assert.equal(lastEvent(rs).deviceId, 'p1');
+  assert.deepEqual(lastEvent(rs).data, { rs_x: 1, rs_y: 2 });
+  rs.setEnabled(false);
+  assert.equal(rs.trackAt('x', { x: 1, y: 2 }), false);
+  await rs.dispose({ flush: false });
+});
+
+test('debug: rs_x and rs_y are known keys, and a bad position warns once per event name', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const warnings = captureConsole(t, 'warn');
+  const rs = makeClient(server, { debug: true });
+  rs.trackAt('player_died', { x: 1, y: 2 }, { rs_kind: 'death' });
+  rs.track('moved', { rs_x: 3, rs_y: 4 });
+  assert.deepEqual(warnings, []);
+  rs.trackAt('player_died', { x: NaN, y: 2 });
+  rs.trackAt('player_died', null);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('player_died'));
+  assert.ok(warnings[0].includes('rs_x'));
+  rs.trackAt('fell', { x: 1 });
+  assert.equal(warnings.length, 2, 'a different event name warns once more');
+  await rs.dispose({ flush: false });
+});
+
+test('trackAt without debug never warns', async (t) => {
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const warnings = captureConsole(t, 'warn');
+  const rs = makeClient(server);
+  rs.trackAt('fell', { x: NaN, y: 0 });
+  assert.deepEqual(warnings, []);
+  await rs.dispose({ flush: false });
+});
+
 function withFrames(t) {
   const saved = [globalThis.requestAnimationFrame, globalThis.cancelAnimationFrame];
   const state = { cb: null, cancelled: 0 };

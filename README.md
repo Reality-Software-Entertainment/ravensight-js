@@ -342,6 +342,27 @@ in MB where the browser exposes it, and milliseconds from page start to the
 client's construction. If no sample was taken, nothing is sent. The frame hook
 itself never sends. It does nothing in Node.
 
+### Positions for Level heatmaps
+
+`rs.trackAt(event, { x, y }, data?, { deviceId }?)` is `rs.track()` with a
+position. It sends `x` and `y` as the reserved keys `rs_x` and `rs_y`, in your
+game's own world units, one top-down plane per level, with y growing downward.
+Put the level in `data` so the map knows which level the point belongs to.
+
+```js
+ravensight.trackAt('player_died', { x: player.x, y: player.y }, { level: 'cave_2', rs_kind: 'death' });
+```
+
+It is one ordinary event, sent and counted like any other: nothing extra is
+sent. `rs_x` and `rs_y` win over the same keys in `data`. If either coordinate
+is not a finite number (missing, `NaN`, `Infinity` or a string), the event is
+still sent, without `rs_x` and `rs_y`, and with `debug: true` the SDK warns
+once per event name. A bad position never throws; the event name and options
+follow `track()`. It returns what `track()` returns.
+
+Level heatmaps read `rs_x` and `rs_y` first, then plain `x` and `y`, so events
+you already send with `x` and `y` keep working.
+
 ### `await rs.flush()`
 
 Sends queued events now. Returns `{ sent, queued }`. Concurrent calls are safe.
@@ -1081,6 +1102,14 @@ GPC are honored. `getAttribution()` returns sanitized first/last landing and
 campaign snapshots for an explicitly separate authenticated acquisition handoff;
 it never exposes browser/account identity. Direct revisits do not overwrite the
 last campaign. The static browser module is available at `dist/site.js`.
+
+When a page loads, the tracker asks the collector for a short-lived page token
+(`GET /site/collect/token`) and attaches it to that page's page views once it
+has been held for the collector's minimum (one second). The token names the
+website and the time only, nothing about the visitor. The collector bills a
+page view only when it carries a token held long enough; a page view sent
+sooner is counted as bot traffic and not billed. A failed token request never
+blocks collection. Pass `pageToken: false` to turn this off.
 
 `site.optOut()` clears queued events and identity; `site.reset()` starts a new
 anonymous identity. Call `site.destroy()` when removing the tracker. Delivery

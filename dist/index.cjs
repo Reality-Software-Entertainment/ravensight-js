@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.10.0';
+const VERSION = '0.11.0';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -29,7 +29,7 @@ const RS_KINDS = Object.freeze([
 /** The reserved keys Ravensight reads. Any other `rs_` key is a typo or a clash. */
 // `rs_invalid` is deliberately absent: only the server writes it.
 const KNOWN_RS_KEYS = Object.freeze([
-  'rs_kind', 'rs_doctor', 'rs_event_id',
+  'rs_kind', 'rs_doctor', 'rs_event_id', 'rs_x', 'rs_y',
   'rs_status', 'rs_p1', 'rs_p2', 'rs_p3', 'rs_score',
   'rs_amount', 'rs_currency', 'rs_item_type', 'rs_item_id', 'rs_cart', 'rs_transaction_id',
   'rs_flow', 'rs_resource',
@@ -1702,6 +1702,8 @@ class Ravensight {
     this._invalidKeyWarned = false;
     /** event + key pairs already warned about in debug mode. */
     this._reservedWarned = new Set();
+    /** Event names already warned about for a trackAt position that is not two finite numbers. */
+    this._positionWarned = new Set();
     /** Set by a 403 playtest_job_closed. Permanent for this client. */
     this._playtestClosed = false;
 
@@ -1953,6 +1955,45 @@ class Ravensight {
 
     if (this.queue.length >= MAX_BATCH_SIZE) this._autoFlush();
     return true;
+  }
+
+  /**
+   * track() with a position for Level heatmaps. `position` is `{ x, y }` in the
+   * game's own world units, y growing downward; they are sent as the reserved
+   * keys rs_x and rs_y on a copy of `data`, and win over the same keys in it.
+   * When either coordinate is not a finite number the event is still sent,
+   * without rs_x and rs_y (debug mode warns once per event name). Returns what
+   * track returns; the event name and options follow track's rules.
+   */
+  trackAt(event, position, data, options) {
+    const props = data && typeof data === 'object' ? { ...data } : {};
+    let x;
+    let y;
+    try {
+      if (position && typeof position === 'object') {
+        x = position.x;
+        y = position.y;
+      }
+    } catch (_err) {
+      x = undefined;
+    }
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      props.rs_x = x;
+      props.rs_y = y;
+    } else {
+      delete props.rs_x;
+      delete props.rs_y;
+      if (this.debug && typeof event === 'string' && !this._positionWarned.has(event)) {
+        this._positionWarned.add(event);
+        if (typeof console !== 'undefined') {
+          console.warn(
+            '[ravensight] event "' + event + '": trackAt needs { x, y } as finite numbers; ' +
+              'sent without rs_x and rs_y (further bad positions for this event are not logged)',
+          );
+        }
+      }
+    }
+    return this.track(event, props, options);
   }
 
   // --- Typed events -------------------------------------------------------
@@ -4320,6 +4361,9 @@ class SiteTracker {
     this._autoPageviews = !this._outcomesOnly && options.autoPageviews !== false;
     this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null; this._exitFlight = null; this._exitRequests = new Set();
     this._paused = false; this._pauseUntil = 0; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
+    // On by default; `pageToken: false` turns it off (tests and custom transports).
+    this._pageTokens = options.pageToken !== false;
+    this._pageToken = { value: null, at: 0, minDelay: 1000, pending: null };
     this._lastLocation = null; this._page = null; this._clicks = new Map(); this._scroll = Array(10).fill(0);
     this._summaryCount = 0; this._summaryStart = Date.now(); this._pageActive = false;
     this._pageViewId = null; this._pageSessionId = null; this._activeMs = 0; this._engagementTick = Date.now(); this._lastActivity = Date.now();
@@ -4414,7 +4458,50 @@ class SiteTracker {
     const first = siteTouch(this._identity.attribution?.first), last = siteTouch(this._identity.attribution?.last);
     return first && last ? { first, last } : null;
   }
+  /**
+   * The signed page token that lets the server bill a page view: asked for
+   * when a page loads, reused for an hour, and held for the server's minimum
+   * before a page view carrying it is sent. It names the site and the time
+   * only. A failed request never blocks collection: page views then go
+   * without it.
+   */
+  _requestPageToken() {
+    const state = this._pageToken;
+    if (!this._pageTokens || this._outcomesOnly || !this._fetch || !this._enabled()) return Promise.resolve(null);
+    if (state.pending) return state.pending;
+    if (state.value && Date.now() - state.at < 3600000) return Promise.resolve(state.value);
+    // Called at once (not on a later tick) so the request starts while the page loads.
+    state.pending = (async () => {
+      const response = await this._fetch(`${this.apiUrl}/site/collect/token?key=${encodeURIComponent(this.key)}`, { method: 'GET', credentials: 'omit', referrerPolicy: 'no-referrer' });
+      const body = response?.ok ? await response.json().catch(() => null) : null;
+      if (typeof body?.token === 'string' && body.token.length <= 600 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(body.token)) {
+        state.value = body.token; state.at = Date.now();
+        state.minDelay = Number.isInteger(body.minDelayMs) && body.minDelayMs >= 0 ? Math.min(body.minDelayMs, 5000) : 1000;
+      }
+      return state.value;
+    })().catch(() => state.value).finally(() => { state.pending = null; });
+    return state.pending;
+  }
+  /** A promise only when there is a page view to stamp, so a send with nothing to do is not delayed. */
+  _attachPageToken(batch, keepalive) {
+    if (!this._pageTokens || this._outcomesOnly) return null;
+    const views = batch.filter(event => event.type === 'page_view' && !event.pageToken);
+    if (!views.length || (keepalive && !this._pageToken.value)) return null;
+    return this._stampPageViews(views, keepalive);
+  }
+  async _stampPageViews(views, keepalive) {
+    const state = this._pageToken;
+    // Never hold collection hostage to the token: wait for it at most two seconds.
+    const token = keepalive ? state.value : await Promise.race([this._requestPageToken(), new Promise(resolve => { const timer = setTimeout(() => resolve(null), 2000); timer?.unref?.(); })]);
+    if (!token) return;
+    const wait = state.at + state.minDelay + 50 - Date.now();
+    // A closing page cannot wait: send without the token rather than one held too briefly.
+    if (wait > 0 && keepalive) return;
+    if (wait > 0) await new Promise(resolve => { const timer = setTimeout(resolve, wait); timer?.unref?.(); });
+    for (const event of views) event.pageToken = token;
+  }
   _enqueue(type, extra = {}, address = this._page) {
+    if (type === 'page_view') this._requestPageToken();
     if (!this._enabled() || !address) return false;
     const summary = type === 'engagement' || type === 'heatmap';
     const identity = summary && this._identity ? this._identity : this._session();
@@ -4576,6 +4663,8 @@ class SiteTracker {
         // Consent/reset may change before this scheduled transport starts.
         // A destroy keepalive still owns its queued batch and may finish.
         if (!this._allowed || this._privacyBlocked() || !batch.some(event => this._queue.includes(event))) return false;
+        const stamping = this._attachPageToken(batch, keepalive);
+        if (stamping) await stamping;
         const timeout = new Promise((_, reject) => {
           timer = setTimeout(() => { controller?.abort(); reject(new Error('Website collection timed out.')); }, 10000);
           timer?.unref?.();

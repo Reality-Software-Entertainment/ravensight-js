@@ -214,6 +214,12 @@ export interface TrackOptions {
   deviceId?: string;
 }
 
+/** A point in the game's own world units for trackAt(): one top-down plane per level, y growing downward. */
+export interface Position {
+  x: number;
+  y: number;
+}
+
 export interface SetDeviceIdResult {
   previousId: string | null;
   /** Events still queued under the previous id. They drain under its own session. */
@@ -379,6 +385,16 @@ export declare class Ravensight {
    * is given and is not a non-empty string.
    */
   track(event: string, data?: Record<string, unknown>, options?: TrackOptions): boolean;
+  /**
+   * track() with a position for Level heatmaps. `position` is in the game's own world units, one
+   * top-down plane per level, y growing downward. It is sent as the reserved keys `rs_x` and `rs_y`
+   * on a copy of `data`, which win over the same keys in `data`. When either coordinate is not a
+   * finite number the event is still sent, without `rs_x` and `rs_y`, and debug mode warns once per
+   * event name. Never throws for a bad position; the event name and options follow track().
+   *
+   * @example ravensight.trackAt('player_died', { x: player.x, y: player.y }, { level: 'cave_2', rs_kind: 'death' });
+   */
+  trackAt(event: string, position: Position | null | undefined, data?: Record<string, unknown> | null, options?: TrackOptions): boolean;
   /** Typed event helpers over track(). Default event name `purchase`. Never throws on bad input; the server flags it. */
   trackPurchase(options: PurchaseOptions, trackOptions?: TrackOptions): boolean;
   /** Default event name `resource_source` or `resource_sink` by flow. */
@@ -474,6 +490,8 @@ export interface SiteTrackerOptions {
   /** Explicit registered signup/checkout outcomes only. No page, DOM or attribution capture. */
   outcomesOnly?: boolean;
   excludedPaths?: string[];
+  /** Ask the collector for a signed page token when a page loads and attach it to page views (default true). The server bills a page view only when its token was held at least a second. */
+  pageToken?: boolean;
   storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
   fetch?: typeof fetch;
 }

@@ -21,7 +21,7 @@ function browser({ privateMode = false, navigator = {}, href = 'https://studio.e
   globalThis.window = win; return win;
 }
 const ok = events => ({ ok: true, status: 200, json: async () => ({ accepted: events.length, duplicates: 0, dropped: 0, refused: 0, acceptedIds: events.map(event => event.eventId), droppedIds: [], refusedIds: [], paused: false }) });
-function tracker(options = {}) { const value = createSiteTracker({ key, fetch: async (_url, request) => ok(JSON.parse(request.body).events), ...options }); trackers.push(value); return value; }
+function tracker(options = {}) { const value = createSiteTracker({ key, fetch: async (_url, request) => ok(JSON.parse(request.body).events), pageToken: false, ...options }); trackers.push(value); return value; }
 afterEach(() => { for (const tracker of trackers.splice(0)) { tracker.optOut(); tracker.destroy(); tracker.grantConsent(); } globalThis.window = previousWindow; });
 
 test('site mode validates options and leaves game identity separate', () => {
@@ -464,4 +464,36 @@ test('outcomes honor opt-in, privacy signals, withdrawal and funding without cap
   const ordinary = tracker();
   assert.throws(() => ordinary.trackOutcome('signup_form_viewed'), TypeError);
   assert.throws(() => ordinary.track('signup_form_viewed'), TypeError);
+});
+
+test('page views carry a signed page token fetched at page load and held at least the server minimum before sending', async () => {
+  browser();
+  const calls = [];
+  const fetch = async (url, request) => {
+    calls.push({ url, request });
+    if (String(url).includes('/site/collect/token')) return { ok: true, status: 200, json: async () => ({ token: 'eyJ2IjoxfQ.c2lnbmF0dXJl', minDelayMs: 50 }) };
+    return ok(JSON.parse(request.body).events);
+  };
+  const site = tracker({ fetch, pageToken: true });
+  const tokenCall = calls.find(call => String(call.url).includes('/site/collect/token'));
+  assert.ok(tokenCall, 'a token is requested when the page loads');
+  assert.equal(tokenCall.request.method, 'GET'); assert.equal(tokenCall.request.credentials, 'omit');
+  assert.ok(String(tokenCall.url).includes(`key=${key}`));
+  const started = Date.now();
+  await site.flush();
+  const sent = calls.filter(call => String(call.url).endsWith('/site/collect'));
+  assert.equal(sent.length, 1);
+  const views = JSON.parse(sent[0].request.body).events.filter(event => event.type === 'page_view');
+  assert.ok(views.length >= 1);
+  assert.ok(views.every(event => event.pageToken === 'eyJ2IjoxfQ.c2lnbmF0dXJl'));
+  assert.ok(Date.now() - started >= 40, 'waits until the token has been held for the minimum time');
+  // Only page views carry it.
+  site.track('cta_clicked'); await site.flush();
+  const custom = JSON.parse(calls.filter(call => String(call.url).endsWith('/site/collect')).at(-1).request.body).events.find(event => event.type === 'custom');
+  assert.equal(custom.pageToken, undefined);
+});
+test('a failed token request never blocks collection', async () => {
+  browser();
+  const site = tracker({ pageToken: true, fetch: async (url, request) => String(url).includes('/site/collect/token') ? { ok: false, status: 503, json: async () => ({}) } : ok(JSON.parse(request.body).events) });
+  assert.equal(await site.flush(), true);
 });
