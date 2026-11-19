@@ -50,6 +50,8 @@
     "build": "node scripts/build-cjs.mjs",
     "pretest": "node scripts/build-cjs.mjs",
     "test": "node --test \"test/**/*.test.js\"",
-    "prepack": "node scripts/build-cjs.mjs"
+    "prepack": "node scripts/build-cjs.mjs",
+    "hooks:install": "git config core.hooksPath .githooks",
+    "prepare": "node -e \"try{require('child_process').execFileSync('git',['config','core.hooksPath','.githooks'],{stdio:'ignore'})}catch(e){}\""
   }
 }
