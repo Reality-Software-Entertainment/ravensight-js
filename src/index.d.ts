@@ -490,6 +490,8 @@ export interface SiteTrackerOptions {
   /** Explicit registered signup/checkout outcomes only. No page, DOM or attribution capture. */
   outcomesOnly?: boolean;
   excludedPaths?: string[];
+  /** Ask the collector for a signed page token when a page loads and attach it to page views (default true). The server bills a page view only when its token was held at least a second. */
+  pageToken?: boolean;
   storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
   fetch?: typeof fetch;
 }

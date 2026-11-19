@@ -1103,6 +1103,14 @@ campaign snapshots for an explicitly separate authenticated acquisition handoff;
 it never exposes browser/account identity. Direct revisits do not overwrite the
 last campaign. The static browser module is available at `dist/site.js`.
 
+When a page loads, the tracker asks the collector for a short-lived page token
+(`GET /site/collect/token`) and attaches it to that page's page views once it
+has been held for the collector's minimum (one second). The token names the
+website and the time only, nothing about the visitor. The collector bills a
+page view only when it carries a token held long enough; a page view sent
+sooner is counted as bot traffic and not billed. A failed token request never
+blocks collection. Pass `pageToken: false` to turn this off.
+
 `site.optOut()` clears queued events and identity; `site.reset()` starts a new
 anonymous identity. Call `site.destroy()` when removing the tracker. Delivery
 retries preserve event IDs and acknowledge partial batches. A funding pause

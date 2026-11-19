@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.11.0 - 2026-11-18
+## 0.11.0 - 2026-11-19
 
 * Add `trackAt(event, { x, y }, data?, options?)` for Level heatmaps. It sends
   the position as the reserved keys `rs_x` and `rs_y` (world units, y growing
@@ -8,8 +8,13 @@
   `track()`. A coordinate that is not a finite number sends the event without
   a position and never throws; debug mode warns once per event name.
 * `rs_x` and `rs_y` are known reserved keys, so debug mode no longer warns about
-  them on `track()`.
-* The website tracker is unchanged: it has no world positions.
+  them on `track()`. `trackAt` is on the game client only: the website tracker
+  has no world positions.
+* Website page views carry a signed page token from the collector, held for the
+  collector's minimum before sending, so the server can bill only page views a
+  person could have made. A failed token request never blocks collection, and a
+  page closing before the minimum sends without it. `pageToken: false` turns it
+  off. Needs the matching server endpoint (`GET /site/collect/token`).
 
 ## 0.10.0 - 2026-11-18
 
