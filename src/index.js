@@ -3731,7 +3731,8 @@ export class Ravensight {
     const res = await this._request('POST', '/session', { headers, body });
 
     if (res.status === 201 && res.body && res.body.token) {
-      if (campaignLink) this._campaignLink = null;
+      // Only the link this request carried: one set while it was in flight goes next.
+      if (campaignLink && this._campaignLink === campaignLink) this._campaignLink = null;
       const token = String(res.body.token);
       if (this._disposed) {
         // dispose() finished while this was in flight. Do not store it.

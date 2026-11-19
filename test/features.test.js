@@ -362,6 +362,33 @@ test('setCampaignLink: a valid id goes lowercased with the next session, once, a
   await rs.dispose();
 });
 
+test('setCampaignLink while the first session is in flight: its answer clears only the link it carried', async (t) => {
+  withPage(t, { search: `?rs_link=${LINK_ID}` });
+  const OTHER = '64b0000000000000000000b2';
+  const bodies = [];
+  let release;
+  const fetchStub = async (url, init) => {
+    const path = new URL(url).pathname;
+    const reply = (status, body) => ({ status, headers: new Headers(), text: async () => JSON.stringify(body) });
+    if (path.endsWith('/session')) {
+      bodies.push(JSON.parse(init.body));
+      if (bodies.length === 1) await new Promise((resolve) => { release = resolve; });
+      return reply(201, { token: 'tok' + bodies.length, expiresIn: 3600 });
+    }
+    if (path.endsWith('/settings')) return reply(200, { trackingEnabled: true });
+    return reply(200, {});
+  };
+  const rs = client({ deviceId: undefined, fetch: fetchStub, autoEvents: false });
+  const first = rs._ensureSession();
+  while (!release) await new Promise((resolve) => setTimeout(resolve, 1));
+  assert.equal(rs.setCampaignLink(OTHER), true);
+  release();
+  await first;
+  await rs._createSession(rs.deviceId, rs._sessionEntry(rs.deviceId));
+  assert.deepEqual(bodies.map((body) => body.campaignLink), [LINK_ID, OTHER]);
+  rs.dispose({ flush: false });
+});
+
 test('setCampaignLink refuses what is not a link id, returns false, and keeps an earlier link', async (t) => {
   withPage(t, { search: `?rs_link=${LINK_ID}` });
   const server = await startMockServer();
