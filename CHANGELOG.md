@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0 - 2026-11-18
+
+* Add `trackAt(event, { x, y }, data?, options?)` for Level heatmaps. It sends
+  the position as the reserved keys `rs_x` and `rs_y` (world units, y growing
+  downward), which win over the same keys in `data`, and otherwise behaves as
+  `track()`. A coordinate that is not a finite number sends the event without
+  a position and never throws; debug mode warns once per event name.
+* `rs_x` and `rs_y` are known reserved keys, so debug mode no longer warns about
+  them on `track()`.
+* The website tracker is unchanged: it has no world positions.
+
 ## 0.10.0 - 2026-11-18
 
 * Add explicit outcome-only tracking for registered signup and checkout events.
