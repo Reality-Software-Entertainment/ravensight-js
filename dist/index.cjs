@@ -2815,7 +2815,7 @@ class Ravensight {
     const bad = message => { throw new RavensightError(message, 'invalid_report'); };
     const payload = { clientId: input.clientId || randomId(), capturedAt: input.capturedAt ?? Math.floor(Date.now() / 1000),
       category: input.category || 'other', source: input.source || 'player', context: { ...(input.context || {}) } };
-    if (!/^[a-zA-Z0-9_-]{8,80}$/.test(payload.clientId)) bad('Use a stable report clientId of 8–80 letters, digits, underscores or hyphens.');
+    if (!/^[a-zA-Z0-9_-]{8,80}$/.test(payload.clientId)) bad('Use a stable report clientId of 8 to 80 letters, digits, underscores or hyphens.');
     if (!FEEDBACK_CATEGORIES.includes(payload.category)) bad('Unknown report category.');
     if (!['player', 'tester'].includes(payload.source)) bad('Report source must be player or tester.');
     if (!Number.isSafeInteger(payload.capturedAt) || payload.capturedAt < Date.now() / 1000 - 86400 || payload.capturedAt > Date.now() / 1000 + 60) bad('Capture time must be within the last day.');
