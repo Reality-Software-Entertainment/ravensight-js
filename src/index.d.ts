@@ -291,6 +291,8 @@ export interface RavensightStats {
   errorsCaptured: number;
   /** Automatic captures dropped on the device by the caps. */
   errorsCapped: number;
+  /** identify(): requests sent and the last refused or failed answer. Never written to lastError. */
+  identify: { sent: number; lastError: RavensightLastError | null };
 }
 
 export declare class RavensightError extends Error {

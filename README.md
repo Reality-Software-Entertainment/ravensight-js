@@ -466,8 +466,15 @@ await rs.resetIdentity();        // on sign-out
   `empty`, `too_long` or `looks_like_email`, and changes nothing. A whole
   number is used as its decimal digits.
 * **One event per identified session** on your usage balance. The same
-  account again in the same session sends nothing; a refused or failed
-  request is tried once more at the next session, never in a loop.
+  account again in the same session sends nothing. A busy, refused or
+  failed request (409, 429, a server error or no connection) is tried once
+  more at the next session, never in a loop. An answer that the server does
+  not offer identify (404), or that the hash is malformed, stops identify
+  for the rest of the launch. `rs.stats.identify` counts requests sent and
+  keeps the last failed answer.
+* **It rejects on bad input**, like `setDeviceId`: await it or catch it,
+  especially in server code, where an unhandled rejection can stop the
+  process.
 * **A different account** on the same device first does `resetIdentity()`.
   `resetIdentity()` forgets the stored hash and switches to a fresh device id
   (as `resetDeviceId()` does), so the next player is not linked to the last
