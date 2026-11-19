@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.0 - unreleased
+
+* Website page views carry a signed page token from the collector, held for the
+  collector's minimum before sending, so the server can bill only page views a
+  person could have made. A failed token request never blocks collection, and a
+  page closing before the minimum sends without it. `pageToken: false` turns it
+  off. Needs the matching server endpoint (`GET /site/collect/token`).
+
 ## 0.10.0 - 2026-11-18
 
 * Add explicit outcome-only tracking for registered signup and checkout events.
