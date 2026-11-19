@@ -29,7 +29,7 @@ const RS_KINDS = Object.freeze([
 /** The reserved keys Ravensight reads. Any other `rs_` key is a typo or a clash. */
 // `rs_invalid` is deliberately absent: only the server writes it.
 const KNOWN_RS_KEYS = Object.freeze([
-  'rs_kind', 'rs_doctor', 'rs_event_id',
+  'rs_kind', 'rs_doctor', 'rs_event_id', 'rs_x', 'rs_y',
   'rs_status', 'rs_p1', 'rs_p2', 'rs_p3', 'rs_score',
   'rs_amount', 'rs_currency', 'rs_item_type', 'rs_item_id', 'rs_cart', 'rs_transaction_id',
   'rs_flow', 'rs_resource',
@@ -1702,6 +1702,8 @@ class Ravensight {
     this._invalidKeyWarned = false;
     /** event + key pairs already warned about in debug mode. */
     this._reservedWarned = new Set();
+    /** Event names already warned about for a trackAt position that is not two finite numbers. */
+    this._positionWarned = new Set();
     /** Set by a 403 playtest_job_closed. Permanent for this client. */
     this._playtestClosed = false;
 
@@ -1953,6 +1955,45 @@ class Ravensight {
 
     if (this.queue.length >= MAX_BATCH_SIZE) this._autoFlush();
     return true;
+  }
+
+  /**
+   * track() with a position for Level heatmaps. `position` is `{ x, y }` in the
+   * game's own world units, y growing downward; they are sent as the reserved
+   * keys rs_x and rs_y on a copy of `data`, and win over the same keys in it.
+   * When either coordinate is not a finite number the event is still sent,
+   * without rs_x and rs_y (debug mode warns once per event name). Returns what
+   * track returns; the event name and options follow track's rules.
+   */
+  trackAt(event, position, data, options) {
+    const props = data && typeof data === 'object' ? { ...data } : {};
+    let x;
+    let y;
+    try {
+      if (position && typeof position === 'object') {
+        x = position.x;
+        y = position.y;
+      }
+    } catch (_err) {
+      x = undefined;
+    }
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      props.rs_x = x;
+      props.rs_y = y;
+    } else {
+      delete props.rs_x;
+      delete props.rs_y;
+      if (this.debug && typeof event === 'string' && !this._positionWarned.has(event)) {
+        this._positionWarned.add(event);
+        if (typeof console !== 'undefined') {
+          console.warn(
+            '[ravensight] event "' + event + '": trackAt needs { x, y } as finite numbers; ' +
+              'sent without rs_x and rs_y (further bad positions for this event are not logged)',
+          );
+        }
+      }
+    }
+    return this.track(event, props, options);
   }
 
   // --- Typed events -------------------------------------------------------
