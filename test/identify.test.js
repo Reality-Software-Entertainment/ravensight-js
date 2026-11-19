@@ -11,7 +11,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const VECTORS = JSON.parse(readFileSync(join(HERE, 'fixtures', 'identify-vectors.json'), 'utf8'));
 const SALT = VECTORS.salt;
 const SEQ = VECTORS.sequence;
-const U1 = SEQ[1].expect.stored;
+const U1 = SEQ[1].expect.stored.accountHash;
 const INGEST_KEY = 'gt_live_test_key';
 const IDENTITY_KEY = 'ravensight_identity';
 

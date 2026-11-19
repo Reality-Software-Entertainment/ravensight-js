@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -462,6 +462,36 @@ function campaignLinkFrom(search) {
 
 /** Written only with consent 'opt_in', once the player has said yes. */
 const OPTIN_KEY = 'ravensight_optin';
+/** identify(): { salt, accountHash } as JSON, never the account id. */
+const IDENTITY_KEY = 'ravensight_identity';
+const IDENTIFY_MAX_BYTES = 256;
+const IDENTIFY_TIMEOUT_MS = 10000;
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/**
+ * The account id identify() hashes, exactly as given: text, or a whole
+ * number as its decimal digits. Throws a TypeError whose `code` is the
+ * contract's reason.
+ */
+function identifyAccountText(value) {
+  let text;
+  if (typeof value === 'string') text = value;
+  else if (typeof value === 'number' && Number.isSafeInteger(value)) text = String(value);
+  else if (typeof value === 'bigint') text = value.toString(10);
+  else throw identifyRefusal('not_text', 'must be text or a whole number');
+  if (text === '') throw identifyRefusal('empty', 'must not be empty');
+  if (utf8Length(text) > IDENTIFY_MAX_BYTES) {
+    throw identifyRefusal('too_long', 'must be at most ' + IDENTIFY_MAX_BYTES + ' bytes of UTF-8');
+  }
+  if (text.includes('@')) throw identifyRefusal('looks_like_email', 'must not contain @ (pass an internal id, never an email)');
+  return text;
+}
+
+function identifyRefusal(code, message) {
+  const err = new TypeError('Ravensight: `accountId` ' + message);
+  err.code = code;
+  return err;
+}
 const CONSENT_MODES = Object.freeze(['opt_out', 'opt_in']);
 const MAX_DISTRIBUTION_LENGTH = 40;
 
@@ -1598,6 +1628,23 @@ class Ravensight {
     }
     /** Set by setDeviceId before the opt-in yes: stored once the player agrees. */
     this._deviceIdUnsaved = false;
+
+    // identify(): the game's own account, sent only as a salted hash.
+    /** { salt, accountHash } once hashed; stored under `ravensight_identity` when allowed. */
+    this._identity = null;
+    /** A valid account id waiting for the salt or the player's yes. Memory only, never stored. */
+    this._heldAccountId = null;
+    /** The game's identify salt: undefined until a session answer, null when the answer had none. */
+    this._identifySalt = undefined;
+    /** Bumped whenever the identity is replaced or forgotten, so a late answer changes nothing. */
+    this._identifyGeneration = 0;
+    /** The session token identify was last sent on: never sent twice on one session. */
+    this._identifySentOn = null;
+    /** A 404 or invalid_account_hash: no more tries this launch. */
+    this._identifyStopped = false;
+    this._identifyNoSessionRetried = false;
+    this._identifyBugWarned = false;
+    if (this._hasKey && this._consented && !this._playtestToken) this._identity = this._readIdentity();
 
     if (opts.deviceId) this.deviceId = String(opts.deviceId);
     else if (!this._hasKey || !this._consented) this.deviceId = null;
@@ -2994,6 +3041,8 @@ class Ravensight {
    */
   setEnabled(value) {
     const next = Boolean(value);
+    // Opting out, or withdrawing consent, forgets the signed-in account.
+    if (!next) this._forgetIdentity();
     if (this._hasKey && this.consent === 'opt_in' && !this._playtestToken) {
       if (next && !this._consented) {
         this._consented = true;
@@ -3001,6 +3050,7 @@ class Ravensight {
         if (this.deviceId == null) this.deviceId = this._loadOrCreateDeviceId();
         else if (this._deviceIdUnsaved) this._persistDeviceId(this.deviceId);
         this._deviceIdUnsaved = false;
+        if (!this._identity && this._heldAccountId == null) this._identity = this._readIdentity();
         this._openQueue();
       } else if (!next && this._consented) {
         this._consented = false;
@@ -3012,6 +3062,10 @@ class Ravensight {
       return;
     }
     this.enabled = next;
+    if (next) {
+      this._writeIdentity();
+      this._hashHeldAccount();
+    }
     if (!next) {
       this._configGeneration += 1;
       this._configs.clear();
@@ -3100,6 +3154,216 @@ class Ravensight {
     this._unconfirmed = this._unconfirmed.filter((item) => !item.auto);
     if (this._queueStore) this._persistNow();
     return next;
+  }
+
+  /**
+   * Links this device to the game's own account once the player signs in, so
+   * one person on two devices, or before and after sign-in, counts as one
+   * player. Pass an opaque internal id (a database key or a UUID), never an
+   * email, a name or a handle.
+   *
+   * Only `accountHash`, an HMAC-SHA256 of the id keyed with the game's
+   * identify salt from the session answer, ever leaves the device or is
+   * stored, beside the device id under `ravensight_identity`. The raw id is
+   * held in memory only until that salt is known. Sent once per session with
+   * the session token (one event on the usage meter per identified session);
+   * the same account again sends nothing. A different account first does
+   * resetIdentity(). It never enters the event queue or delays an event.
+   * Inert without a key and held in memory before the opt-in yes.
+   *
+   * @param {string|number} accountId text, or a whole number used as its decimal digits.
+   * @returns {Promise<void>} once the identity is set; the request is not awaited.
+   * @throws {TypeError} with `code` `not_text`, `empty`, `too_long` (over 256
+   *   UTF-8 bytes) or `looks_like_email` (any `@`). Nothing changes.
+   * @throws {RavensightError} code `disposed` after dispose().
+   */
+  async identify(accountId) {
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+    const id = identifyAccountText(accountId);
+    // A different account than the one stored or held: a sign-out first.
+    if (!this._isSameAccount(id)) await this.resetIdentity();
+    if (this._identifySalt === null) {
+      this._log('identify is not offered by this server, nothing is sent this launch');
+      return;
+    }
+    if (this._identifySalt === undefined || !this._identityAllowed) {
+      // No salt yet, or no key or consent: hold the id in memory only.
+      if (!this._identity) this._heldAccountId = id;
+      return;
+    }
+    if (!this._identity) {
+      this._identity = { salt: this._identifySalt, accountHash: hmacSha256Hex(this._identifySalt, id) };
+      this._writeIdentity();
+    }
+    this._heldAccountId = null;
+    if (this.sessionTokenFor(this.deviceId)) this._sendIdentify();
+    else if (this.initialized && this._canSend) this._ensureSession(this.deviceId).catch(noop);
+  }
+
+  /**
+   * For sign-out: forgets the stored or held account and switches to a fresh
+   * device id exactly as resetDeviceId() does, so the next session is not
+   * linked to the previous account. Sends nothing. With no account stored or
+   * held it does nothing and keeps the device id.
+   *
+   * @returns {Promise<void>}
+   * @throws {RavensightError} code `disposed` after dispose().
+   */
+  async resetIdentity() {
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+    if (!this._identity && this._heldAccountId == null) return;
+    this._forgetIdentity();
+    await this.resetDeviceId();
+  }
+
+  /** True while an account is stored or held by identify(). The account id itself is never readable. */
+  get isIdentified() {
+    return Boolean(this._identity) || this._heldAccountId != null;
+  }
+
+  /** Whether identify may hash and store now: a key, consent, not opted out, not a playtest. */
+  get _identityAllowed() {
+    return this._hasKey && this._consented && this.enabled && !this._playtestToken;
+  }
+
+  /** True when `id` is the account already stored or held, or when none is. */
+  _isSameAccount(id) {
+    if (this._heldAccountId != null) return this._heldAccountId === id;
+    if (this._identity) return hmacSha256Hex(this._identity.salt, id) === this._identity.accountHash;
+    return true;
+  }
+
+  _forgetIdentity() {
+    this._identifyGeneration += 1;
+    this._identifySentOn = null;
+    this._heldAccountId = null;
+    if (!this._identity) return;
+    this._identity = null;
+    try {
+      if (typeof this._storage.removeItem === 'function') this._storage.removeItem(IDENTITY_KEY);
+      else this._storage.setItem(IDENTITY_KEY, '');
+    } catch (_err) {
+      // Blocked storage: nothing was kept there either.
+    }
+  }
+
+  _readIdentity() {
+    try {
+      const parsed = JSON.parse(this._storage.getItem(IDENTITY_KEY));
+      if (parsed && HEX64.test(parsed.salt) && HEX64.test(parsed.accountHash)) {
+        return { salt: parsed.salt, accountHash: parsed.accountHash };
+      }
+    } catch (_err) {
+      // Missing or unreadable: no identity.
+    }
+    return null;
+  }
+
+  _writeIdentity() {
+    if (!this._identity || !this._identityAllowed) return;
+    try {
+      this._storage.setItem(IDENTITY_KEY, JSON.stringify(this._identity));
+    } catch (_err) {
+      // Blocked storage: the identity holds for this launch only.
+    }
+  }
+
+  /**
+   * Reads `identify.salt` from a session answer. The first answer decides
+   * whether this server offers identify this launch; a salt other than the
+   * stored one (another game's key) deletes the stored identity unsent. A
+   * held id is hashed now.
+   */
+  _readIdentifySalt(body) {
+    if (this._identifySalt === null) return;
+    const salt = body && body.identify && typeof body.identify === 'object' ? body.identify.salt : null;
+    if (!HEX64.test(salt)) {
+      if (this._identifySalt === undefined) {
+        this._identifySalt = null;
+        this._heldAccountId = null;
+        this._identifyGeneration += 1;
+      }
+      return;
+    }
+    this._identifySalt = salt;
+    if (this._identity && this._identity.salt !== salt) {
+      const held = this._heldAccountId;
+      this._forgetIdentity();
+      this._heldAccountId = held;
+    }
+    this._hashHeldAccount();
+  }
+
+  /** Hashes a held account id once the salt is known and storing is allowed. */
+  _hashHeldAccount() {
+    const salt = this._identifySalt;
+    if (this._heldAccountId == null || typeof salt !== 'string' || !this._identityAllowed) return;
+    this._identity = { salt, accountHash: hmacSha256Hex(salt, this._heldAccountId) };
+    this._heldAccountId = null;
+    this._writeIdentity();
+  }
+
+  /**
+   * Sends the identity on the current device's open session, once per
+   * session. Never awaited by a caller, never queued, never throws.
+   */
+  _sendIdentify() {
+    const identity = this._identity;
+    if (!identity || identity.salt !== this._identifySalt || this._identifyStopped) return;
+    if (!this._canSend || this._disposing) return;
+    const token = this.sessionTokenFor(this.deviceId);
+    if (!token || this._identifySentOn === token) return;
+    this._identifySentOn = token;
+    const generation = this._identifyGeneration;
+    const options = {
+      headers: { 'X-API-Key': this.ingestKey, 'X-Session-Token': token },
+      body: { accountHash: identity.accountHash },
+    };
+    try {
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        options.signal = AbortSignal.timeout(IDENTIFY_TIMEOUT_MS);
+      }
+    } catch (_err) {
+      // No timeout signal: the request still ends with the connection.
+    }
+    this._request('POST', '/identify', options)
+      .then((res) => this._identifyAnswered(res, generation))
+      .catch(noop);
+  }
+
+  _identifyAnswered(res, generation) {
+    const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
+    // The server does not offer identify, or calls the hash malformed (a bug):
+    // whatever identity is current, retrying this launch cannot help.
+    if (res.status === 404) {
+      this._identifyStopped = true;
+      this._log('identify is not offered by this server, not retried this launch');
+      return;
+    }
+    if (res.status === 400 && code === 'invalid_account_hash') {
+      this._identifyStopped = true;
+      if (!this._identifyBugWarned && typeof console !== 'undefined') {
+        this._identifyBugWarned = true;
+        console.warn('[ravensight] identify was refused as invalid_account_hash; not retried this launch');
+      }
+      return;
+    }
+    // A late answer for an identity since replaced or forgotten changes nothing.
+    if (generation !== this._identifyGeneration) return;
+    if (res.status === 200) {
+      this._identifyNoSessionRetried = false;
+      return;
+    }
+    if (res.status === 400 && code === 'no_session') {
+      // Again once, when the next session opens; a second no_session in a row ends it.
+      if (this._identifyNoSessionRetried) this._identifyStopped = true;
+      this._identifyNoSessionRetried = true;
+      return;
+    }
+    // 409 session_taken or synthetic_session, 429 identify_limited, rate_limited
+    // or needs_funds, 5xx, timeout, offline: the identity is kept and this
+    // session is not tried again; the next session tries once more.
+    this._recordError(this._failureCode(res, 'identify_failed'), res.status);
   }
 
   /**
@@ -3422,6 +3686,9 @@ class Ravensight {
       this._evictSessions(deviceId);
       this._log('session ready');
       this._readErrorCapture(res.body);
+      this._readIdentifySalt(res.body);
+      // Never awaited: identify does not hold back the session or any event.
+      if (deviceId === this.deviceId) this._sendIdentify();
       await this.fetchConfig(deviceId);
       return token;
     }
