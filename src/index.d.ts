@@ -456,6 +456,14 @@ export declare class Ravensight {
   /** Switches to a fresh random device id. Same semantics as setDeviceId. Resolves with the new id. */
   resetDeviceId(): Promise<string>;
   /**
+   * The campaign link this player arrived by, for a game that reads it itself (a deep link,
+   * universal link, App Link or install referrer whose address carries `rs_link`). In a browser
+   * the SDK reads `rs_link` from the page address on its own. Sent with the next session the
+   * client opens for its own player, once, never stored. Returns true when the id (24
+   * characters, 0-9 and a-f) was valid; false, changing nothing, otherwise or after dispose().
+   */
+  setCampaignLink(linkId: string): boolean;
+  /**
    * Links this device to the game's own account after sign-in. Pass an opaque internal id (a
    * database key or a UUID), or a whole number used as its decimal digits. Only a salted hash
    * leaves the device, once per session; the raw id is held in memory only until the session

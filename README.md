@@ -692,11 +692,29 @@ client starts, and sends it as `campaignLink` with the first `POST /session`
 it opens. Later sessions of the same page do not send it, nothing is stored,
 and the page address is left exactly as it is. The server keeps it only when
 it names a link of the same game, and then counts the player and the session
-on the Campaign links page, by link. The id is one the studio created, not
+on the Campaign links page, by link, where each link's player count opens
+those players in Player insights. The id is one the studio created, not
 personal data. It follows the same consent as everything else: with
 `consent: 'opt_in'` it goes with the first session after the player's yes,
-and an opted out player sends nothing. Nothing to call; it needs SDK 0.8.0 or
-later.
+and an opted out player sends nothing. Nothing to call on a web page; it needs
+SDK 0.8.0 or later.
+
+Outside a web page (a desktop or mobile app built on the SDK) the game
+learns the link itself, from a deep link, a universal link or App Link, or an
+install referrer it already handles. Point the campaign link at your own
+https page that opens the app, read `rs_link` from the address the app was
+opened with, and pass it on (SDK 0.12.0 or later):
+
+```js
+// In your deep link handler, before or after init().
+const link = new URL(openedUrl).searchParams.get('rs_link');
+if (link) rs.setCampaignLink(link);
+```
+
+`setCampaignLink(id)` returns `true` when the id is a link id (24 characters,
+`0-9` and `a-f`) and `false`, changing nothing, for anything else. The id goes
+with the next session the client opens, once, under the same rules as the
+page's own; a call before the first session is the usual case.
 
 ## Public builds
 

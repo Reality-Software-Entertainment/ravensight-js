@@ -449,12 +449,16 @@ const EXPIRY_SKEW_MS = 5000;
 export const MAX_EVENT_BYTES = 8192;
 const CAMPAIGN_LINK_PATTERN = /^[a-f0-9]{24}$/i;
 
+/** A campaign link id in the lower case the server stamps, or null for anything else. */
+function campaignLinkId(value) {
+  return typeof value === 'string' && CAMPAIGN_LINK_PATTERN.test(value) ? value.toLowerCase() : null;
+}
+
 /** A campaign link id from a landing query string (`rs_link`), or null. */
 function campaignLinkFrom(search) {
   if (!search) return null;
   try {
-    const value = new URLSearchParams(search).get('rs_link');
-    return value && CAMPAIGN_LINK_PATTERN.test(value) ? value.toLowerCase() : null;
+    return campaignLinkId(new URLSearchParams(search).get('rs_link'));
   } catch (_err) {
     return null;
   }
@@ -3161,6 +3165,32 @@ export class Ravensight {
     this._unconfirmed = this._unconfirmed.filter((item) => !item.auto);
     if (this._queueStore) this._persistNow();
     return next;
+  }
+
+  /**
+   * The Ravensight campaign link this player arrived by, for a game that
+   * learns it itself: a deep link, a universal link or App Link, or an
+   * install referrer it already handles. A link's redirect adds
+   * `rs_link=<link id>` to the studio's own https page, so the handler reads
+   * `rs_link` from that address and passes it here. In a browser the SDK
+   * already reads `rs_link` from the page address on its own.
+   *
+   * The id goes with the next session the client opens for its own player,
+   * exactly as the page's does: once, cleared only when that session is
+   * answered, never with a join token or a playtest session, under the same
+   * key and consent rules, and never stored. A later call replaces a link
+   * not yet sent.
+   *
+   * @param {string} linkId the link's id, 24 characters 0-9 and a-f.
+   * @returns {boolean} true when the id was valid and will be sent; false,
+   *   changing nothing, for anything else or after dispose().
+   */
+  setCampaignLink(linkId) {
+    if (this._disposed || this._disposing) return false;
+    const id = campaignLinkId(linkId);
+    if (!id) return false;
+    this._campaignLink = id;
+    return true;
   }
 
   /**

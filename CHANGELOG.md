@@ -16,6 +16,12 @@
   `stats.identify` counts requests sent and keeps the last failed answer. Without a key or before the opt-in yes nothing is stored or sent, and
   opting out deletes the stored hash. Needs the matching server endpoint
   (`POST /identify`) and the session answer's `identify.salt`.
+* Add `setCampaignLink(id)` for apps that learn the campaign link themselves
+  (a deep link, universal link, App Link or install referrer carrying
+  `rs_link`). It returns `true` for a link id and sends it with the next
+  session exactly as the page's `rs_link` is sent: once, cleared only on the
+  session's answer, never with a join token or a playtest session, never
+  stored. Anything else returns `false` and changes nothing.
 
 ## 0.11.0 - 2026-11-19
 
