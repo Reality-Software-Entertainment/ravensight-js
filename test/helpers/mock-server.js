@@ -77,6 +77,14 @@ export async function startMockServer(config = {}) {
     signing: Boolean(config.signing),
     /** When set, `errorCapture` on the settings and session answers. */
     errorCapture: config.errorCapture === undefined ? undefined : config.errorCapture,
+    /** When a string, every session answer carries identify: { salt }. Null leaves it out (an older server). */
+    identifySalt: config.identifySalt == null ? null : config.identifySalt,
+    /** Every POST /identify: { token, body, text }. */
+    identifies: [],
+    /** Queue of one shot answers for POST /identify: { status, body, headers }. */
+    identifyOverrides: config.identifyOverrides ? config.identifyOverrides.slice() : [],
+    /** Delay before answering POST /identify, to let a test change identity mid-flight. */
+    identifyDelayMs: config.identifyDelayMs == null ? 0 : config.identifyDelayMs,
     seq: 0,
   };
 
@@ -145,6 +153,7 @@ export async function startMockServer(config = {}) {
         created.signing = { algorithm: 'HMAC-SHA256', version: 1, secret: 'secret_' + state.seq, serverTime: Math.floor(Date.now() / 1000) };
       }
       if (state.errorCapture !== undefined) created.errorCapture = state.errorCapture;
+      if (typeof state.identifySalt === 'string') created.identify = { salt: state.identifySalt };
       if (body && body.joinToken != null && state.joinSynthetic != null) {
         created.joined = true;
         created.synthetic = state.joinSynthetic;
@@ -177,6 +186,26 @@ export async function startMockServer(config = {}) {
         events,
       });
       return send(res, 202, { accepted: events.length });
+    }
+
+    if (req.method === 'POST' && path === '/api/v1/identify') {
+      state.identifies.push({ token: req.headers['x-session-token'], body, text: req.rawText });
+      if (state.identifyDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, state.identifyDelayMs).unref());
+      }
+      const override = state.identifyOverrides.shift();
+      if (override) {
+        return send(res, override.status, override.body || { error: 'forced' }, override.headers || {});
+      }
+      if (!String(req.headers['x-api-key'] || '').startsWith('gt_live_')) {
+        return send(res, 401, { error: 'invalid_api_key' });
+      }
+      if (!isValid(req.headers['x-session-token'])) {
+        return send(res, 400, { error: 'no_session' });
+      }
+      const hash = body && typeof body.accountHash === 'string' ? body.accountHash : '';
+      if (!/^[0-9a-f]{64}$/.test(hash)) return send(res, 400, { error: 'invalid_account_hash' });
+      return send(res, 200, { playerId: 'px_' + hash.slice(0, 32), linked: true, verified: false, repeat: false });
     }
 
     if (req.method === 'POST' && path === '/api/v1/track') {
