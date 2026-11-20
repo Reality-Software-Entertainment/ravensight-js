@@ -444,6 +444,54 @@ changes nothing.
 `resetDeviceId()` does the same with a fresh random id and resolves with it.
 Use it for a "reset analytics id" button.
 
+### Identify players who sign in
+
+If your game has its own login, call `identify` once the player signs in and
+`resetIdentity` when they sign out. One person on two devices, or before and
+after signing in, then counts as one player.
+
+```js
+await rs.identify(account.analyticsId);   // after your own sign-in: a random id stored with the account
+await rs.resetIdentity();                 // on sign-out
+```
+
+* **What is sent:** a salted hash of the id (`accountHash`, 64 hex
+  characters, keyed with your game's own salt from the session answer) and
+  the session token, once per session. The raw account id, an email or a
+  name is never sent and never stored; until the first session answer the
+  id is held in memory only.
+* **Pass a random, high-entropy id**, such as a random UUID or a random
+  analytics id you make once for each account and store with it, never a
+  sequential database key, an email, a name or a handle. Your game's salt
+  reaches every copy of the game, so anyone could hash 1, 2, 3 and onward and
+  match a guessable id; a random one cannot be guessed. The hash is still a
+  pseudonymous identifier for the player: declare it in your game's privacy
+  notice. Any value containing `@` is refused, as are empty values and values
+  over 256 bytes of UTF-8. A refusal rejects with a `TypeError` whose `code`
+  is `not_text`, `empty`, `too_long` or `looks_like_email`, and changes
+  nothing. A whole number is accepted and used as its decimal digits, but a
+  sequential number is exactly the guessable kind.
+* **One event per identified session** on your usage balance. The same
+  account again in the same session sends nothing. A busy, refused or
+  failed request (409, 429, a server error or no connection) is tried once
+  more at the next session, never in a loop. An answer that the server does
+  not offer identify (404), or that the hash is malformed, stops identify
+  for the rest of the launch. A `no_session` answer is tried once more when
+  the next session opens; a second `no_session` in a row stops identify until
+  `resetIdentity()`. `rs.stats.identify` counts requests sent and keeps the
+  last failed answer.
+* **It rejects on bad input**, like `setDeviceId`: await it or catch it,
+  especially in server code, where an unhandled rejection can stop the
+  process.
+* **A different account** on the same device first does `resetIdentity()`.
+  `resetIdentity()` forgets the stored hash and switches to a fresh device id
+  (as `resetDeviceId()` does), so the next player is not linked to the last
+  one. `resetDeviceId()` alone keeps the identity.
+* The hash is stored beside the device id under `ravensight_identity`. It
+  never enters the event queue and never delays an event. Without a key, or
+  before the opt-in yes, it is held in memory only; `setEnabled(false)`
+  deletes it. `rs.isIdentified` says whether an account is set.
+
 ### `rs.session(deviceId?)` and `rs.sessionTokenFor(deviceId?)`
 
 `session()` resolves with `{ token, expiresAt }` once the device (default: the
@@ -652,11 +700,29 @@ client starts, and sends it as `campaignLink` with the first `POST /session`
 it opens. Later sessions of the same page do not send it, nothing is stored,
 and the page address is left exactly as it is. The server keeps it only when
 it names a link of the same game, and then counts the player and the session
-on the Campaign links page, by link. The id is one the studio created, not
+on the Campaign links page, by link, where each link's player count opens
+those players in Player insights. The id is one the studio created, not
 personal data. It follows the same consent as everything else: with
 `consent: 'opt_in'` it goes with the first session after the player's yes,
-and an opted out player sends nothing. Nothing to call; it needs SDK 0.8.0 or
-later.
+and an opted out player sends nothing. Nothing to call on a web page; it needs
+SDK 0.8.0 or later.
+
+Outside a web page (a desktop or mobile app built on the SDK) the game
+learns the link itself, from a deep link, a universal link or App Link, or an
+install referrer it already handles. Point the campaign link at your own
+https page that opens the app, read `rs_link` from the address the app was
+opened with, and pass it on (SDK 0.12.0 or later):
+
+```js
+// In your deep link handler, before or after init().
+const link = new URL(openedUrl).searchParams.get('rs_link');
+if (link) rs.setCampaignLink(link);
+```
+
+`setCampaignLink(id)` returns `true` when the id is a link id (24 characters,
+`0-9` and `a-f`) and `false`, changing nothing, for anything else. The id goes
+with the next session the client opens, once, under the same rules as the
+page's own; a call before the first session is the usual case.
 
 ## Public builds
 

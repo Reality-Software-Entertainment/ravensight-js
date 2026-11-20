@@ -291,6 +291,8 @@ export interface RavensightStats {
   errorsCaptured: number;
   /** Automatic captures dropped on the device by the caps. */
   errorsCapped: number;
+  /** identify(): requests sent and the last refused or failed answer. Never written to lastError. */
+  identify: { sent: number; lastError: RavensightLastError | null };
 }
 
 export declare class RavensightError extends Error {
@@ -453,6 +455,32 @@ export declare class Ravensight {
   isSynthetic(deviceId?: string): boolean | null;
   /** Switches to a fresh random device id. Same semantics as setDeviceId. Resolves with the new id. */
   resetDeviceId(): Promise<string>;
+  /**
+   * The campaign link this player arrived by, for a game that reads it itself (a deep link,
+   * universal link, App Link or install referrer whose address carries `rs_link`). In a browser
+   * the SDK reads `rs_link` from the page address on its own. Sent with the next session the
+   * client opens for its own player, once, never stored. Returns true when the id (24
+   * characters, 0-9 and a-f) was valid; false, changing nothing, otherwise or after dispose().
+   */
+  setCampaignLink(linkId: string): boolean;
+  /**
+   * Links this device to the game's own account after sign-in. Pass a random, high-entropy id
+   * (a random UUID or analytics id stored with the account), never a sequential database key:
+   * the salt reaches every client, so a guessable id can be matched. A whole number is used as
+   * its decimal digits. The hash is a pseudonymous identifier to declare in your privacy notice. Only a salted hash
+   * leaves the device, once per session; the raw id is held in memory only until the session
+   * answer gives the game's salt. A different account first does resetIdentity(). The request is
+   * not awaited. Rejects with a TypeError whose code is not_text, empty, too_long (over 256 UTF-8
+   * bytes) or looks_like_email (any @), and with a RavensightError code disposed after dispose().
+   */
+  identify(accountId: string | number | bigint): Promise<void>;
+  /**
+   * For sign-out: forgets the stored or held account and switches to a fresh device id as
+   * resetDeviceId() does. Sends nothing. Does nothing when no account is stored or held.
+   */
+  resetIdentity(): Promise<void>;
+  /** True while an account is stored or held by identify(). The account id is never readable. */
+  readonly isIdentified: boolean;
   dispose(options?: DisposeOptions): Promise<DisposeResult>;
 }
 

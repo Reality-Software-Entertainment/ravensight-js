@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.12.0 - 2026-11-19
+
+* Add `identify(accountId)` and `resetIdentity()` for games with their own
+  login, plus the `isIdentified` getter. Only a salted hash of the id
+  (`accountHash`, HMAC-SHA256 keyed with the game's salt from the session
+  answer) is sent, with the session token, once per session; the raw id is
+  never sent or stored and is held in memory only until the salt is known.
+  The hash is stored under `ravensight_identity`. Values that are empty, over
+  256 bytes of UTF-8 or contain `@` are refused with a `TypeError` whose
+  `code` names the reason. A different account first resets the identity,
+  which also switches to a fresh device id; `resetDeviceId()` alone keeps it.
+  A failed or refused request is tried again at the next session, never in a
+  loop; a 404 or a malformed-hash answer stops identify for the launch, and a
+  second `no_session` answer in a row stops it until `resetIdentity()`.
+  `stats.identify` counts requests sent and keeps the last failed answer. Without a key or before the opt-in yes nothing is stored or sent, and
+  opting out deletes the stored hash. Needs the matching server endpoint
+  (`POST /identify`) and the session answer's `identify.salt`.
+* Add `setCampaignLink(id)` for apps that learn the campaign link themselves
+  (a deep link, universal link, App Link or install referrer carrying
+  `rs_link`). It returns `true` for a link id and sends it with the next
+  session exactly as the page's `rs_link` is sent: once, cleared only on the
+  session's answer, never with a join token or a playtest session, never
+  stored. Anything else returns `false` and changes nothing.
+
 ## 0.11.0 - 2026-11-19
 
 * Add `trackAt(event, { x, y }, data?, options?)` for Level heatmaps. It sends

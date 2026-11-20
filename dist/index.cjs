@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-const VERSION = '0.11.0';
+const VERSION = '0.12.0';
 
 const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -449,12 +449,16 @@ const EXPIRY_SKEW_MS = 5000;
 const MAX_EVENT_BYTES = 8192;
 const CAMPAIGN_LINK_PATTERN = /^[a-f0-9]{24}$/i;
 
+/** A campaign link id in the lower case the server stamps, or null for anything else. */
+function campaignLinkId(value) {
+  return typeof value === 'string' && CAMPAIGN_LINK_PATTERN.test(value) ? value.toLowerCase() : null;
+}
+
 /** A campaign link id from a landing query string (`rs_link`), or null. */
 function campaignLinkFrom(search) {
   if (!search) return null;
   try {
-    const value = new URLSearchParams(search).get('rs_link');
-    return value && CAMPAIGN_LINK_PATTERN.test(value) ? value.toLowerCase() : null;
+    return campaignLinkId(new URLSearchParams(search).get('rs_link'));
   } catch (_err) {
     return null;
   }
@@ -462,6 +466,36 @@ function campaignLinkFrom(search) {
 
 /** Written only with consent 'opt_in', once the player has said yes. */
 const OPTIN_KEY = 'ravensight_optin';
+/** identify(): { salt, accountHash } as JSON, never the account id. */
+const IDENTITY_KEY = 'ravensight_identity';
+const IDENTIFY_MAX_BYTES = 256;
+const IDENTIFY_TIMEOUT_MS = 10000;
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/**
+ * The account id identify() hashes, exactly as given: text, or a whole
+ * number as its decimal digits. Throws a TypeError whose `code` is the
+ * contract's reason.
+ */
+function identifyAccountText(value) {
+  let text;
+  if (typeof value === 'string') text = value;
+  else if (typeof value === 'number' && Number.isSafeInteger(value)) text = String(value);
+  else if (typeof value === 'bigint') text = value.toString(10);
+  else throw identifyRefusal('not_text', 'must be text or a whole number');
+  if (text === '') throw identifyRefusal('empty', 'must not be empty');
+  if (utf8Length(text) > IDENTIFY_MAX_BYTES) {
+    throw identifyRefusal('too_long', 'must be at most ' + IDENTIFY_MAX_BYTES + ' bytes of UTF-8');
+  }
+  if (text.includes('@')) throw identifyRefusal('looks_like_email', 'must not contain @ (pass an internal id, never an email)');
+  return text;
+}
+
+function identifyRefusal(code, message) {
+  const err = new TypeError('Ravensight: `accountId` ' + message);
+  err.code = code;
+  return err;
+}
 const CONSENT_MODES = Object.freeze(['opt_out', 'opt_in']);
 const MAX_DISTRIBUTION_LENGTH = 40;
 
@@ -1599,6 +1633,28 @@ class Ravensight {
     /** Set by setDeviceId before the opt-in yes: stored once the player agrees. */
     this._deviceIdUnsaved = false;
 
+    // identify(): the game's own account, sent only as a salted hash.
+    /** { salt, accountHash } once hashed; stored under `ravensight_identity` when allowed. */
+    this._identity = null;
+    /** A valid account id waiting for the salt or the player's yes. Memory only, never stored. */
+    this._heldAccountId = null;
+    /** The game's identify salt: undefined until a session answer, null when the answer had none. */
+    this._identifySalt = undefined;
+    /** Bumped whenever the identity is replaced or forgotten, so a late answer changes nothing. */
+    this._identifyGeneration = 0;
+    /** Session tokens identify was sent on for the current identity: never twice on one session. */
+    this._identifySentOn = new Set();
+    /** Counts identify() calls, so the last of several un-awaited calls wins. */
+    this._identifyCalls = 0;
+    /** A 404 or invalid_account_hash: no more tries this launch. */
+    this._identifyStopped = false;
+    /** One no_session answer: the next session tries once more. Cleared by any other answer or a reset. */
+    this._identifyNoSessionRetried = false;
+    /** A second no_session in a row: no more tries until resetIdentity() (or the identity is forgotten). */
+    this._identifyNoSessionStopped = false;
+    this._identifyBugWarned = false;
+    if (this._hasKey && this._consented && !this._playtestToken) this._identity = this._readIdentity();
+
     if (opts.deviceId) this.deviceId = String(opts.deviceId);
     else if (!this._hasKey || !this._consented) this.deviceId = null;
     else this.deviceId = this._playtestToken ? 'dev_' + randomId() : this._loadOrCreateDeviceId();
@@ -1653,6 +1709,8 @@ class Ravensight {
       errorsCaptured: 0,
       /** Automatic captures dropped on the device by the caps. */
       errorsCapped: 0,
+      /** identify(): requests sent and the last refused or failed answer, { code, status, at }. */
+      identify: { sent: 0, lastError: null },
     };
 
     // Automatic error capture. Installed at construction with a key and
@@ -2768,7 +2826,7 @@ class Ravensight {
     const bad = message => { throw new RavensightError(message, 'invalid_report'); };
     const payload = { clientId: input.clientId || randomId(), capturedAt: input.capturedAt ?? Math.floor(Date.now() / 1000),
       category: input.category || 'other', source: input.source || 'player', context: { ...(input.context || {}) } };
-    if (!/^[a-zA-Z0-9_-]{8,80}$/.test(payload.clientId)) bad('Use a stable report clientId of 8–80 letters, digits, underscores or hyphens.');
+    if (!/^[a-zA-Z0-9_-]{8,80}$/.test(payload.clientId)) bad('Use a stable report clientId of 8 to 80 letters, digits, underscores or hyphens.');
     if (!FEEDBACK_CATEGORIES.includes(payload.category)) bad('Unknown report category.');
     if (!['player', 'tester'].includes(payload.source)) bad('Report source must be player or tester.');
     if (!Number.isSafeInteger(payload.capturedAt) || payload.capturedAt < Date.now() / 1000 - 86400 || payload.capturedAt > Date.now() / 1000 + 60) bad('Capture time must be within the last day.');
@@ -2994,6 +3052,8 @@ class Ravensight {
    */
   setEnabled(value) {
     const next = Boolean(value);
+    // Opting out, or withdrawing consent, forgets the signed-in account.
+    if (!next) this._forgetIdentity();
     if (this._hasKey && this.consent === 'opt_in' && !this._playtestToken) {
       if (next && !this._consented) {
         this._consented = true;
@@ -3001,6 +3061,7 @@ class Ravensight {
         if (this.deviceId == null) this.deviceId = this._loadOrCreateDeviceId();
         else if (this._deviceIdUnsaved) this._persistDeviceId(this.deviceId);
         this._deviceIdUnsaved = false;
+        if (!this._identity && this._heldAccountId == null) this._identity = this._readIdentity();
         this._openQueue();
       } else if (!next && this._consented) {
         this._consented = false;
@@ -3012,6 +3073,11 @@ class Ravensight {
       return;
     }
     this.enabled = next;
+    if (next) {
+      this._writeIdentity();
+      this._hashHeldAccount();
+      this._sendIdentify();
+    }
     if (!next) {
       this._configGeneration += 1;
       this._configs.clear();
@@ -3080,6 +3146,8 @@ class Ravensight {
     if (id !== previousId) {
       this.deviceId = id;
       this._persistDeviceId(id);
+      // Back on a device whose open session was never identified.
+      this._sendIdentify();
     }
     return { previousId, queuedUnderPreviousId };
   }
@@ -3100,6 +3168,285 @@ class Ravensight {
     this._unconfirmed = this._unconfirmed.filter((item) => !item.auto);
     if (this._queueStore) this._persistNow();
     return next;
+  }
+
+  /**
+   * The Ravensight campaign link this player arrived by, for a game that
+   * learns it itself: a deep link, a universal link or App Link, or an
+   * install referrer it already handles. A link's redirect adds
+   * `rs_link=<link id>` to the studio's own https page, so the handler reads
+   * `rs_link` from that address and passes it here. In a browser the SDK
+   * already reads `rs_link` from the page address on its own.
+   *
+   * The id goes with the next session the client opens for its own player,
+   * exactly as the page's does: once, cleared only when that session is
+   * answered, never with a join token or a playtest session, under the same
+   * key and consent rules, and never stored. A later call replaces a link
+   * not yet sent.
+   *
+   * @param {string} linkId the link's id, 24 characters 0-9 and a-f.
+   * @returns {boolean} true when the id was valid and will be sent; false,
+   *   changing nothing, for anything else or after dispose().
+   */
+  setCampaignLink(linkId) {
+    if (this._disposed || this._disposing) return false;
+    const id = campaignLinkId(linkId);
+    if (!id) return false;
+    this._campaignLink = id;
+    return true;
+  }
+
+  /**
+   * Links this device to the game's own account once the player signs in, so
+   * one person on two devices, or before and after sign-in, counts as one
+   * player. Pass a random, high-entropy id (a random UUID or analytics id
+   * stored with the account), never a sequential database key, an email, a
+   * name or a handle: the salt reaches every client, so a guessable id can be
+   * matched. The hash is a pseudonymous identifier to declare in the game's
+   * privacy notice.
+   *
+   * Only `accountHash`, an HMAC-SHA256 of the id keyed with the game's
+   * identify salt from the session answer, ever leaves the device or is
+   * stored, beside the device id under `ravensight_identity`. The raw id is
+   * held in memory only until that salt is known. Sent once per session with
+   * the session token (one event on the usage meter per identified session);
+   * the same account again sends nothing. A different account first does
+   * resetIdentity(). It never enters the event queue or delays an event.
+   * Inert without a key and held in memory before the opt-in yes.
+   *
+   * @param {string|number} accountId text, or a whole number used as its decimal digits.
+   * @returns {Promise<void>} once the identity is set; the request is not awaited.
+   * @throws {TypeError} with `code` `not_text`, `empty`, `too_long` (over 256
+   *   UTF-8 bytes) or `looks_like_email` (any `@`). Nothing changes.
+   * @throws {RavensightError} code `disposed` after dispose().
+   */
+  async identify(accountId) {
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+    const id = identifyAccountText(accountId);
+    const call = ++this._identifyCalls;
+    // A different account than the one stored or held: a sign-out first.
+    if (!this._isSameAccount(id)) {
+      await this.resetIdentity();
+      // A later identify() ran meanwhile: the last call wins.
+      if (call !== this._identifyCalls) return;
+    }
+    if (this._identifySalt === null) {
+      this._log('identify is not offered by this server, nothing is sent this launch');
+      return;
+    }
+    if (this._identifySalt === undefined || !this._identityAllowed) {
+      // No salt this launch yet, or no key or consent: hold the id in memory
+      // only, and hash it under whichever salt the session answer brings.
+      this._heldAccountId = id;
+      return;
+    }
+    if (!this._identity) {
+      this._identity = { salt: this._identifySalt, accountHash: hmacSha256Hex(this._identifySalt, id) };
+      this._writeIdentity();
+    }
+    this._heldAccountId = null;
+    if (this.sessionTokenFor(this.deviceId)) this._sendIdentify();
+    else if (this.initialized && this._canSend && this._mayOpenSessionNow()) this._ensureSession(this.deviceId).catch(noop);
+  }
+
+  /** No backoff, no server Retry-After and no blocked send: a session may be opened now. */
+  _mayOpenSessionNow() {
+    const now = this._clock();
+    return !this._sendBlocked && now >= this._nextAttemptAt && now >= this._retryAfterUntil;
+  }
+
+  /**
+   * For sign-out: forgets the stored or held account and switches to a fresh
+   * device id exactly as resetDeviceId() does, so the next session is not
+   * linked to the previous account. Sends nothing. With no account stored or
+   * held it does nothing and keeps the device id.
+   *
+   * @returns {Promise<void>}
+   * @throws {RavensightError} code `disposed` after dispose().
+   */
+  async resetIdentity() {
+    if (this._disposed || this._disposing) throw new RavensightError('client disposed', 'disposed');
+    if (!this._identity && this._heldAccountId == null && !this._hasIdentityOnDisk()) return;
+    this._forgetIdentity();
+    await this.resetDeviceId();
+  }
+
+  /** An identity saved by an earlier launch, read even before the opt-in yes (only to delete it). */
+  _hasIdentityOnDisk() {
+    if (!this._hasKey || this._playtestToken) return false;
+    try {
+      return Boolean(this._storage.getItem(IDENTITY_KEY));
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  /** True while an account is stored or held by identify(). The account id itself is never readable. */
+  get isIdentified() {
+    return Boolean(this._identity) || this._heldAccountId != null;
+  }
+
+  /** Whether identify may hash and store now: a key, consent, not opted out, not a playtest. */
+  get _identityAllowed() {
+    return this._hasKey && this._consented && this.enabled && !this._playtestToken;
+  }
+
+  /** True when `id` is the account already stored or held, or when none is. */
+  _isSameAccount(id) {
+    if (this._heldAccountId != null) return this._heldAccountId === id;
+    if (this._identity) return hmacSha256Hex(this._identity.salt, id) === this._identity.accountHash;
+    return true;
+  }
+
+  _forgetIdentity() {
+    this._identifyGeneration += 1;
+    this._identifySentOn.clear();
+    this._identifyNoSessionRetried = false;
+    this._identifyNoSessionStopped = false;
+    this._heldAccountId = null;
+    this._identity = null;
+    // Also an identity on disk this launch never loaded (before the opt-in
+    // yes). Never the player's storage in a playtest, never while inert.
+    if (!this._hasKey || this._playtestToken) return;
+    try {
+      // Only when there is one: an opt-out with nothing saved writes nothing.
+      if (this._storage.getItem(IDENTITY_KEY) == null) return;
+      if (typeof this._storage.removeItem === 'function') this._storage.removeItem(IDENTITY_KEY);
+      else this._storage.setItem(IDENTITY_KEY, '');
+    } catch (_err) {
+      // Blocked storage: nothing was kept there either.
+    }
+  }
+
+  _readIdentity() {
+    try {
+      const parsed = JSON.parse(this._storage.getItem(IDENTITY_KEY));
+      if (parsed && HEX64.test(parsed.salt) && HEX64.test(parsed.accountHash)) {
+        return { salt: parsed.salt, accountHash: parsed.accountHash };
+      }
+    } catch (_err) {
+      // Missing or unreadable: no identity.
+    }
+    return null;
+  }
+
+  _writeIdentity() {
+    if (!this._identity || !this._identityAllowed) return;
+    try {
+      this._storage.setItem(IDENTITY_KEY, JSON.stringify(this._identity));
+    } catch (_err) {
+      // Blocked storage: the identity holds for this launch only.
+    }
+  }
+
+  /**
+   * Reads `identify.salt` from a session answer. The first answer decides
+   * whether this server offers identify this launch; a salt other than the
+   * stored one (another game's key) deletes the stored identity unsent. A
+   * held id is hashed now.
+   */
+  _readIdentifySalt(body) {
+    if (this._identifySalt === null) return;
+    const salt = body && body.identify && typeof body.identify === 'object' ? body.identify.salt : null;
+    if (!HEX64.test(salt)) {
+      if (this._identifySalt === undefined) {
+        this._identifySalt = null;
+        this._heldAccountId = null;
+        this._identifyGeneration += 1;
+      }
+      return;
+    }
+    this._identifySalt = salt;
+    if (this._identity && this._identity.salt !== salt) {
+      const held = this._heldAccountId;
+      this._forgetIdentity();
+      this._heldAccountId = held;
+    }
+    this._hashHeldAccount();
+  }
+
+  /** Hashes a held account id once the salt is known and storing is allowed. */
+  _hashHeldAccount() {
+    const salt = this._identifySalt;
+    if (this._heldAccountId == null || typeof salt !== 'string' || !this._identityAllowed) return;
+    this._identity = { salt, accountHash: hmacSha256Hex(salt, this._heldAccountId) };
+    this._heldAccountId = null;
+    this._writeIdentity();
+  }
+
+  /**
+   * Sends the identity on the current device's open session, once per
+   * session. Never awaited by a caller, never queued, never throws.
+   */
+  _sendIdentify(freshToken) {
+    const identity = this._identity;
+    if (!identity || identity.salt !== this._identifySalt || this._identifyStopped || this._identifyNoSessionStopped) return;
+    if (!this._canSend || this._disposing) return;
+    // A session that just opened is used as answered, whatever the device
+    // clock says about its expiry.
+    const token = freshToken || this.sessionTokenFor(this.deviceId);
+    if (!token || this._identifySentOn.has(token)) return;
+    this._identifySentOn.add(token);
+    if (this._identifySentOn.size > 256) this._identifySentOn.delete(this._identifySentOn.values().next().value);
+    this.stats.identify.sent += 1;
+    const generation = this._identifyGeneration;
+    const options = {
+      headers: { 'X-API-Key': this.ingestKey, 'X-Session-Token': token },
+      body: { accountHash: identity.accountHash },
+    };
+    try {
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        options.signal = AbortSignal.timeout(IDENTIFY_TIMEOUT_MS);
+      }
+    } catch (_err) {
+      // No timeout signal: the request still ends with the connection.
+    }
+    this._request('POST', '/identify', options)
+      .then((res) => this._identifyAnswered(res, generation))
+      .catch(noop);
+  }
+
+  _identifyAnswered(res, generation) {
+    const code = res.body && typeof res.body.error === 'string' ? res.body.error : null;
+    if (res.status !== 200) {
+      // Its own stat: never the delivery error in stats.lastError.
+      this.stats.identify.lastError = { code: this._failureCode(res, 'identify_failed'), status: res.status, at: this._clock() };
+    }
+    // The server does not offer identify, or calls the hash malformed (a bug):
+    // whatever identity is current, retrying this launch cannot help.
+    if (res.status === 404) {
+      this._identifyStopped = true;
+      this._log('identify is not offered by this server, not retried this launch');
+      return;
+    }
+    if (res.status === 400 && code === 'invalid_account_hash') {
+      this._identifyStopped = true;
+      if (!this._identifyBugWarned && typeof console !== 'undefined') {
+        this._identifyBugWarned = true;
+        console.warn('[ravensight] identify was refused as invalid_account_hash; not retried this launch');
+      }
+      return;
+    }
+    // A late answer for an identity since replaced or forgotten changes nothing.
+    if (generation !== this._identifyGeneration) return;
+    if (res.status === 200) {
+      this._identifyNoSessionRetried = false;
+      return;
+    }
+    if (res.status === 400 && code === 'no_session') {
+      // Again once, when the next session opens; a second no_session in a row
+      // stops it until resetIdentity() (a sign-out), not for the whole launch.
+      if (this._identifyNoSessionRetried) {
+        this._identifyNoSessionStopped = true;
+        this._log('identify answered no_session twice in a row; not sent again until resetIdentity()');
+      }
+      this._identifyNoSessionRetried = true;
+      return;
+    }
+    // 409 session_taken or synthetic_session, 429 identify_limited, rate_limited
+    // or needs_funds, 5xx, timeout, offline: the identity is kept and this
+    // session is not tried again; the next session tries once more.
+    this._identifyNoSessionRetried = false;
   }
 
   /**
@@ -3395,7 +3742,8 @@ class Ravensight {
     const res = await this._request('POST', '/session', { headers, body });
 
     if (res.status === 201 && res.body && res.body.token) {
-      if (campaignLink) this._campaignLink = null;
+      // Only the link this request carried: one set while it was in flight goes next.
+      if (campaignLink && this._campaignLink === campaignLink) this._campaignLink = null;
       const token = String(res.body.token);
       if (this._disposed) {
         // dispose() finished while this was in flight. Do not store it.
@@ -3422,6 +3770,9 @@ class Ravensight {
       this._evictSessions(deviceId);
       this._log('session ready');
       this._readErrorCapture(res.body);
+      this._readIdentifySalt(res.body);
+      // Never awaited: identify does not hold back the session or any event.
+      if (deviceId === this.deviceId) this._sendIdentify(token);
       await this.fetchConfig(deviceId);
       return token;
     }

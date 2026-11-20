@@ -343,6 +343,92 @@ test('an opt-in player sends the link only with the session after the yes, and a
   await optedOut.dispose();
 });
 
+test('setCampaignLink: a valid id goes lowercased with the next session, once, and returns true', async (t) => {
+  withPage(t, { search: '' });
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = new Ravensight({ ingestKey: INGEST_KEY, apiUrl: server.url, storage: new MemoryStorage(), autoFlushMs: 0, autoEvents: false });
+  assert.equal(rs.setCampaignLink(LINK_ID.toUpperCase()), true);
+  await rs.init();
+  assert.equal(server.requestsTo('/api/v1/session')[0].body.campaignLink, LINK_ID);
+  // Once: the next session carries none until another call.
+  await rs._createSession(rs.deviceId, rs._sessionEntry(rs.deviceId));
+  assert.equal(server.requestsTo('/api/v1/session')[1].body.campaignLink, undefined);
+  // A later call (a deep link while the game runs) goes with the next session opened.
+  const OTHER = '64b0000000000000000000b2';
+  assert.equal(rs.setCampaignLink(OTHER), true);
+  await rs._createSession(rs.deviceId, rs._sessionEntry(rs.deviceId));
+  assert.equal(server.requestsTo('/api/v1/session')[2].body.campaignLink, OTHER);
+  await rs.dispose();
+});
+
+test('setCampaignLink while the first session is in flight: its answer clears only the link it carried', async (t) => {
+  withPage(t, { search: `?rs_link=${LINK_ID}` });
+  const OTHER = '64b0000000000000000000b2';
+  const bodies = [];
+  let release;
+  const fetchStub = async (url, init) => {
+    const path = new URL(url).pathname;
+    const reply = (status, body) => ({ status, headers: new Headers(), text: async () => JSON.stringify(body) });
+    if (path.endsWith('/session')) {
+      bodies.push(JSON.parse(init.body));
+      if (bodies.length === 1) await new Promise((resolve) => { release = resolve; });
+      return reply(201, { token: 'tok' + bodies.length, expiresIn: 3600 });
+    }
+    if (path.endsWith('/settings')) return reply(200, { trackingEnabled: true });
+    return reply(200, {});
+  };
+  const rs = client({ deviceId: undefined, fetch: fetchStub, autoEvents: false });
+  const first = rs._ensureSession();
+  while (!release) await new Promise((resolve) => setTimeout(resolve, 1));
+  assert.equal(rs.setCampaignLink(OTHER), true);
+  release();
+  await first;
+  await rs._createSession(rs.deviceId, rs._sessionEntry(rs.deviceId));
+  assert.deepEqual(bodies.map((body) => body.campaignLink), [LINK_ID, OTHER]);
+  rs.dispose({ flush: false });
+});
+
+test('setCampaignLink refuses what is not a link id, returns false, and keeps an earlier link', async (t) => {
+  withPage(t, { search: `?rs_link=${LINK_ID}` });
+  const server = await startMockServer();
+  t.after(() => server.close());
+  const rs = new Ravensight({ ingestKey: INGEST_KEY, apiUrl: server.url, storage: new MemoryStorage(), autoFlushMs: 0, autoEvents: false });
+  for (const bad of ['', 'abc', LINK_ID + '0', LINK_ID.slice(1), 'g'.repeat(24), ` ${LINK_ID}`, `${LINK_ID} `, null, undefined, 42, {}]) {
+    assert.equal(rs.setCampaignLink(bad), false, String(bad));
+  }
+  await rs.init();
+  // The page's own link, untouched by the refused calls.
+  assert.equal(server.requestsTo('/api/v1/session')[0].body.campaignLink, LINK_ID);
+  await rs.dispose();
+});
+
+test('setCampaignLink replaces the page link, and never rides on a join token or a playtest session', async (t) => {
+  withPage(t, { search: `?rs_link=${LINK_ID}` });
+  const server = await startMockServer({ joinTokens: ['join_abc'] });
+  t.after(() => server.close());
+  const OTHER = '64b0000000000000000000b2';
+  const rs = new Ravensight({ ingestKey: INGEST_KEY, apiUrl: server.url, storage: new MemoryStorage(), autoFlushMs: 0, autoEvents: false, deviceId: 'host' });
+  assert.equal(rs.setCampaignLink(OTHER), true);
+  rs.joinSession('join_abc', { deviceId: 'p7' });
+  rs.track('server_side', {}, { deviceId: 'p7' });
+  await rs.flush();
+  const joined = server.requestsTo('/api/v1/session').find((request) => request.body.deviceId === 'p7');
+  assert.equal(joined.body.campaignLink, undefined, 'never on another device id or a join token');
+  await rs.init();
+  const own = server.requestsTo('/api/v1/session').find((request) => request.body.deviceId === 'host');
+  assert.equal(own.body.campaignLink, OTHER);
+  await rs.dispose();
+});
+
+test('setCampaignLink without a key or after dispose sends nothing and never throws', async (t) => {
+  withPage(t, { search: '' });
+  const keyless = new Ravensight({ storage: new MemoryStorage(), autoFlushMs: 0, autoEvents: false });
+  assert.equal(keyless.setCampaignLink(LINK_ID), true);
+  await keyless.dispose();
+  assert.equal(keyless.setCampaignLink(LINK_ID), false);
+});
+
 test('a failed session keeps the link for the next attempt', async (t) => {
   withPage(t, { search: `?rs_link=${LINK_ID}` });
   const bodies = [];
