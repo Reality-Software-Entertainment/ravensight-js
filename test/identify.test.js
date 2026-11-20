@@ -443,10 +443,78 @@ test('a 400 no_session identifies again once the next session opens, once', asyn
   await waitFor(() => server.state.identifies.length === 2);
   assert.equal(server.state.identifies[1].token, rs.sessionToken);
   await settle();
-  // A second no_session in a row: no more tries this launch.
+  // A second no_session in a row: no more tries until resetIdentity.
   await nextSession(server, rs);
   await settle();
   assert.equal(server.state.identifies.length, 2);
+  await rs.dispose();
+});
+
+test('two no_session answers in a row stop identify until resetIdentity, not for the whole launch', async (t) => {
+  const noSession = { status: 400, body: { error: 'no_session' } };
+  const server = await saltedServer({ identifyOverrides: [noSession, noSession] });
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  await rs.identify('u1');
+  await waitFor(() => server.state.identifies.length === 1);
+  await settle();
+  await nextSession(server, rs);
+  await waitFor(() => server.state.identifies.length === 2);
+  await settle();
+  // Stopped: neither a new session nor resetDeviceId alone (not a sign-out) sends again.
+  await nextSession(server, rs);
+  await settle();
+  await rs.resetDeviceId();
+  rs.track('tick');
+  await rs.flush();
+  await settle();
+  assert.equal(server.state.identifies.length, 2);
+  // A sign-out clears the stop: the next account is identified on its session.
+  await rs.resetIdentity();
+  await rs.identify('u2');
+  await waitFor(() => server.state.identifies.length === 3);
+  assert.equal(server.state.identifies[2].token, rs.sessionToken);
+  assert.notEqual(server.state.identifies[2].body.accountHash, U1);
+  await rs.dispose();
+});
+
+test('a different account after two no_session answers in a row is identified (identify resets first)', async (t) => {
+  const noSession = { status: 400, body: { error: 'no_session' } };
+  const server = await saltedServer({ identifyOverrides: [noSession, noSession, noSession] });
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  await rs.identify('u1');
+  await waitFor(() => server.state.identifies.length === 1);
+  await settle();
+  await nextSession(server, rs);
+  await waitFor(() => server.state.identifies.length === 2);
+  await settle();
+  await rs.identify('u2');
+  await waitFor(() => server.state.identifies.length === 3);
+  await settle();
+  // The reset cleared the count too: this third no_session is the first in a row, so one more try.
+  await nextSession(server, rs);
+  await waitFor(() => server.state.identifies.length === 4);
+  assert.equal(server.state.identifies[3].token, rs.sessionToken);
+  await rs.dispose();
+});
+
+test('a 404 still stops identify for the launch, even after resetIdentity', async (t) => {
+  const server = await saltedServer({ identifyOverrides: [{ status: 404, body: { error: 'not_found' } }] });
+  t.after(() => server.close());
+  const rs = makeClient(server);
+  await rs.init();
+  await rs.identify('u1');
+  await waitFor(() => server.state.identifies.length === 1);
+  await settle();
+  await rs.resetIdentity();
+  await rs.identify('u2');
+  rs.track('tick');
+  await rs.flush();
+  await settle();
+  assert.equal(server.state.identifies.length, 1);
   await rs.dispose();
 });
 

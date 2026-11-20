@@ -476,8 +476,10 @@ await rs.resetIdentity();                 // on sign-out
   failed request (409, 429, a server error or no connection) is tried once
   more at the next session, never in a loop. An answer that the server does
   not offer identify (404), or that the hash is malformed, stops identify
-  for the rest of the launch. `rs.stats.identify` counts requests sent and
-  keeps the last failed answer.
+  for the rest of the launch. A `no_session` answer is tried once more when
+  the next session opens; a second `no_session` in a row stops identify until
+  `resetIdentity()`. `rs.stats.identify` counts requests sent and keeps the
+  last failed answer.
 * **It rejects on bad input**, like `setDeviceId`: await it or catch it,
   especially in server code, where an unhandled rejection can stop the
   process.

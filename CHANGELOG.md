@@ -12,7 +12,8 @@
   `code` names the reason. A different account first resets the identity,
   which also switches to a fresh device id; `resetDeviceId()` alone keeps it.
   A failed or refused request is tried again at the next session, never in a
-  loop; a 404 or a malformed-hash answer stops identify for the launch.
+  loop; a 404 or a malformed-hash answer stops identify for the launch, and a
+  second `no_session` answer in a row stops it until `resetIdentity()`.
   `stats.identify` counts requests sent and keeps the last failed answer. Without a key or before the opt-in yes nothing is stored or sent, and
   opting out deletes the stored hash. Needs the matching server endpoint
   (`POST /identify`) and the session answer's `identify.salt`.

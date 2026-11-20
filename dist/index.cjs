@@ -1648,7 +1648,10 @@ class Ravensight {
     this._identifyCalls = 0;
     /** A 404 or invalid_account_hash: no more tries this launch. */
     this._identifyStopped = false;
+    /** One no_session answer: the next session tries once more. Cleared by any other answer or a reset. */
     this._identifyNoSessionRetried = false;
+    /** A second no_session in a row: no more tries until resetIdentity() (or the identity is forgotten). */
+    this._identifyNoSessionStopped = false;
     this._identifyBugWarned = false;
     if (this._hasKey && this._consented && !this._playtestToken) this._identity = this._readIdentity();
 
@@ -3299,6 +3302,7 @@ class Ravensight {
     this._identifyGeneration += 1;
     this._identifySentOn.clear();
     this._identifyNoSessionRetried = false;
+    this._identifyNoSessionStopped = false;
     this._heldAccountId = null;
     this._identity = null;
     // Also an identity on disk this launch never loaded (before the opt-in
@@ -3376,7 +3380,7 @@ class Ravensight {
    */
   _sendIdentify(freshToken) {
     const identity = this._identity;
-    if (!identity || identity.salt !== this._identifySalt || this._identifyStopped) return;
+    if (!identity || identity.salt !== this._identifySalt || this._identifyStopped || this._identifyNoSessionStopped) return;
     if (!this._canSend || this._disposing) return;
     // A session that just opened is used as answered, whatever the device
     // clock says about its expiry.
@@ -3430,8 +3434,12 @@ class Ravensight {
       return;
     }
     if (res.status === 400 && code === 'no_session') {
-      // Again once, when the next session opens; a second no_session in a row ends it.
-      if (this._identifyNoSessionRetried) this._identifyStopped = true;
+      // Again once, when the next session opens; a second no_session in a row
+      // stops it until resetIdentity() (a sign-out), not for the whole launch.
+      if (this._identifyNoSessionRetried) {
+        this._identifyNoSessionStopped = true;
+        this._log('identify answered no_session twice in a row; not sent again until resetIdentity()');
+      }
       this._identifyNoSessionRetried = true;
       return;
     }
