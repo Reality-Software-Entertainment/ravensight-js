@@ -21,7 +21,8 @@
   seconds, or until the page is hidden or closed or the visitor declines,
   so an Accept on that page replaces it with a consented page view. A view a
   request already carried is never replaced: the consented visit then starts
-  without counting the page again.
+  without counting the page again. Either way, active time and heatmaps for
+  the page start at Accept: nothing observed before it is reported.
 * An anonymous view is one event on the meter, like any page view, and carries
   the page token. `opt_in` and `opt_out` are unchanged. `reset()` keeps queued
   anonymous views, which name no one. Needs a collector that accepts

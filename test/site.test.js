@@ -673,3 +673,15 @@ test('anonymous page views carry the page token and the other consent modes are 
   assert.equal(tracker({ consent: 'opt_in' })._queue.length, 0);
   assert.throws(() => tracker({ consent: 'anonymous' }), /opt_in, opt_out or anonymous_until_consent/);
 });
+
+test('an Accept reports nothing observed before it: no engagement or heatmap for the anonymous time', () => {
+  const { win } = spiedBrowser();
+  const site = tracker({ consent: 'anonymous_until_consent', heatmaps: true, engagement: true });
+  // Time passes and the visitor scrolls and types before choosing.
+  site._summaryStart -= 20000; site._engagementTick -= 20000; site._lastActivity -= 20000;
+  win.dispatch('scroll'); win.document.dispatch('keydown');
+  assert.equal(site.grantConsent(), true);
+  assert.deepEqual(site._queue.map(event => [event.type, event.anonymous === true]), [['page_view', false]], 'only the consented page view: no summary of the time before Accept');
+  assert.equal(site._activeMs, 0);
+  assert.ok(Date.now() - site._summaryStart < 1000, 'the consented page time starts at Accept');
+});

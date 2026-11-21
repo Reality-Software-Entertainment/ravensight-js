@@ -451,6 +451,10 @@ export class SiteTracker {
     if (this._anonymousMode) {
       if (this._privacyBlocked()) return false;
       this._allowed = true; this._declined = false; this._useStorage();
+      // Nothing observed before the yes is reported after it: active time and
+      // heatmap summaries for this page start now, not at the anonymous view.
+      this._activeMs = 0; this._summaryStart = Date.now(); this._engagementTick = Date.now(); this._lastActivity = Date.now();
+      this._pageActive = false; this._clicks.clear(); this._scroll.fill(0);
       const view = this._anonymousView;
       this._anonymousView = null;
       // A view a request has carried may already be counted, even if its answer was lost.
@@ -463,7 +467,6 @@ export class SiteTracker {
       // counting this page a second time.
       if (this._page && this._enabled()) {
         this._rememberAttribution(this._page); this._pageSessionId = this._session().sessionId; this._pageViewId = randomId();
-        this._activeMs = 0; this._summaryStart = Date.now(); this._engagementTick = Date.now(); this._lastActivity = Date.now();
       }
       return false;
     }
