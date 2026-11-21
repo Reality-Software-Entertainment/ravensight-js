@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.13.0 - 2026-11-21
+
+* Website mode gets a third consent mode, `consent: 'anonymous_until_consent'`,
+  for sites with a consent banner. Until the visitor accepts, after Decline,
+  and whenever the browser sends Global Privacy Control or Do Not Track (both
+  mean Decline in this mode), the tracker sends anonymous page views only: the
+  page address without its query and the referring host name, marked
+  `anonymous: true`, with no visitor or session id, campaign attribution,
+  custom event, engagement, heatmap or browser flag. It reads nothing from and
+  writes nothing to the browser's storage and sets no cookie. The collector
+  counts these as anonymous views, never as visitors or sessions.
+* `grantConsent()` (Accept) switches to the full website analytics; it returns
+  `false` and stays anonymous while GPC or DNT is on. `optOut()` (Decline or
+  withdrawal) deletes the visitor id the tracker stored, keeps counting
+  anonymously and stores nothing: the page's banner remembers the choice.
+  The new `consentState` getter reads `anonymous` or `granted`
+  (`granted` or `denied` in the other modes).
+* Each page view is counted once. A page's anonymous view waits up to 30
+  seconds, or until the page is hidden or closed or the visitor declines,
+  so an Accept on that page replaces it with a consented page view. A view a
+  request already carried is never replaced: the consented visit then starts
+  without counting the page again.
+* An anonymous view is one event on the meter, like any page view, and carries
+  the page token. `opt_in` and `opt_out` are unchanged. `reset()` keeps queued
+  anonymous views, which name no one. Needs a collector that accepts
+  anonymous page views; an older one refuses the batch with a 400.
+
 ## 0.12.1 - 2026-11-21
 
 * A page restored from the back-forward cache (the player leaves and comes

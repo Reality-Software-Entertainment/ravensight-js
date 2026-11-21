@@ -1148,7 +1148,8 @@ names, free text, account details and form values are rejected. Sessions expire
 after 30 minutes of inactivity. Website mode uses no cookies, honors Do Not
 Track and Global Privacy Control, and stores only random browser/session IDs in
 local storage (with memory fallback), plus first-seen time and sanitized campaign
-snapshots. Query strings are removed except bounded
+snapshots (with `consent: 'anonymous_until_consent'`, only after Accept; see
+below). Query strings are removed except bounded
 campaign parameters; referrers contain only their origin. Add
 `data-ravensight-private` or `data-ravensight-ignore` to sensitive regions.
 Forms, editable controls, element text, IDs, classes, and values are excluded
@@ -1179,6 +1180,44 @@ website and the time only, nothing about the visitor. The collector bills a
 page view only when it carries a token held long enough; a page view sent
 sooner is counted as bot traffic and not billed. A failed token request never
 blocks collection. Pass `pageToken: false` to turn this off.
+
+### Anonymous until consent (0.13.0)
+
+`consent: 'anonymous_until_consent'` counts page views anonymously until the
+visitor accepts, so a website can show a consent banner and still know how many
+pages were read:
+
+```js
+const site = createSiteTracker({
+  key: 'gt_site_YOUR_WEBSITE_KEY',
+  consent: 'anonymous_until_consent',
+});
+// Your banner remembers the choice. On every page load, and when the visitor
+// clicks Accept:
+site.grantConsent();
+// When the visitor clicks Decline, or withdraws consent later:
+site.optOut();
+site.consentState; // 'anonymous' or 'granted'
+```
+
+Before Accept, after Decline, and whenever the browser sends Global Privacy
+Control or Do Not Track (both mean Decline in this mode, and `grantConsent()`
+returns `false`), the tracker sends page views only, each with the page address
+without its query and the referring site's host name. It reads nothing from and
+writes nothing to the browser's storage, sets no cookie and sends no visitor or
+session id, campaign attribution, custom event, engagement or heatmap. The
+collector adds a country and a device type worked out from the request, does
+not store the network address, and reports these as anonymous views, never as
+visitors or sessions. After Accept the tracker runs the full website analytics
+described above. `optOut()` deletes the visitor id it stored, keeps counting
+anonymously and stores nothing: remembering the choice is your banner's job.
+
+Each page view is counted once, anonymously or with consent. A page's anonymous
+view waits up to 30 seconds before it is sent (a hidden or closing page, or a
+Decline, sends it at once), so an Accept on that page replaces it with a
+consented page view. If it has already been sent, the consented visit starts
+without counting the page again. An anonymous view uses one event on the meter,
+like any page view, and carries the page token described above.
 
 `site.optOut()` clears queued events and identity; `site.reset()` starts a new
 anonymous identity. Call `site.destroy()` when removing the tracker. Delivery

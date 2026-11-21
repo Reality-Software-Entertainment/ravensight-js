@@ -497,3 +497,179 @@ test('a failed token request never blocks collection', async () => {
   const site = tracker({ pageToken: true, fetch: async (url, request) => String(url).includes('/site/collect/token') ? { ok: false, status: 503, json: async () => ({}) } : ok(JSON.parse(request.body).events) });
   assert.equal(await site.flush(), true);
 });
+
+// ---- consent: 'anonymous_until_consent' ----------------------------------------------------------------
+/** A browser whose localStorage records every touch, so a test can prove nothing was read or written. */
+function spiedBrowser(options) {
+  const win = browser(options), storage = new MemoryStorage(), calls = [];
+  let touched = 0;
+  const spy = {
+    getItem(name) { calls.push(['get', name]); return storage.getItem(name); },
+    setItem(name, value) { calls.push(['set', name]); storage.setItem(name, value); },
+    removeItem(name) { calls.push(['remove', name]); storage.removeItem(name); },
+  };
+  Object.defineProperty(win, 'localStorage', { configurable: true, get() { touched++; return spy; } });
+  return { win, calls, storage, touched: () => touched };
+}
+const ANONYMOUS_KEYS = ['anonymous', 'eventId', 'referrer', 'timestamp', 'type', 'url'];
+
+test('anonymous until consent sends page views only, with no id and nothing read from or written to storage', () => {
+  const { win, calls, touched } = spiedBrowser();
+  const site = tracker({ consent: 'anonymous_until_consent', heatmaps: true, engagement: true });
+  assert.equal(site.consentState, 'anonymous');
+  assert.equal(site._queue.length, 1);
+  const [view] = site._queue;
+  assert.deepEqual(Object.keys(view).sort(), ANONYMOUS_KEYS);
+  assert.equal(view.type, 'page_view'); assert.equal(view.anonymous, true);
+  assert.equal(view.url, 'https://studio.example/', 'the address keeps no query, not even campaign tags');
+  assert.equal(view.referrer, 'search.example', 'the referrer is a host name only');
+  assert.equal(site.getAttribution(), null);
+  assert.equal(site.track('wishlist_click'), false);
+  win.document.dispatch('click', { isTrusted: true, target: { closest: () => null, tagName: 'BUTTON' }, pageX: 10, pageY: 10 }, 'capture');
+  win.dispatch('scroll'); win.document.dispatch('keydown');
+  assert.equal(site._summarize('navigation'), false);
+  win.history.pushState({}, '', '/news/?utm_source=feed');
+  assert.equal(site._queue.length, 2);
+  assert.equal(site._queue[1].url, 'https://studio.example/news/');
+  assert.ok(site._queue.every(event => event.anonymous === true && Object.keys(event).sort().join() === ANONYMOUS_KEYS.join()));
+  assert.equal(touched(), 0, 'window.localStorage was never touched');
+  assert.deepEqual(calls, []);
+  site.reset();
+  assert.equal(site._queue.length, 3, 'reset keeps queued anonymous views, which name no one');
+  assert.equal(touched(), 0);
+});
+
+test('an Accept before the anonymous view leaves replaces it, so the page counts once, with consent', () => {
+  const { calls } = spiedBrowser();
+  const site = tracker({ consent: 'anonymous_until_consent' });
+  assert.equal(site.grantConsent(), true);
+  assert.equal(site.consentState, 'granted');
+  assert.equal(site._queue.length, 1);
+  const [view] = site._queue;
+  assert.equal(view.anonymous, undefined); assert.equal(view.type, 'page_view');
+  assert.match(view.visitorId, /^[A-Za-z0-9_.:-]{8,128}$/);
+  assert.equal(view.url, 'https://studio.example/?utm_source=newsletter', 'full analytics keeps approved campaign tags again');
+  assert.ok(calls.some(([kind]) => kind === 'set'), 'the visitor id is stored only after Accept');
+  assert.equal(site.grantConsent(), false, 'a second yes changes nothing');
+  assert.equal(site.track('wishlist_click'), true);
+});
+
+test('an Accept after the anonymous view was sent starts the consented visit without counting the page again', async () => {
+  spiedBrowser(); const sent = [];
+  const site = tracker({ consent: 'anonymous_until_consent', fetch: async (_url, request) => { const events = JSON.parse(request.body).events; sent.push(...events); return ok(events); } });
+  assert.equal(await site.flush(), false, 'a fresh anonymous view waits for the choice');
+  assert.equal(sent.length, 0);
+  assert.equal(await site.flush({ keepalive: true }), true, 'a hidden or closing page sends it at once');
+  assert.equal(sent.length, 1); assert.equal(sent[0].anonymous, true);
+  assert.equal(site.grantConsent(), false);
+  assert.equal(site.consentState, 'granted');
+  assert.equal(site._queue.length, 0, 'no second page view for this page');
+  assert.ok(site._identity?.visitorId, 'the consented visit has its visitor id');
+  site.track('wishlist_click'); window.history.pushState({}, '', '/next/');
+  assert.deepEqual(site._queue.map(event => [event.type, Boolean(event.visitorId), event.anonymous]), [['custom', true, undefined], ['page_view', true, undefined]]);
+});
+
+test('a view whose request failed may already be counted, so an Accept never replaces it', async () => {
+  spiedBrowser(); let calls = 0;
+  const site = tracker({ consent: 'anonymous_until_consent', fetch: async () => { calls++; throw new Error('the answer was lost'); } });
+  site._queue[0].timestamp -= 30000;
+  assert.equal(await site.flush(), false); assert.equal(calls, 1);
+  assert.equal(site.grantConsent(), false);
+  assert.deepEqual(site._queue.map(event => event.anonymous), [true], 'the anonymous view is retried with its id; no consented duplicate');
+});
+
+test('the anonymous hold ends after 30 seconds, at a Decline, or with a privacy signal', async () => {
+  spiedBrowser(); const sent = [];
+  const fetch = async (_url, request) => { const events = JSON.parse(request.body).events; sent.push(...events); return ok(events); };
+  const waiting = tracker({ consent: 'anonymous_until_consent', fetch });
+  assert.equal(await waiting.flush(), false);
+  waiting._queue[0].timestamp -= 30000;
+  assert.equal(await waiting.flush(), true); assert.equal(sent.length, 1);
+  const declined = tracker({ consent: 'anonymous_until_consent', fetch });
+  declined.optOut();
+  assert.equal(declined.consentState, 'anonymous');
+  assert.equal(await declined.flush(), true, 'after Decline there is nothing to wait for');
+  assert.equal(sent.length, 2); assert.ok(sent.every(event => event.anonymous === true));
+});
+
+test('Global Privacy Control and Do Not Track mean Decline: anonymous views go on and Accept is refused', async () => {
+  for (const navigator of [{ globalPrivacyControl: true }, { doNotTrack: '1' }, { msDoNotTrack: 'yes' }]) {
+    const { touched } = spiedBrowser({ navigator }); const sent = [];
+    const site = tracker({ consent: 'anonymous_until_consent', fetch: async (_url, request) => { const events = JSON.parse(request.body).events; sent.push(...events); return ok(events); } });
+    assert.equal(site._queue.length, 1); assert.equal(site._queue[0].anonymous, true);
+    assert.equal(site.grantConsent(), false); assert.equal(site.consentState, 'anonymous');
+    assert.equal(site.track('wishlist_click'), false);
+    assert.equal(await site.flush(), true, 'no hold: the browser has already answered');
+    assert.equal(sent.length, 1); assert.equal(sent[0].anonymous, true);
+    assert.equal(touched(), 0);
+  }
+});
+
+test('a Decline after Accept deletes the stored visitor id, keeps counting anonymously and stores no choice', async () => {
+  const { win, calls, storage } = spiedBrowser(); const sent = [];
+  const fetch = async (_url, request) => { const events = JSON.parse(request.body).events; sent.push(...events); return ok(events); };
+  const site = tracker({ consent: 'anonymous_until_consent', fetch });
+  site.grantConsent(); site.track('wishlist_click');
+  const identityKey = calls.find(([kind]) => kind === 'set')[1];
+  assert.ok(storage.getItem(identityKey));
+  site.optOut();
+  assert.equal(site.consentState, 'anonymous');
+  assert.equal(storage.getItem(identityKey), null, 'the visitor id is deleted');
+  assert.ok(!calls.some(([kind, name]) => kind === 'set' && name.endsWith('_opt_out')), 'no opt-out is stored: the page remembers the choice');
+  assert.equal(site._queue.length, 0, 'identified events still queued are dropped');
+  win.history.pushState({}, '', '/after/');
+  assert.equal(site._queue.length, 1); assert.equal(site._queue[0].anonymous, true);
+  assert.equal(await site.flush(), true);
+  assert.ok(sent.every(event => event.anonymous === true));
+  const before = calls.length;
+  tracker({ consent: 'anonymous_until_consent', fetch });
+  assert.equal(calls.length, before, 'a new anonymous tracker never reads storage');
+});
+
+test('a Decline while a batch is scheduled sends only the anonymous views in it', async () => {
+  spiedBrowser(); let sent;
+  const site = tracker({ consent: 'anonymous_until_consent', fetch: async (_url, request) => { sent = JSON.parse(request.body).events; return ok(sent); } });
+  window.history.pushState({}, '', '/two/');
+  assert.equal(site.grantConsent(), true, 'the second page is counted with consent; the first stays anonymous');
+  site.track('wishlist_click');
+  assert.deepEqual(site._queue.map(event => event.anonymous === true), [true, false, false]);
+  const pending = site.flush(); site.optOut();
+  assert.equal(await pending, true);
+  assert.equal(sent.length, 1); assert.equal(sent[0].anonymous, true); assert.equal(sent[0].url, 'https://studio.example/');
+  assert.equal(site._queue.length, 0);
+});
+
+test('an Accept while the page token is awaited replaces the anonymous view before it is sent', async () => {
+  spiedBrowser(); let releaseToken; const collected = [];
+  const fetch = async (url, request) => {
+    if (String(url).includes('/site/collect/token')) { await new Promise(resolve => { releaseToken = resolve; }); return { ok: true, status: 200, json: async () => ({ token: 'eyJ2IjoxfQ.c2lnbmF0dXJl', minDelayMs: 0 }) }; }
+    const events = JSON.parse(request.body).events; collected.push(events); return ok(events);
+  };
+  const site = tracker({ consent: 'anonymous_until_consent', pageToken: true, fetch });
+  site._queue[0].timestamp -= 30000;
+  const pending = site.flush();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(site.grantConsent(), true);
+  releaseToken();
+  assert.equal(await pending, false, 'the replaced anonymous view is not sent');
+  assert.equal(collected.length, 0);
+  site._retryAt = 0;
+  assert.equal(await site.flush(), true);
+  assert.equal(collected.length, 1); assert.equal(collected[0].length, 1);
+  assert.equal(collected[0][0].anonymous, undefined); assert.equal(collected[0][0].pageToken, 'eyJ2IjoxfQ.c2lnbmF0dXJl');
+});
+
+test('anonymous page views carry the page token and the other consent modes are unchanged', async () => {
+  spiedBrowser(); const collected = [];
+  const fetch = async (url, request) => String(url).includes('/site/collect/token')
+    ? { ok: true, status: 200, json: async () => ({ token: 'eyJ2IjoxfQ.c2lnbmF0dXJl', minDelayMs: 0 }) }
+    : (collected.push(...JSON.parse(request.body).events), ok(JSON.parse(request.body).events));
+  const site = tracker({ consent: 'anonymous_until_consent', pageToken: true, fetch });
+  site._queue[0].timestamp -= 30000;
+  assert.equal(await site.flush(), true);
+  assert.equal(collected[0].anonymous, true); assert.equal(collected[0].pageToken, 'eyJ2IjoxfQ.c2lnbmF0dXJl');
+  assert.equal(tracker().consentState, 'granted');
+  assert.equal(tracker({ consent: 'opt_in' }).consentState, 'denied');
+  assert.equal(tracker({ consent: 'opt_in' })._queue.length, 0);
+  assert.throws(() => tracker({ consent: 'anonymous' }), /opt_in, opt_out or anonymous_until_consent/);
+});

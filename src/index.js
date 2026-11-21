@@ -7,7 +7,7 @@
  * Docs: https://ravensight.io/docs/
  */
 
-export const VERSION = '0.12.1';
+export const VERSION = '0.13.0';
 
 export const DEFAULT_API_URL = 'https://api.ravensight.io/api/v1';
 
@@ -4624,6 +4624,11 @@ const SITE_ATTRIBUTION = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_conte
 const SITE_PUBLIC_EVENTS = {"version":3,"limits":{"properties":24,"propertyBytes":4096,"batch":50,"engagementSummariesPerPage":6,"periodicSummaryMs":300000},"types":{"token":{"type":"string","max":80,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"slug":{"type":"string","max":120,"pattern":"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"},"catalog":{"type":"string","max":24,"pattern":"^[0-9]+$"},"path":{"type":"string","max":500,"pattern":"^/[^?#@\\\\]*$"},"count":{"type":"number","integer":true,"min":0,"max":1000000},"position":{"type":"number","integer":true,"min":1,"max":100},"flag":{"type":"boolean"},"campaign_tag":{"type":"string","max":60,"pattern":"^[a-z0-9_.-]{1,60}$"},"location":{"type":"enum","values":["header","footer","body","hero","sidebar","inline","bottom","nav"]},"form":{"type":"enum","values":["newsletter","contact","careers","support"]},"failure":{"type":"enum","values":["rejected","network","validation","unavailable"]},"error":{"type":"enum","values":["type_error","range_error","syntax_error","reference_error","network","unknown"]},"component":{"type":"enum","values":["runtime","promise","auth","play_catalog","play_transport","form"]},"product":{"type":"enum","values":["realityse","ravensight"]},"surface":{"type":"enum","values":["marketing","website","docs","blog"]}},"common":{"product":"product","surface":"surface","landing_page":"token","landing_version":"token"},"contextEvents":{"signup_form_viewed":"signup","signup_failed":"signup","checkout_failed":"checkout"},"events":{"signup_form_viewed":{},"signup_failed":{"code":{"type":"enum","values":["email_unconfirmed","invalid_input","email_in_use","rate_limited","network","unavailable","unknown"]}},"checkout_failed":{"plan":{"type":"enum","values":["monthly","annual"]},"code":{"type":"enum","values":["billing_disabled","billing_misconfigured","already_subscribed","invalid_plan","rate_limited","network","unavailable","unknown"]}},"navigation_click":{"location":"location","route":"token"},"game_link_click":{"catalog_id":"catalog","action":{"type":"enum","values":["play","learn_more","catalog","store","website"]},"destination":{"type":"enum","values":["apple","google_play","steam","game_site"]}},"external_link_click":{"destination":"token","location":"location"},"promotion_action":{"action":{"type":"enum","values":["dismiss","open"]}},"content_filter_change":{"section":{"type":"enum","values":["games","shop","play","accordion"]},"value":"slug"},"content_link_click":{"content_id":"slug","section":{"type":"enum","values":["blog","news","press","play"]},"action":{"type":"enum","values":["open","cta"]}},"form_submit_attempt":{"form":"form"},"form_submit_success":{"form":"form"},"form_submit_failure":{"form":"form","error_code":"failure"},"page_not_found":{"route":{"type":"enum","values":["not_found"]},"referrer":{"type":"enum","values":["internal","external","none"]}},"diagnostic":{"error_code":"error","component":"component"},"website_error":{"fingerprint":"token","error_code":"error","component":"component"},"cta_dashboard_clicked":{"section":"token","cta_location":"token"},"cta_docs_clicked":{"section":"token"},"sdk_repo_clicked":{"repo":"slug"},"pricing_viewed":{},"landing_page_viewed":{},"landing_cta_clicked":{"cta_location":"token","destination":"path"},"landing_stage_selected":{"stage":"token","stage_number":"position"},"landing_faq_opened":{"question_number":"position"},"landing_section_viewed":{"section":"token"},"ad_school_searched":{"found":"flag"},"ad_school_picked":{"classification":{"type":"enum","values":["1A","2A","3A","4A","5A","6A"]},"locked":"flag"},"ad_cta_clicked":{"placement":{"type":"enum","values":["hero","job_card_free","job_card","job_card_subscribe","finish","sticky"]},"picked":"flag","locked":"flag"},"ad_landing_viewed":{"source":"campaign_tag","medium":"campaign_tag","campaign":"campaign_tag","content":"campaign_tag"},"download":{"catalog_id":"catalog","destination":"token"},"outbound_click":{"destination":"token","location":"location"}}};
 const SITE_SESSION_MS = 30 * 60 * 1000;
 const SITE_MEMORY_STORAGE = new MemoryStorage();
+const SITE_CONSENT_MODES = ['opt_out', 'opt_in', 'anonymous_until_consent'];
+// In anonymous_until_consent mode a page's anonymous view waits up to this long
+// (or until the page is hidden or closed, or the visitor declines) before it is
+// sent, so an Accept on the same page replaces it and the page counts once.
+const SITE_ANONYMOUS_HOLD_MS = 30000;
 // Advertising click IDs are often long opaque strings. Length alone is not a
 // secret detector for these explicitly permitted attribution fields.
 function siteCampaignValue(value) {
@@ -4699,11 +4704,21 @@ function siteProperties(name, input) {
   return result;
 }
 
-/** Privacy-limited browser analytics. No cookies, text capture or player IDs. */
+/**
+ * Privacy-limited browser analytics. No cookies, text capture or player IDs.
+ *
+ * Consent modes: 'opt_out' (the default) collects until optOut(); 'opt_in'
+ * collects nothing until grantConsent(); 'anonymous_until_consent' counts
+ * anonymous page views until grantConsent() and again after optOut(). An
+ * anonymous page view carries the page address without its query and the
+ * referring host only: no visitor or session id, attribution, custom event,
+ * engagement or heatmap, and nothing is read from or written to the browser's
+ * storage. Global Privacy Control and Do Not Track mean Decline in that mode.
+ */
 export class SiteTracker {
   constructor(options = {}) {
     if (!/^gt_site_[A-Za-z0-9_-]{16,128}$/.test(options.key || '')) throw new TypeError('A website key is required.');
-    if (options.consent !== undefined && !['opt_in', 'opt_out'].includes(options.consent)) throw new TypeError('Consent must be opt_in or opt_out.');
+    if (options.consent !== undefined && !SITE_CONSENT_MODES.includes(options.consent)) throw new TypeError('Consent must be opt_in, opt_out or anonymous_until_consent.');
     if (options.excludedPaths !== undefined && (!Array.isArray(options.excludedPaths) || options.excludedPaths.length > 40 || options.excludedPaths.some(path => typeof path !== 'string' || !/^\/[A-Za-z0-9_/-]{0,180}$/.test(path)))) throw new TypeError('Excluded paths must be bounded absolute paths.');
     if (options.outcomesOnly !== undefined && typeof options.outcomesOnly !== 'boolean') throw new TypeError('outcomesOnly must be a boolean.');
     if (options.outcomesOnly && (options.heatmaps || options.engagement || options.autoPageviews === true)) throw new TypeError('Outcome-only mode cannot capture pages, engagement or heatmaps.');
@@ -4714,13 +4729,21 @@ export class SiteTracker {
     this._document = this._window?.document || (typeof document !== 'undefined' ? document : null);
     this._navigator = this._window?.navigator || (typeof navigator !== 'undefined' ? navigator : {});
     this._fetch = options.fetch || globalThis.fetch?.bind(globalThis);
+    this._anonymousMode = options.consent === 'anonymous_until_consent';
+    this._storageOption = options.storage || null;
     this._storage = options.storage || SITE_MEMORY_STORAGE;
-    if (!options.storage) { try { this._storage = this._window?.localStorage || this._storage; } catch {} }
     this._storageKey = `ravensight_site_${queueKeyHash(this.key)}`;
     this._preferenceKey = `${this._storageKey}_opt_out`;
-    this._allowed = options.consent !== 'opt_in';
-    try { if (this._storage.getItem(this._preferenceKey) === 'true') this._allowed = false; } catch {}
-    if (SITE_MEMORY_STORAGE.getItem(this._preferenceKey) === 'true') this._allowed = false;
+    // Anonymous mode never touches the browser's storage before Accept, not even
+    // to look: the page's consent banner remembers the choice, not the tracker.
+    this._storageReady = false;
+    this._allowed = options.consent === undefined || options.consent === 'opt_out';
+    if (!this._anonymousMode) {
+      this._useStorage();
+      try { if (this._storage.getItem(this._preferenceKey) === 'true') this._allowed = false; } catch {}
+      if (SITE_MEMORY_STORAGE.getItem(this._preferenceKey) === 'true') this._allowed = false;
+    }
+    this._declined = false; this._anonymousView = null; this._attempted = new WeakSet();
     this._heatmaps = options.heatmaps === true;
     this._engagement = options.engagement === true;
     this._excludedPaths = options.excludedPaths || [];
@@ -4784,14 +4807,32 @@ export class SiteTracker {
     this._listeners.push(() => target.removeEventListener(name, listener, options));
   }
   _privacyBlocked() { return this._navigator.globalPrivacyControl === true || [this._navigator.doNotTrack, this._navigator.msDoNotTrack, this._window?.doNotTrack].some(value => ['1', 'yes'].includes(String(value).toLowerCase())); }
-  _enabled() {
+  _live() {
     // Cooldown never creates an event. Only fresh activity can collect again;
     // the refused queue was discarded at the pause and is never replayed.
     if (this._paused && Date.now() >= this._pauseUntil) this._paused = false;
-    return this._allowed && !this._privacyBlocked() && !this._paused && !this._destroyed;
+    return !this._paused && !this._destroyed;
   }
-  _read() { try { return JSON.parse(this._storage.getItem(this._storageKey) || SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { try { return JSON.parse(SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { return null; } } }
+  /** Full website analytics: consent (or opt_out mode), no privacy signal, not paused or destroyed. */
+  _enabled() { return this._live() && this._allowed && !this._privacyBlocked(); }
+  /** anonymous_until_consent mode without full analytics: anonymous page views only. */
+  _anonymous() { return this._anonymousMode && this._live() && !(this._allowed && !this._privacyBlocked()); }
+  /** Whether a queued event may still be sent under the visitor's current choice. */
+  _sendable(event) { return event.anonymous ? this._anonymousMode : this._allowed && !this._privacyBlocked(); }
+  /** 'granted' while full analytics may run; 'anonymous' in anonymous_until_consent mode otherwise; 'denied' in the other modes. */
+  get consentState() { return this._allowed && !this._privacyBlocked() ? 'granted' : this._anonymousMode ? 'anonymous' : 'denied'; }
+  /** The browser's storage, first used here: at construction, or in anonymous mode at Accept. */
+  _useStorage() {
+    if (this._storageReady) return;
+    this._storageReady = true;
+    if (!this._storageOption) { try { this._storage = this._window?.localStorage || SITE_MEMORY_STORAGE; } catch { this._storage = SITE_MEMORY_STORAGE; } }
+  }
+  _read() {
+    if (!this._storageReady) return null;
+    try { return JSON.parse(this._storage.getItem(this._storageKey) || SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { try { return JSON.parse(SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { return null; } }
+  }
   _write(value) {
+    if (!this._storageReady) return;
     try { value ? this._storage.setItem(this._storageKey, JSON.stringify(value)) : this._storage.removeItem(this._storageKey); }
     catch { if (value) SITE_MEMORY_STORAGE.setItem(this._storageKey, JSON.stringify(value)); }
     if (!value) SITE_MEMORY_STORAGE.removeItem(this._storageKey);
@@ -4833,7 +4874,7 @@ export class SiteTracker {
    */
   _requestPageToken() {
     const state = this._pageToken;
-    if (!this._pageTokens || this._outcomesOnly || !this._fetch || !this._enabled()) return Promise.resolve(null);
+    if (!this._pageTokens || this._outcomesOnly || !this._fetch || !(this._enabled() || this._anonymous())) return Promise.resolve(null);
     if (state.pending) return state.pending;
     if (state.value && Date.now() - state.at < 3600000) return Promise.resolve(state.value);
     // Called at once (not on a later tick) so the request starts while the page loads.
@@ -4868,7 +4909,18 @@ export class SiteTracker {
   }
   _enqueue(type, extra = {}, address = this._page) {
     if (type === 'page_view') this._requestPageToken();
-    if (!this._enabled() || !address) return false;
+    if (!address) return false;
+    if (!this._enabled()) {
+      if (type !== 'page_view' || !this._anonymous()) return false;
+      // An anonymous page view: the page address without its query and the
+      // referring host. No id, attribution, browser flag or storage.
+      let referrer = '';
+      try { referrer = this._document?.referrer ? new URL(this._document.referrer).hostname : ''; } catch {}
+      const url = new URL(address);
+      const event = { eventId: randomId(), type: 'page_view', anonymous: true, timestamp: Date.now(), url: url.origin + url.pathname, referrer };
+      if (this._queue.length >= 100) this._queue.shift();
+      this._queue.push(event); this._anonymousView = event; return true;
+    }
     const summary = type === 'engagement' || type === 'heatmap';
     const identity = summary && this._identity ? this._identity : this._session();
     let referrer = '';
@@ -4881,7 +4933,7 @@ export class SiteTracker {
   _navigation() {
     if (this._outcomesOnly) return false;
     const href = this._window?.location?.href;
-    if (!href || href === this._lastLocation || !this._enabled()) return false;
+    if (!href || href === this._lastLocation || !(this._enabled() || this._anonymous())) return false;
     this._summarize('navigation'); this._lastLocation = href; this._page = siteAddress(href, this._excludedPaths);
     this._summaryCount = 0; this._summaryStart = Date.now(); this._pageActive = false;
     this._activeMs = 0; this._engagementTick = Date.now(); this._lastActivity = Date.now();
@@ -4920,20 +4972,57 @@ export class SiteTracker {
     return this._enqueue('custom', { name, context, ...(fields === undefined ? {} : { properties: fields }) }, origin);
   }
   pageView() { this._lastLocation = null; return this._navigation(); }
+  /**
+   * The visitor's yes. True when a page view was recorded for the current page.
+   * In anonymous_until_consent mode it is refused (false, still anonymous) while
+   * the browser sends Global Privacy Control or Do Not Track.
+   */
   grantConsent() {
     if (this._allowed) return false;
+    if (this._anonymousMode) {
+      if (this._privacyBlocked()) return false;
+      this._allowed = true; this._declined = false; this._useStorage();
+      const view = this._anonymousView;
+      this._anonymousView = null;
+      // A view a request has carried may already be counted, even if its answer was lost.
+      if (view && this._queue.includes(view) && !this._attempted.has(view)) {
+        // This page's anonymous view has not left yet: count the page once, with consent.
+        this._queue = this._queue.filter(event => event !== view);
+        this._lastLocation = null; return this._navigation();
+      }
+      // Already counted anonymously: the consented visit starts here without
+      // counting this page a second time.
+      if (this._page && this._enabled()) {
+        this._rememberAttribution(this._page); this._pageSessionId = this._session().sessionId; this._pageViewId = randomId();
+        this._activeMs = 0; this._summaryStart = Date.now(); this._engagementTick = Date.now(); this._lastActivity = Date.now();
+      }
+      return false;
+    }
     try { this._storage.removeItem(this._preferenceKey); } catch {}
     SITE_MEMORY_STORAGE.removeItem(this._preferenceKey);
     this._allowed = true; this._lastLocation = null; return this._navigation();
   }
+  /**
+   * Stop collecting and forget the visitor. In anonymous_until_consent mode this
+   * is Decline (or consent withdrawn): anonymous page views go on, the stored
+   * visitor id is deleted and nothing is stored, because the page remembers the
+   * choice. In the other modes the opt-out is remembered in storage.
+   */
   optOut() {
+    if (this._anonymousMode) {
+      this._allowed = false; this._declined = true; this._queue = this._queue.filter(event => event.anonymous);
+      this._identity = null; this._write(null); this._clicks.clear(); this._scroll.fill(0);
+      this._activeMs = 0; this._pageActive = false; this._firstNavigation = true; this._pageViewId = null; this._pageSessionId = null;
+      return;
+    }
     this._allowed = false; this._queue = []; this._identity = null; this._page = null;
     this._clicks.clear(); this._scroll.fill(0); this._write(null);
     this._activeMs = 0; this._pageActive = false; this._firstNavigation = true;
     try { this._storage.setItem(this._preferenceKey, 'true'); } catch { SITE_MEMORY_STORAGE.setItem(this._preferenceKey, 'true'); }
   }
   reset() {
-    this._queue = []; this._identity = null; this._write(null); this._lastLocation = null;
+    // Anonymous page views name no one, so a reset keeps the ones still queued.
+    this._queue = this._queue.filter(event => event.anonymous); this._identity = null; this._write(null); this._lastLocation = null;
     this._page = null; this._activeMs = 0; this._pageActive = false; this._firstNavigation = true;
     this._clicks.clear(); this._scroll.fill(0); return this._navigation();
   }
@@ -4999,9 +5088,13 @@ export class SiteTracker {
     // fetch would lose actions queued just before the page closes.
     const lane = keepalive ? '_exitFlight' : '_inFlight';
     if (!keepalive && this._inFlight) return this._inFlight;
-    if (!this._enabled() || !this._queue.length || !this._fetch || Date.now() < this._retryAt) return false;
+    if (!(this._enabled() || this._anonymous()) || !this._queue.length || !this._fetch || Date.now() < this._retryAt) return false;
     const activeExitIds = new Set([...this._exitRequests].flatMap(request => [...request.ids]));
-    const candidates = this._queue.filter(event => !keepalive || !activeExitIds.has(event.eventId));
+    // Before the visitor chooses, a fresh anonymous view waits (SITE_ANONYMOUS_HOLD_MS)
+    // so an Accept can replace it; a hidden or closing page sends it at once.
+    const now = Date.now(), holding = !keepalive && this._anonymousMode && !this._allowed && !this._declined && !this._privacyBlocked();
+    const candidates = this._queue.filter(event => (!keepalive || !activeExitIds.has(event.eventId)) && this._sendable(event)
+      && !(holding && event.anonymous && now - event.timestamp < SITE_ANONYMOUS_HOLD_MS));
     const batch = candidates.slice(0, 50);
     if (!batch.length) return this._exitFlight || false;
     while (batch.length > 1 && JSON.stringify(batch).length > 400000) batch.pop();
@@ -5028,9 +5121,16 @@ export class SiteTracker {
       try {
         // Consent/reset may change before this scheduled transport starts.
         // A destroy keepalive still owns its queued batch and may finish.
-        if (!this._allowed || this._privacyBlocked() || !batch.some(event => this._queue.includes(event))) return false;
+        const live = () => batch.filter(event => this._queue.includes(event) && this._sendable(event));
+        if (!live().length) return false;
         const stamping = this._attachPageToken(batch, keepalive);
         if (stamping) await stamping;
+        // An Accept while the page token was awaited replaces the page's
+        // anonymous view, and a Decline drops identified events: send what is left.
+        const remaining = live();
+        if (!remaining.length) return false;
+        if (remaining.length < batch.length) batch.splice(0, batch.length, ...remaining);
+        for (const event of batch) this._attempted.add(event);
         const timeout = new Promise((_, reject) => {
           timer = setTimeout(() => { controller?.abort(); reject(new Error('Website collection timed out.')); }, 10000);
           timer?.unref?.();

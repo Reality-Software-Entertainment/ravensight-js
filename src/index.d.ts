@@ -509,7 +509,13 @@ export default Ravensight;
 export interface SiteTrackerOptions {
   key: string;
   apiUrl?: string;
-  consent?: 'opt_in' | 'opt_out';
+  /**
+   * 'opt_out' (default) collects until optOut(); 'opt_in' collects nothing until grantConsent();
+   * 'anonymous_until_consent' counts anonymous page views (page address without its query and the
+   * referring host, no id, nothing read from or written to storage) until grantConsent() and again
+   * after optOut(). Global Privacy Control and Do Not Track mean Decline in that mode.
+   */
+  consent?: 'opt_in' | 'opt_out' | 'anonymous_until_consent';
   heatmaps?: boolean;
   /** Extra bounded engagement summaries consume one event each. Off by default. */
   engagement?: boolean;
@@ -526,11 +532,15 @@ export interface SiteTrackerOptions {
 export class SiteTracker {
   constructor(options: SiteTrackerOptions);
   readonly paused: boolean;
+  /** 'granted' while full analytics may run; 'anonymous' in anonymous_until_consent mode otherwise; 'denied' in the other modes. */
+  readonly consentState: 'granted' | 'anonymous' | 'denied';
   track(name: string, properties?: Record<string, string | number | boolean>): boolean;
   trackOutcome(name: 'signup_form_viewed' | 'signup_failed' | 'checkout_failed', properties?: Record<string, string | number | boolean>): boolean;
   getAttribution(): { first: SiteAttributionTouch; last: SiteAttributionTouch } | null;
   pageView(): boolean;
+  /** The visitor's yes. In anonymous_until_consent mode, false and still anonymous while GPC or DNT is on. */
   grantConsent(): boolean;
+  /** Stop and forget the visitor. In anonymous_until_consent mode: Decline, anonymous page views go on and nothing is stored. */
   optOut(): void;
   reset(): boolean;
   resume(): boolean;
