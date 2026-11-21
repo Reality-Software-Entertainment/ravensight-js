@@ -1247,3 +1247,7 @@ Signup codes: `email_unconfirmed`, `invalid_input`, `email_in_use`, `rate_limite
 These are explicit funnel steps/failures, not proof of a completed account or
 purchase. Successful authenticated outcomes remain in your gameplay integration.
 Destroy this tracker before returning to ordinary public tracking.
+
+## Contributing
+
+`npm install` installs the local checks (or run `npm run hooks:install`). The pre-push hook then runs the tests on Node 24 before every push, with a time limit, and refuses the push if they fail. CI runs nightly and on demand, not on pushes or pull requests, so this hook is where a change is checked first.
