@@ -1,14 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.12.1 - 2026-11-21
 
-* A page restored from the back-forward cache sends `game_started` again, and
-  the next `pagehide` sends its own `game_exited`. Before, the restored page was
-  played with no start, and its exit was never sent because the first one
-  already had been, so the events after a restore followed a `game_exited`. A
-  first load, a plain `pageshow`, a client that sent no exit and an opted-out
-  player are unchanged. A game that counts `game_started` sees one more start
-  for each restore.
+* A page restored from the back-forward cache (the player leaves and comes
+  back with the browser's back or forward button) sends `game_started` again,
+  and the next `pagehide` sends its own `game_exited`, so starts and exits stay
+  paired. Before, the restored page was played with no start, and its exit was
+  never sent because the first one already had been. A first load, a plain
+  `pageshow`, a client that sent no exit and an opted-out player are unchanged.
+* Each restore counts as one more start in your data and as two events on the
+  usage meter: the new `game_started`, and the `game_exited` sent when the
+  player leaves again.
 
 ## 0.12.0 - 2026-11-19
 
