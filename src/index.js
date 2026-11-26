@@ -4858,12 +4858,14 @@ export class SiteTracker {
   async _stampPageViews(views, keepalive) {
     const state = this._pageToken;
     // Never hold collection hostage to the token: wait for it at most two seconds.
-    const token = keepalive ? state.value : await Promise.race([this._requestPageToken(), new Promise(resolve => { const timer = setTimeout(() => resolve(null), 2000); timer?.unref?.(); })]);
+    // The timer is awaited, so it must not be unref'd (Node treats that wait as a hang); clear it once the race ends.
+    let limit;
+    const token = keepalive ? state.value : await Promise.race([this._requestPageToken(), new Promise(resolve => { limit = setTimeout(() => resolve(null), 2000); })]).finally(() => clearTimeout(limit));
     if (!token) return;
     const wait = state.at + state.minDelay + 50 - Date.now();
     // A closing page cannot wait: send without the token rather than one held too briefly.
     if (wait > 0 && keepalive) return;
-    if (wait > 0) await new Promise(resolve => { const timer = setTimeout(resolve, wait); timer?.unref?.(); });
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
     for (const event of views) event.pageToken = token;
   }
   _enqueue(type, extra = {}, address = this._page) {

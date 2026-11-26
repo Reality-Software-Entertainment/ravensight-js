@@ -11,6 +11,10 @@
 * Each restore counts as one more start in your data and as two events on the
   usage meter: the new `game_started`, and the `game_exited` sent when the
   player leaves again.
+* Website mode: the short waits for the page token (at most two seconds, then
+  the server's minimum hold) use ordinary timers, and the two second timer is
+  cleared as soon as the token arrives. Node 22 no longer reports those waits
+  as a promise still pending when the event loop ends. Collection is unchanged.
 
 ## 0.12.0 - 2026-11-19
 
