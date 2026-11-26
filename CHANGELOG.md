@@ -15,6 +15,12 @@
   the server's minimum hold) use ordinary timers, and the two second timer is
   cleared as soon as the token arrives. Node 22 no longer reports those waits
   as a promise still pending when the event loop ends. Collection is unchanged.
+* Website mode: a page view held for its page token is checked again after
+  each wait. If the visitor opted out, a privacy signal appeared, the tracker
+  was reset or `destroy()` was called in the meantime, the held page view is
+  not sent. `optOut()` and `destroy()` end those waits at once, so no timer
+  outlives the tracker. The final keepalive flush that `destroy()` starts is
+  unchanged.
 
 ## 0.12.0 - 2026-11-19
 

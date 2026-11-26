@@ -497,3 +497,63 @@ test('a failed token request never blocks collection', async () => {
   const site = tracker({ pageToken: true, fetch: async (url, request) => String(url).includes('/site/collect/token') ? { ok: false, status: 503, json: async () => ({}) } : ok(JSON.parse(request.body).events) });
   assert.equal(await site.flush(), true);
 });
+// Timers that keep the process alive (unref'd ones are not counted).
+const liveTimers = () => process.getActiveResourcesInfo().filter(type => type === 'Timeout').length;
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function heldTracker({ minDelayMs = 1000, token = true } = {}) {
+  const calls = [];
+  const fetch = async (url, request) => {
+    calls.push({ url: String(url), request });
+    if (String(url).includes('/site/collect/token')) return token ? { ok: true, status: 200, json: async () => ({ token: 'eyJ2IjoxfQ.c2lnbmF0dXJl', minDelayMs }) } : new Promise(() => {});
+    return ok(JSON.parse(request.body).events);
+  };
+  return { site: tracker({ fetch, pageToken: true }), collects: () => calls.filter(call => call.url.endsWith('/site/collect')) };
+}
+test('opting out while a page view is held for its token sends nothing and ends the wait at once', async () => {
+  browser(); const { site, collects } = heldTracker();
+  const held = site.flush(); await sleep(20);
+  assert.equal(collects().length, 0, 'the page view is still held');
+  const before = liveTimers(), started = Date.now();
+  site.optOut();
+  assert.equal(before - liveTimers(), 1, 'the hold timer is cleared');
+  assert.equal(await held, false);
+  assert.ok(Date.now() - started < 500, 'the wait ends early instead of running out');
+  await sleep(1100);
+  assert.equal(collects().length, 0, 'nothing is sent when the hold would have ended');
+});
+test('destroying the tracker while a page view is held sends nothing after teardown and leaves no timer', async () => {
+  browser(); const { site, collects } = heldTracker();
+  const held = site.flush(); await sleep(20);
+  assert.equal(collects().length, 0, 'the page view is still held');
+  const before = liveTimers(), started = Date.now();
+  site.destroy();
+  assert.equal(before - liveTimers(), 1, 'the hold timer is cleared');
+  assert.equal(await held, false, 'the held send is dropped');
+  assert.ok(Date.now() - started < 500, 'the wait ends early instead of running out');
+  // destroy() keeps its documented final keepalive flush, scheduled at teardown; a closing page sends without the token.
+  const final = collects();
+  assert.equal(final.length, 1); assert.equal(final[0].request.keepalive, true);
+  assert.ok(JSON.parse(final[0].request.body).events.every(event => event.pageToken === undefined));
+  await sleep(1100);
+  assert.equal(collects().length, 1, 'nothing is sent when the hold would have ended');
+});
+test('opting out while the token request is pending sends nothing and clears the two second limit', async () => {
+  browser(); const { site, collects } = heldTracker({ token: false });
+  const held = site.flush(); await sleep(20);
+  const before = liveTimers(), started = Date.now();
+  site.optOut();
+  assert.equal(before - liveTimers(), 1, 'the limit timer is cleared');
+  assert.equal(await held, false);
+  assert.ok(Date.now() - started < 500);
+  assert.equal(collects().length, 0);
+});
+test('a privacy signal or a reset that arrives during the hold stops the held send', async () => {
+  const win = browser(); const signalled = heldTracker({ minDelayMs: 100 });
+  const blocked = signalled.site.flush(); await sleep(20);
+  win.navigator.globalPrivacyControl = true;
+  assert.equal(await blocked, false); assert.equal(signalled.collects().length, 0);
+  browser(); const resetting = heldTracker({ minDelayMs: 100 });
+  const reset = resetting.site.flush(); await sleep(20);
+  resetting.site.reset();
+  assert.equal(await reset, false); assert.equal(resetting.collects().length, 0, 'the events from before the reset are never sent');
+});
