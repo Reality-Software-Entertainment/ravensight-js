@@ -4725,7 +4725,7 @@ class SiteTracker {
     this._engagement = options.engagement === true;
     this._excludedPaths = options.excludedPaths || [];
     this._autoPageviews = !this._outcomesOnly && options.autoPageviews !== false;
-    this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null; this._exitFlight = null; this._exitRequests = new Set();
+    this._queue = []; this._listeners = []; this._identity = null; this._inFlight = null; this._exitFlight = null; this._exitRequests = new Set(); this._waits = new Set();
     this._paused = false; this._pauseUntil = 0; this._destroyed = false; this._retryAt = 0; this._attempts = 0;
     // On by default; `pageToken: false` turns it off (tests and custom transports).
     this._pageTokens = options.pageToken !== false;
@@ -4790,6 +4790,30 @@ class SiteTracker {
     if (this._paused && Date.now() >= this._pauseUntil) this._paused = false;
     return this._allowed && !this._privacyBlocked() && !this._paused && !this._destroyed;
   }
+  /**
+   * The gate for one batch, checked before it is sent and again after every
+   * wait on the way: consent, privacy signals, teardown, and at least one of
+   * its events still queued (an opt-out, reset or pause empties the queue).
+   * Only the keepalive flush that destroy() itself starts may finish after it.
+   */
+  _maySend(batch, keepalive) {
+    return this._allowed && !this._privacyBlocked() && (keepalive || !this._destroyed) && batch.some(event => this._queue.includes(event));
+  }
+  /**
+   * A timer the send path awaits. It is not unref'd (Node treats an awaited
+   * unref'd timer as a hang); it is tracked instead, so destroy() and optOut()
+   * clear it and end the wait at once. Returns the wait and its early end.
+   */
+  _wait(ms) {
+    let end;
+    const done = new Promise(resolve => {
+      const timer = setTimeout(() => end(), ms);
+      end = () => { clearTimeout(timer); this._waits.delete(end); resolve(); };
+      this._waits.add(end);
+    });
+    return { done, end };
+  }
+  _endWaits() { for (const end of [...this._waits]) end(); }
   _read() { try { return JSON.parse(this._storage.getItem(this._storageKey) || SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { try { return JSON.parse(SITE_MEMORY_STORAGE.getItem(this._storageKey) || 'null'); } catch { return null; } } }
   _write(value) {
     try { value ? this._storage.setItem(this._storageKey, JSON.stringify(value)) : this._storage.removeItem(this._storageKey); }
@@ -4848,25 +4872,36 @@ class SiteTracker {
     })().catch(() => state.value).finally(() => { state.pending = null; });
     return state.pending;
   }
-  /** A promise only when there is a page view to stamp, so a send with nothing to do is not delayed. */
+  /**
+   * A promise only when there is a page view to stamp, so a send with nothing
+   * to do is not delayed. It resolves false when the batch must not be sent.
+   */
   _attachPageToken(batch, keepalive) {
     if (!this._pageTokens || this._outcomesOnly) return null;
     const views = batch.filter(event => event.type === 'page_view' && !event.pageToken);
     if (!views.length || (keepalive && !this._pageToken.value)) return null;
-    return this._stampPageViews(views, keepalive);
+    return this._stampPageViews(batch, views, keepalive);
   }
-  async _stampPageViews(views, keepalive) {
+  async _stampPageViews(batch, views, keepalive) {
     const state = this._pageToken;
-    // Never hold collection hostage to the token: wait for it at most two seconds.
-    // The timer is awaited, so it must not be unref'd (Node treats that wait as a hang); clear it once the race ends.
-    let limit;
-    const token = keepalive ? state.value : await Promise.race([this._requestPageToken(), new Promise(resolve => { limit = setTimeout(() => resolve(null), 2000); })]).finally(() => clearTimeout(limit));
-    if (!token) return;
+    let token = state.value;
+    if (!keepalive) {
+      // Never hold collection hostage to the token: wait for it at most two seconds.
+      const limit = this._wait(2000);
+      token = await Promise.race([this._requestPageToken(), limit.done.then(() => null)]).finally(limit.end);
+      // Consent, privacy, teardown or a reset may have changed during the wait.
+      if (!this._maySend(batch, keepalive)) return false;
+    }
+    if (!token) return true;
     const wait = state.at + state.minDelay + 50 - Date.now();
     // A closing page cannot wait: send without the token rather than one held too briefly.
-    if (wait > 0 && keepalive) return;
-    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+    if (wait > 0 && keepalive) return true;
+    if (wait > 0) {
+      await this._wait(wait).done;
+      if (!this._maySend(batch, keepalive)) return false;
+    }
     for (const event of views) event.pageToken = token;
+    return true;
   }
   _enqueue(type, extra = {}, address = this._page) {
     if (type === 'page_view') this._requestPageToken();
@@ -4933,6 +4968,8 @@ class SiteTracker {
     this._clicks.clear(); this._scroll.fill(0); this._write(null);
     this._activeMs = 0; this._pageActive = false; this._firstNavigation = true;
     try { this._storage.setItem(this._preferenceKey, 'true'); } catch { SITE_MEMORY_STORAGE.setItem(this._preferenceKey, 'true'); }
+    // A send waiting on the page token wakes now, finds the gate closed and sends nothing.
+    this._endWaits();
   }
   reset() {
     this._queue = []; this._identity = null; this._write(null); this._lastLocation = null;
@@ -5030,9 +5067,10 @@ class SiteTracker {
       try {
         // Consent/reset may change before this scheduled transport starts.
         // A destroy keepalive still owns its queued batch and may finish.
-        if (!this._allowed || this._privacyBlocked() || !batch.some(event => this._queue.includes(event))) return false;
+        if (!this._maySend(batch, keepalive)) return false;
+        // Stamping may wait for the token and its hold; it checks the gate again after each wait.
         const stamping = this._attachPageToken(batch, keepalive);
-        if (stamping) await stamping;
+        if (stamping && !(await stamping)) return false;
         const timeout = new Promise((_, reject) => {
           timer = setTimeout(() => { controller?.abort(); reject(new Error('Website collection timed out.')); }, 10000);
           timer?.unref?.();
@@ -5074,6 +5112,8 @@ class SiteTracker {
     if (this._destroyed) return;
     this._summarize('destroy'); this.flush({ keepalive: true }); this._destroyed = true;
     clearInterval(this._timer); for (const remove of this._listeners.splice(0)) remove();
+    // No timer outlives the tracker, and a send held for the page token is dropped.
+    this._endWaits();
   }
 }
 function createSiteTracker(options) { return new SiteTracker(options); }
